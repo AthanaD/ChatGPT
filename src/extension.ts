@@ -11,6 +11,7 @@ import * as vscode from 'vscode';
 import { SettingsManager } from './stores/settingsManager';
 import { SidebarProvider } from './ui/sidebarProvider';
 import { registerInlineReview } from './ui/inlineReview';
+import { registerGitSync } from './integrations/gitSync';
 import { SettingsPanel } from './ui/settingsPanel';
 import { FeatureStore } from './stores/featureStore';
 import { setToolTimeoutOverrides } from './agent/tools/shared';
@@ -76,6 +77,9 @@ export function activate(context: vscode.ExtensionContext) {
 
   // Inline diff view for agent edits + changed-line decorations (no git needed).
   registerInlineReview(context);
+
+  // Committing in git counts as "keep" — clear those pending reviews.
+  registerGitSync(context);
 
   context.subscriptions.push(
     vscode.commands.registerCommand('ocursor.openSettings', (section?: string) => {
