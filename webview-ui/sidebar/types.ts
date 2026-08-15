@@ -93,7 +93,7 @@ export interface PendingChangeInfo {
 }
 
 // Extension -> webview
-export type UiPrefs = { chatTextSize: string; submitWithCtrlEnter: boolean; maxTabCount: number; completionSound: boolean };
+export type UiPrefs = { chatTextSize: string; submitWithCtrlEnter: boolean; maxTabCount: number; completionSound: boolean; perTabDrafts: boolean };
 /** A subagent team as shown in the composer's Project-mode picker. */
 export type TeamInfo = { id: string; name: string; description: string; members: string[] };
 export type InMessage =

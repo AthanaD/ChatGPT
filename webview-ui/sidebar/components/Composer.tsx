@@ -721,6 +721,8 @@ function ModelPicker({
   );
 }
 
+export type ComposerDraft = { text: string; attachments: Attachment[] };
+
 export function Composer({
   mode,
   onMode,
@@ -741,6 +743,8 @@ export function Composer({
   onCancelEdit,
   submitWithCtrlEnter,
   draft,
+  tabDraft,
+  onTabDraft,
   usedTokens,
   queuedCount,
   onRunNextQueued,
@@ -775,6 +779,10 @@ export function Composer({
   submitWithCtrlEnter?: boolean;
   /** Restored (unsent) message: replaces the editor content when set. */
   draft?: { text: string; attachments?: Attachment[]; mentions?: MentionItem[] } | null;
+  /** Per-tab draft restored when switching chats. */
+  tabDraft?: ComposerDraft | null;
+  /** Fired whenever the composer content changes (tab switch / typing). */
+  onTabDraft?: (d: ComposerDraft) => void;
   /** Tokens consumed by the conversation so far (drives the context ring). */
   usedTokens?: number;
   /** Queued messages count; Enter on an empty editor fires the next one now. */
@@ -917,9 +925,42 @@ export function Composer({
     setEmpty(!ed || (ed.textContent || "").trim() === "" && ed.querySelectorAll(".mention").length === 0);
   }, []);
 
-  // Auto-focus the editor on tab switch / new chat.
+  const onTabDraftRef = React.useRef(onTabDraft);
+  React.useEffect(() => { onTabDraftRef.current = onTabDraft; }, [onTabDraft]);
+  const attachmentsRef = React.useRef(attachments);
+  React.useEffect(() => { attachmentsRef.current = attachments; }, [attachments]);
+  const tabDraftRef = React.useRef(tabDraft);
+  tabDraftRef.current = tabDraft; // sync before focusKey effect restores
+  const prevFocusKeyRef = React.useRef(focusKey);
+  // Serialize is defined below; snapshot via ref so tab-switch effect can call it.
+  const serializeRef = React.useRef<() => string>(() => "");
+
+  const emitDraft = React.useCallback(() => {
+    if (editing) return;
+    onTabDraftRef.current?.({ text: serializeRef.current(), attachments: attachmentsRef.current });
+  }, [editing]);
+
+  // Auto-focus + restore per-tab draft on tab switch / new chat.
   React.useEffect(() => {
+    if (editing) return;
+    const prev = prevFocusKeyRef.current;
+    if (prev !== focusKey) {
+      // Leaving a tab: parent already has latest via emitDraft on input; just swap in.
+      prevFocusKeyRef.current = focusKey;
+      const d = tabDraftRef.current;
+      const ed = edRef.current;
+      if (ed) {
+        if (d?.text) seedEditor(ed, d.text);
+        else ed.innerHTML = "";
+        histRef.current = { stack: [{ html: ed.innerHTML, caret: -1 }], idx: 0, lastPush: 0 };
+        setAttachments(d?.attachments ?? []);
+        refreshEmpty();
+      } else {
+        setAttachments(d?.attachments ?? []);
+      }
+    }
     if (!isRunning) edRef.current?.focus();
+    // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [focusKey]);
 
   /**
@@ -1324,6 +1365,13 @@ export function Composer({
     walk(ed);
     return out.trim();
   };
+  serializeRef.current = serialize;
+
+  // Keep parent draft map in sync (typing + attachment chips).
+  React.useEffect(() => {
+    if (editing) return;
+    emitDraft();
+  }, [attachments, empty, editing, emitDraft]);
 
   const clear = () => {
     if (edRef.current) {
@@ -1332,6 +1380,7 @@ export function Composer({
     }
     histRef.current = { stack: [{ html: "", caret: 0 }], idx: 0, lastPush: 0 };
     refreshEmpty();
+    if (!editing) onTabDraftRef.current?.({ text: "", attachments: [] });
   };
 
   // Send (or queue, when a run is in flight). Never stops the run — stopping is
@@ -1476,6 +1525,7 @@ export function Composer({
             pushHistory();
             refreshEmpty();
             detectMention();
+            emitDraft();
           }}
           onPaste={(e) => {
             const plain = plainPasteRef.current;

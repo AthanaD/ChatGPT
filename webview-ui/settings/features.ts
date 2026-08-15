@@ -271,6 +271,7 @@ export interface FeatureConfig {
   chatTextSize: "compact" | "default" | "large";
   submitWithCtrlEnter: boolean;
   maxTabCount: number;
+  perTabDrafts: boolean;
   maxAgentSteps: number;
   /** Per-tool hard timeout overrides in seconds (empty = built-in defaults). */
   toolTimeoutsSec: Record<string, number>;
@@ -361,6 +362,7 @@ export const EMPTY_FEATURES: FeatureConfig = {
   chatTextSize: "default",
   submitWithCtrlEnter: false,
   maxTabCount: 0,
+  perTabDrafts: false,
   maxAgentSteps: 50,
   toolTimeoutsSec: {},
   autoContinue: false,

@@ -250,6 +250,8 @@ export interface FeatureConfig {
 	submitWithCtrlEnter: boolean;
 	/** Max chat tabs open at once (0 = unlimited). */
 	maxTabCount: number;
+	/** Keep a separate composer draft per chat tab (off = one shared composer). */
+	perTabDrafts: boolean;
 	/** Max agent steps per run before pausing (0 = default 50). */
 	maxAgentSteps: number;
 	/** Per-tool hard timeout overrides in seconds (empty = built-in defaults). */
@@ -304,6 +306,7 @@ const DEFAULTS: FeatureConfig = {
 	chatTextSize: "default",
 	submitWithCtrlEnter: false,
 	maxTabCount: 0,
+	perTabDrafts: false,
 	maxAgentSteps: 50,
 	toolTimeoutsSec: {},
 	autoContinue: false,

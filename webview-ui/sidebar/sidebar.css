@@ -382,7 +382,11 @@ body {
 	gap: var(--sp-7);
 	overflow-anchor: none;
 	mask-image: linear-gradient(to bottom, black calc(100% - 28px), transparent 100%);
-	scroll-behavior: smooth;
+	/* NOT scroll-behavior: smooth — it would animate every programmatic
+	   `scrollTop = scrollHeight`, so opening a tab visibly travels from the top
+	   and an interrupted animation leaves the view mid-chat. Scrolls that should
+	   animate pass `behavior: "smooth"` to scrollTo() explicitly (App.tsx). */
+	scroll-behavior: auto;
 }
 /* Each user message + its assistant replies. Sticky "You" is bounded by the
    group, so the next group's "You" collides with and pushes it out. */

@@ -613,6 +613,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         submitWithCtrlEnter: features.submitWithCtrlEnter === true,
         maxTabCount: features.maxTabCount ?? 0,
         completionSound: features.completionSound === true,
+        perTabDrafts: features.perTabDrafts === true,
       },
     });
     this._sendConversations();
@@ -765,6 +766,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         submitWithCtrlEnter: features.submitWithCtrlEnter === true,
         maxTabCount: features.maxTabCount ?? 0,
         completionSound: features.completionSound === true,
+        perTabDrafts: features.perTabDrafts === true,
       },
     });
   }
