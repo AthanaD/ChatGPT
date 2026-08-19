@@ -26,20 +26,16 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
   if (!ctx) return { output: "error: todo context unavailable" };
   const incoming: TodoItem[] = Array.isArray(input.todos) ? input.todos : [];
   if (input.merge) {
-    // Merge mode: combine existing + incoming by id. Safe — never clears the list.
+    // Merge mode: combine existing + incoming by id.
     const byId = new Map(ctx.todos.map((t) => [t.id, t]));
     for (const t of incoming) byId.set(t.id, { ...byId.get(t.id), ...t });
     ctx.todos = [...byId.values()];
   } else {
-    // Replace mode: guard against accidental wipe. Only allow replacement if
-    // incoming is non-empty. An empty array would erase the todo list.
-    if (incoming.length === 0) {
-      return { output: "error: cannot replace todos with an empty list. Use merge=true to update individual items." };
-    }
+    // Replace mode: full replacement. Rolling window anti-loop in loop.ts
+    // prevents the model from looping by breaking when TodoWrite dominates.
     ctx.todos = incoming;
   }
   // Render in [x]/[ ] format so the webview TodoList component can parse it.
-  // The rolling window anti-loop in loop.ts prevents the model from looping.
   const render = ctx.todos
     .map((t) => {
       const mark =
