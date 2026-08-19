@@ -964,6 +964,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const exec = async (i: number) => {
 				const { call, input, badArgs } = parsed[i];
 				if (badArgs) {
+					// TodoWrite/Read with truncated JSON: don't error, just skip.
+					// The model's text response is still valid and should be displayed.
+					// Erroring here causes red X in UI and stops processing.
+					if (call.name === "TodoWrite" || call.name === "TodoRead") {
+						results[i] = {
+							status: "completed",
+							output: call.name === "TodoRead" ? "(no todos)" : "(todos: skipped due to truncated input)",
+						};
+						finishUi(i);
+						return;
+					}
 					results[i] = {
 						status: "error",
 						output: `error: tool arguments were not valid JSON (likely truncated — the payload was too large). Retry with a smaller edit: split the change into multiple smaller ${call.name} calls.`,

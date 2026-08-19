@@ -5,7 +5,7 @@
 import { describe, it, expect } from "vitest";
 
 interface TodoItem {
-  id: string;
+  id?: string;
   content: string;
   status: "pending" | "in_progress" | "completed" | "cancelled";
 }
