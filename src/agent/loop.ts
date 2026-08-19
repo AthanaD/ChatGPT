@@ -542,19 +542,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// If the same tool+args signature appears repeatedly, the model is stuck.
 		const recentToolCalls = new Map<string, number>();
 		const TOOL_REPEAT_LIMIT = 2;
-		// Anti-loop: detect excessive TodoWrite calls using a rolling window.
-		// The model may interleave TodoWrite with Read/Grep to look busy while
-		// just stepping through the todo list. Track per-step counts in a
-		// sliding window and break when TodoWrite dominates AND no file-editing
-		// work was done. Thresholds are generous to avoid false positives in
-		// legitimate workflows (create todos, mark progress, do work, repeat).
-		let totalToolCallsRecent = 0;
-		let todoCallsRecent = 0;
-		let editCallsRecent = 0;
-		const ROLLING_WINDOW = 10;
-		const TODO_RATIO_LIMIT = 0.85;
-		const EDIT_TOOLS_SET = new Set(["Write", "StrReplace", "Delete", "Shell", "EditNotebook"]);
-		const recentStepCounts: { total: number; todo: number; edit: number }[] = [];
 		// Anti-loop: detect duplicate text across turns. If the model produces
 		// nearly identical text twice, it's stuck in a thought loop.
 		let lastAssistantText = "";
@@ -840,12 +827,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// calls), it's stuck in a "resume" echo chamber. Break after N
 				// consecutive text-only turns to prevent infinite nudge cycles.
 				consecutiveTextTurns++;
-				// Reset the rolling-window TodoWrite tracker when the model produces
-				// text-only turns, since meaningful output means it's no longer stuck
-				// in a todo-update loop.
-				totalToolCallsRecent = 0;
-				todoCallsRecent = 0;
-				editCallsRecent = 0;
 				if (consecutiveTextTurns >= CONSECUTIVE_TEXT_LIMIT) {
 					finalText = assistantText;
 					break;
@@ -1277,33 +1258,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						return;
 					}
 				}
-			}
-			// Anti-loop: track TodoWrite calls in a rolling window. MUST run after
-			// tool execution — if it ran before, the break would prevent tools
-			// from executing, leaving the UI stuck on "Updating...".
-			const todoCallCount = calls.filter((c) => c.name === "TodoWrite").length;
-			const editCallCount = calls.filter((c) => EDIT_TOOLS_SET.has(c.name)).length;
-			const stepTotal = calls.length;
-			recentStepCounts.push({ total: stepTotal, todo: todoCallCount, edit: editCallCount });
-			totalToolCallsRecent += stepTotal;
-			todoCallsRecent += todoCallCount;
-			editCallsRecent += editCallCount;
-			if (recentStepCounts.length > ROLLING_WINDOW) {
-				const oldest = recentStepCounts.shift()!;
-				totalToolCallsRecent -= oldest.total;
-				todoCallsRecent -= oldest.todo;
-				editCallsRecent -= oldest.edit;
-			}
-			// Only trigger when TodoWrite dominates AND no real work (file edits)
-			// was done in the window. TodoWrite + Write = legitimate progress.
-			// TodoWrite + Read only = model stepping through the list.
-			if (
-				totalToolCallsRecent >= ROLLING_WINDOW &&
-				editCallsRecent === 0 &&
-				todoCallsRecent / totalToolCallsRecent >= TODO_RATIO_LIMIT
-			) {
-				finalText = `The model is spending too many steps on todo updates (${todoCallsRecent} of ${totalToolCallsRecent} recent tool calls were TodoWrite) without making progress on the actual task. Stop updating todos — either continue working on the task or give your final answer.`;
-				break;
 			}
 		}
 
