@@ -30,17 +30,19 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     const incoming: TodoItem[] = Array.isArray(input?.todos) ? input.todos : [];
     if (input?.merge) {
       // Merge mode: combine existing + incoming by id.
-      const byId = new Map(ctx.todos.map((t) => [t.id, t]));
+      // Auto-generate id if model (Mimo) omits it.
+      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
       for (const t of incoming) {
-        if (t && typeof t === "object" && t.id) {
-          byId.set(t.id, { ...byId.get(t.id), ...t });
+        if (t && typeof t === "object") {
+          const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+          byId.set(key, { ...byId.get(key), ...t, id: key });
         }
       }
       ctx.todos = [...byId.values()];
     } else if (incoming.length > 0) {
       // Replace mode: only replace if incoming is non-empty.
-      // Empty array = model mistake, preserve existing list.
-      ctx.todos = incoming.filter((t) => t && typeof t === "object" && t.id);
+      // Accept items even without id — model (Mimo) often omits it.
+      ctx.todos = incoming.filter((t) => t && typeof t === "object");
     }
     // Render in [x]/[ ] format so the webview TodoList component can parse it.
     const render = ctx.todos
