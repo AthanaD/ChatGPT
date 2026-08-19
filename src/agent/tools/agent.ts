@@ -32,19 +32,22 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     ctx.todos = [...byId.values()];
   } else {
     // Replace mode: guard against accidental wipe. Only allow replacement if
-    // incoming is non-empty. An empty array (or all-completed with no open
-    // items in existing list) would erase the todo list and freeze processing.
+    // incoming is non-empty. An empty array would erase the todo list.
     if (incoming.length === 0) {
       return { output: "error: cannot replace todos with an empty list. Use merge=true to update individual items." };
     }
     ctx.todos = incoming;
   }
-  // Brief acknowledgment only — never echo the full list back. Returning the
-  // complete list in the tool output causes the model to see pending items and
-  // loop endlessly calling TodoWrite to step through them one by one.
-  const done = ctx.todos.filter((t) => t.status === "completed").length;
-  const open = ctx.todos.length - done;
-  return { output: `Todos updated: ${done} completed, ${open} remaining.` };
+  // Render in [x]/[ ] format so the webview TodoList component can parse it.
+  // The rolling window anti-loop in loop.ts prevents the model from looping.
+  const render = ctx.todos
+    .map((t) => {
+      const mark =
+        t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
+      return `${mark} ${t.content}`;
+    })
+    .join("\n");
+  return { output: render || "(no todos)" };
 });
 
 // ---- TodoRead ----
