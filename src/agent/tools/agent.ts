@@ -23,27 +23,37 @@ import {
 
 // ---- TodoWrite ----
 export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abortSignal, _callId, ctx) => {
-  if (!ctx) return { output: "error: todo context unavailable" };
-  const incoming: TodoItem[] = Array.isArray(input.todos) ? input.todos : [];
-  if (input.merge) {
-    // Merge mode: combine existing + incoming by id.
-    const byId = new Map(ctx.todos.map((t) => [t.id, t]));
-    for (const t of incoming) byId.set(t.id, { ...byId.get(t.id), ...t });
-    ctx.todos = [...byId.values()];
-  } else if (incoming.length > 0) {
-    // Replace mode: only replace if incoming is non-empty.
-    // Empty array = model mistake, preserve existing list.
-    ctx.todos = incoming;
+  try {
+    if (!ctx) return { output: "error: todo context unavailable" };
+    // Ensure ctx.todos is always an array (defensive — prevents throw).
+    if (!Array.isArray(ctx.todos)) ctx.todos = [];
+    const incoming: TodoItem[] = Array.isArray(input?.todos) ? input.todos : [];
+    if (input?.merge) {
+      // Merge mode: combine existing + incoming by id.
+      const byId = new Map(ctx.todos.map((t) => [t.id, t]));
+      for (const t of incoming) {
+        if (t && typeof t === "object" && t.id) {
+          byId.set(t.id, { ...byId.get(t.id), ...t });
+        }
+      }
+      ctx.todos = [...byId.values()];
+    } else if (incoming.length > 0) {
+      // Replace mode: only replace if incoming is non-empty.
+      // Empty array = model mistake, preserve existing list.
+      ctx.todos = incoming.filter((t) => t && typeof t === "object" && t.id);
+    }
+    // Render in [x]/[ ] format so the webview TodoList component can parse it.
+    const render = ctx.todos
+      .map((t) => {
+        const mark =
+          t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
+        return `${mark} ${t.content || "unnamed"}`;
+      })
+      .join("\n");
+    return { output: render || "(no todos)" };
+  } catch (e) {
+    return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
   }
-  // Render in [x]/[ ] format so the webview TodoList component can parse it.
-  const render = ctx.todos
-    .map((t) => {
-      const mark =
-        t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-      return `${mark} ${t.content}`;
-    })
-    .join("\n");
-  return { output: render || "(no todos)" };
 });
 
 // ---- TodoRead ----
