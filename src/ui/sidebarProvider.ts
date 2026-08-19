@@ -263,12 +263,16 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                     b.name === "Task" || b.name === "task" || b.subStatus
                       ? (timedOut ? ("error" as const) : ("cancelled" as const))
                       : b.subStatus;
+                  // TodoWrite/Read: use "completed" instead of "error" to avoid red X
+                  const isTodo = b.name === "TodoWrite" || b.name === "TodoRead"
+                    || b.name === "todo_write" || b.name === "todo_read";
                   return {
                     ...b,
-                    status: "error" as const,
+                    status: isTodo ? "completed" as const : "error" as const,
                     result:
                       b.result ||
-                      (timedOut
+                      (isTodo ? "(todos: cancelled)" :
+                        timedOut
                         ? `(timeout after ${Math.round((b.timeoutMs || 0) / 1000)}s)`
                         : "(cancelled)"),
                     subStatus,
@@ -284,7 +288,12 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
             const resultMsg = timedOut
               ? `(timeout after tool budget)`
               : "(cancelled)";
-            // Always push completed so webview spinner dies even if turns map missed.
+            // TodoWrite/Read: cancel/timeout should NOT show red X in UI.
+            // The "(cancelled)" string doesn't match parseTodos patterns, so
+            // status "error" + empty parse = red X + "(no todos)" which stops
+            // processing visually. Use "completed" for TodoWrite/Read.
+            const isTodo = toolName === "TodoWrite" || toolName === "TodoRead"
+              || toolName === "todo_write" || toolName === "todo_read";
             this._view?.webview.postMessage({
               type: "agentEvent",
               convId: cid,
@@ -292,8 +301,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
                 type: "tool-call-completed",
                 callId: data.callId,
                 name: toolName,
-                status: "error",
-                result: resultMsg,
+                status: isTodo ? "completed" : "error",
+                result: isTodo ? "(todos: cancelled)" : resultMsg,
               },
             });
             if (toolName === "Task" || toolName === "task") {
