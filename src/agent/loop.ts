@@ -890,15 +890,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					);
 					continue;
 				}
-				// Model produced text without tools — treat as final answer ONLY if
-				// the text is meaningful (not empty). Empty/short responses likely
-				// mean the model is still thinking, not done. Let it try again.
-				if (assistantText.trim().length > 10) {
-					finalText = assistantText;
-					break;
-				}
-				// Short/empty text without tools — don't break yet, let the
-				// consecutiveTextTurns guard handle it after 2 turns.
+				// DO NOT break here — let consecutiveTextTurns handle the exit.
+				// Breaking on any text > N chars stops the model mid-task when it
+				// produces a brief acknowledgment like "I'll work on that" or "OK".
+				// The consecutiveTextTurns guard (limit=2) gives the model 2 turns
+				// to produce a real final answer before the loop exits.
 		} else {
 			// Model called tools — reset text-only counter.
 			consecutiveTextTurns = 0;
