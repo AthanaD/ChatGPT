@@ -26,10 +26,17 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
   if (!ctx) return { output: "error: todo context unavailable" };
   const incoming: TodoItem[] = Array.isArray(input.todos) ? input.todos : [];
   if (input.merge) {
+    // Merge mode: combine existing + incoming by id. Safe — never clears the list.
     const byId = new Map(ctx.todos.map((t) => [t.id, t]));
     for (const t of incoming) byId.set(t.id, { ...byId.get(t.id), ...t });
     ctx.todos = [...byId.values()];
   } else {
+    // Replace mode: guard against accidental wipe. Only allow replacement if
+    // incoming is non-empty. An empty array (or all-completed with no open
+    // items in existing list) would erase the todo list and freeze processing.
+    if (incoming.length === 0) {
+      return { output: "error: cannot replace todos with an empty list. Use merge=true to update individual items." };
+    }
     ctx.todos = incoming;
   }
   // Brief acknowledgment only — never echo the full list back. Returning the

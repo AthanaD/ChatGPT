@@ -545,12 +545,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// Anti-loop: detect excessive TodoWrite calls using a rolling window.
 		// The model may interleave TodoWrite with Read/Grep to look busy while
 		// just stepping through the todo list. Track per-step counts in a
-		// sliding window and break when TodoWrite exceeds 50% of calls.
+		// sliding window and break when TodoWrite exceeds 75% of calls AND no
+		// file-editing work was done in the window.
 		let totalToolCallsRecent = 0;
 		let todoCallsRecent = 0;
+		let editCallsRecent = 0;
 		const ROLLING_WINDOW = 6;
-		const TODO_RATIO_LIMIT = 0.5;
-		const recentStepCounts: { total: number; todo: number }[] = [];
+		const TODO_RATIO_LIMIT = 0.75;
+		const EDIT_TOOLS_SET = new Set(["Write", "StrReplace", "Delete", "Shell", "EditNotebook"]);
+		const recentStepCounts: { total: number; todo: number; edit: number }[] = [];
 		// Anti-loop: detect duplicate text across turns. If the model produces
 		// nearly identical text twice, it's stuck in a thought loop.
 		let lastAssistantText = "";
@@ -841,6 +844,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// in a todo-update loop.
 				totalToolCallsRecent = 0;
 				todoCallsRecent = 0;
+				editCallsRecent = 0;
 				if (consecutiveTextTurns >= CONSECUTIVE_TEXT_LIMIT) {
 					finalText = assistantText;
 					break;
@@ -940,20 +944,27 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// just stepping through the list, so a consecutive counter resets
 			// on any non-TodoWrite call. A rolling window catches this.
 			const todoCallCount = calls.filter((c) => c.name === "TodoWrite").length;
+			const editCallCount = calls.filter((c) => EDIT_TOOLS_SET.has(c.name)).length;
 			const stepTotal = calls.length;
-			recentStepCounts.push({ total: stepTotal, todo: todoCallCount });
+			recentStepCounts.push({ total: stepTotal, todo: todoCallCount, edit: editCallCount });
 			totalToolCallsRecent += stepTotal;
 			todoCallsRecent += todoCallCount;
+			editCallsRecent += editCallCount;
 			if (recentStepCounts.length > ROLLING_WINDOW) {
 				const oldest = recentStepCounts.shift()!;
 				totalToolCallsRecent -= oldest.total;
 				todoCallsRecent -= oldest.todo;
+				editCallsRecent -= oldest.edit;
 			}
+			// Only trigger when TodoWrite dominates AND no real work (file edits)
+			// was done in the window. TodoWrite + Write = legitimate progress.
+			// TodoWrite + Read only = model stepping through the list.
 			if (
 				totalToolCallsRecent >= ROLLING_WINDOW &&
+				editCallsRecent === 0 &&
 				todoCallsRecent / totalToolCallsRecent >= TODO_RATIO_LIMIT
 			) {
-				finalText = `The model is spending too many steps on todo updates (${todoCallsRecent} of ${totalToolCallsRecent} recent tool calls were TodoWrite). Stop updating todos — either continue working on the actual task or give your final answer.`;
+				finalText = `The model is spending too many steps on todo updates (${todoCallsRecent} of ${totalToolCallsRecent} recent tool calls were TodoWrite) without making progress on the actual task. Stop updating todos — either continue working on the task or give your final answer.`;
 				break;
 			}
 		}
