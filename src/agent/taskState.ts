@@ -147,8 +147,14 @@ export class ActivityLedger {
 		if (request) parts.push(`Original request: ${request.length > 600 ? `${request.slice(0, 600)}…` : request}`);
 
 		if (opts.todos.length) {
-			const mark = (s: TodoItem["status"]) => (s === "completed" ? "x" : s === "in_progress" ? ">" : s === "cancelled" ? "-" : " ");
-			parts.push(`Todos:\n${opts.todos.map((t) => `  [${mark(t.status)}] ${t.content}`).join("\n")}`);
+			const counts = { completed: 0, in_progress: 0, pending: 0, cancelled: 0 };
+			for (const t of opts.todos) counts[t.status]++;
+			const open = counts.pending + counts.in_progress;
+			const parts_list: string[] = [];
+			if (counts.completed) parts_list.push(`${counts.completed} done`);
+			if (open) parts_list.push(`${open} open`);
+			if (counts.cancelled) parts_list.push(`${counts.cancelled} cancelled`);
+			parts.push(`Todos: ${opts.todos.length} total (${parts_list.join(", ")})`);
 		}
 
 		if (this.files.size) {
