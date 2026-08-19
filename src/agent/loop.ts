@@ -881,9 +881,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 			}
 			lastAssistantText = assistantText;
+				// Empty turn right after a tool result → nudge for more work.
 				const prev = history[history.length - 2];
-				// Empty turn right after a tool result → nudge for more work. If it
-				// produced any text, that's its final answer — stop.
 				if (canNudge && isAgentic() && !assistantText.trim() && !thinking.trim() && prev && prev.kind === "tool-result") {
 					nudgeCount++;
 					pushSystemNote(
@@ -891,8 +890,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					);
 					continue;
 				}
-				finalText = assistantText;
-				break;
+				// Model produced text without tools — treat as final answer ONLY if
+				// the text is meaningful (not empty). Empty/short responses likely
+				// mean the model is still thinking, not done. Let it try again.
+				if (assistantText.trim().length > 10) {
+					finalText = assistantText;
+					break;
+				}
+				// Short/empty text without tools — don't break yet, let the
+				// consecutiveTextTurns guard handle it after 2 turns.
 		} else {
 			// Model called tools — reset text-only counter.
 			consecutiveTextTurns = 0;
