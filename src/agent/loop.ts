@@ -939,34 +939,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 			}
 			if (finalText) break;
-			// Anti-loop: track TodoWrite calls in a rolling window. The model
-			// often interleaves TodoWrite with Read/Grep to look busy while
-			// just stepping through the list, so a consecutive counter resets
-			// on any non-TodoWrite call. A rolling window catches this.
-			const todoCallCount = calls.filter((c) => c.name === "TodoWrite").length;
-			const editCallCount = calls.filter((c) => EDIT_TOOLS_SET.has(c.name)).length;
-			const stepTotal = calls.length;
-			recentStepCounts.push({ total: stepTotal, todo: todoCallCount, edit: editCallCount });
-			totalToolCallsRecent += stepTotal;
-			todoCallsRecent += todoCallCount;
-			editCallsRecent += editCallCount;
-			if (recentStepCounts.length > ROLLING_WINDOW) {
-				const oldest = recentStepCounts.shift()!;
-				totalToolCallsRecent -= oldest.total;
-				todoCallsRecent -= oldest.todo;
-				editCallsRecent -= oldest.edit;
-			}
-			// Only trigger when TodoWrite dominates AND no real work (file edits)
-			// was done in the window. TodoWrite + Write = legitimate progress.
-			// TodoWrite + Read only = model stepping through the list.
-			if (
-				totalToolCallsRecent >= ROLLING_WINDOW &&
-				editCallsRecent === 0 &&
-				todoCallsRecent / totalToolCallsRecent >= TODO_RATIO_LIMIT
-			) {
-				finalText = `The model is spending too many steps on todo updates (${todoCallsRecent} of ${totalToolCallsRecent} recent tool calls were TodoWrite) without making progress on the actual task. Stop updating todos — either continue working on the task or give your final answer.`;
-				break;
-			}
 		}
 
 			const parsed = calls.map((call) => {
@@ -1304,6 +1276,33 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						return;
 					}
 				}
+			}
+			// Anti-loop: track TodoWrite calls in a rolling window. MUST run after
+			// tool execution — if it ran before, the break would prevent tools
+			// from executing, leaving the UI stuck on "Updating...".
+			const todoCallCount = calls.filter((c) => c.name === "TodoWrite").length;
+			const editCallCount = calls.filter((c) => EDIT_TOOLS_SET.has(c.name)).length;
+			const stepTotal = calls.length;
+			recentStepCounts.push({ total: stepTotal, todo: todoCallCount, edit: editCallCount });
+			totalToolCallsRecent += stepTotal;
+			todoCallsRecent += todoCallCount;
+			editCallsRecent += editCallCount;
+			if (recentStepCounts.length > ROLLING_WINDOW) {
+				const oldest = recentStepCounts.shift()!;
+				totalToolCallsRecent -= oldest.total;
+				todoCallsRecent -= oldest.todo;
+				editCallsRecent -= oldest.edit;
+			}
+			// Only trigger when TodoWrite dominates AND no real work (file edits)
+			// was done in the window. TodoWrite + Write = legitimate progress.
+			// TodoWrite + Read only = model stepping through the list.
+			if (
+				totalToolCallsRecent >= ROLLING_WINDOW &&
+				editCallsRecent === 0 &&
+				todoCallsRecent / totalToolCallsRecent >= TODO_RATIO_LIMIT
+			) {
+				finalText = `The model is spending too many steps on todo updates (${todoCallsRecent} of ${totalToolCallsRecent} recent tool calls were TodoWrite) without making progress on the actual task. Stop updating todos — either continue working on the task or give your final answer.`;
+				break;
 			}
 		}
 
