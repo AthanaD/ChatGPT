@@ -30,9 +30,9 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     const byId = new Map(ctx.todos.map((t) => [t.id, t]));
     for (const t of incoming) byId.set(t.id, { ...byId.get(t.id), ...t });
     ctx.todos = [...byId.values()];
-  } else {
-    // Replace mode: full replacement. Rolling window anti-loop in loop.ts
-    // prevents the model from looping by breaking when TodoWrite dominates.
+  } else if (incoming.length > 0) {
+    // Replace mode: only replace if incoming is non-empty.
+    // Empty array = model mistake, preserve existing list.
     ctx.todos = incoming;
   }
   // Render in [x]/[ ] format so the webview TodoList component can parse it.
