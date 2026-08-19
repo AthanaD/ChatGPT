@@ -1152,21 +1152,32 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						logError("tool.execute", e, { tool: call.name, callId: call.id });
 						try { toolAc.abort(); } catch { /* ignore */ }
 						const isTo = timedOut || msg.startsWith("timeout:") || msg.startsWith("aborted:");
-						r = {
-							output: isTo
-								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
-								: `error: ${msg}`,
-						};
+						// TodoWrite/Read: abort or timeout should NOT produce error status.
+						// The red X in UI stops processing. Return success instead.
+						if (isTo && (call.name === "TodoWrite" || call.name === "TodoRead")) {
+							r = { output: call.name === "TodoRead" ? "(no todos)" : "(todos: skipped)" };
+						} else {
+							r = {
+								output: isTo
+									? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
+									: `error: ${msg}`,
+							};
+						}
 					} finally {
 						signal.removeEventListener("abort", onParentAbort);
 					}
 					// Timeout path already set results + finishUi; don't overwrite with a late success.
 					if (timedOut || completedUi.has(i)) {
 						if (!results[i]) {
-							results[i] = {
-								status: "error",
-								output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
-							};
+							// TodoWrite/Read: don't error on abort/timeout — red X stops processing
+							if (call.name === "TodoWrite" || call.name === "TodoRead") {
+								results[i] = { status: "completed", output: r?.output || "(todos: skipped)" };
+							} else {
+								results[i] = {
+									status: "error",
+									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+								};
+							}
 						}
 						finishUi(i);
 						return;
