@@ -545,13 +545,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// Anti-loop: detect excessive TodoWrite calls using a rolling window.
 		// The model may interleave TodoWrite with Read/Grep to look busy while
 		// just stepping through the todo list. Track per-step counts in a
-		// sliding window and break when TodoWrite exceeds 75% of calls AND no
-		// file-editing work was done in the window.
+		// sliding window and break when TodoWrite dominates AND no file-editing
+		// work was done. Thresholds are generous to avoid false positives in
+		// legitimate workflows (create todos, mark progress, do work, repeat).
 		let totalToolCallsRecent = 0;
 		let todoCallsRecent = 0;
 		let editCallsRecent = 0;
-		const ROLLING_WINDOW = 6;
-		const TODO_RATIO_LIMIT = 0.75;
+		const ROLLING_WINDOW = 10;
+		const TODO_RATIO_LIMIT = 0.85;
 		const EDIT_TOOLS_SET = new Set(["Write", "StrReplace", "Delete", "Shell", "EditNotebook"]);
 		const recentStepCounts: { total: number; todo: number; edit: number }[] = [];
 		// Anti-loop: detect duplicate text across turns. If the model produces
