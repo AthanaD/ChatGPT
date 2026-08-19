@@ -67,7 +67,7 @@ const PROJECT_REMINDER =
 	"Plan the project with TodoWrite, then delegate each unit of work to the right team member with the Task tool " +
 	'(run_in_background=true, subagent_type set to the member name), launching every independent member AT THE SAME TIME in a single turn.\n</reminder>';
 
-const MAX_STEPS = 50;
+const MAX_STEPS = 200;
 
 /**
  * Tools whose description carries protocol the model must not lose mid-run
