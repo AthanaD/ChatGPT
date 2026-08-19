@@ -528,8 +528,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		let finalText = "";
 		let planWritten = false;
 		let planNudged = false;
-		// One-shot nudge when the model stops with unfinished todos.
-		let todoNudged = false;
 		// Anti-loop: count consecutive text-only turns (no tool calls). After
 		// CONSECUTIVE_TEXT_LIMIT in a row, the model is stuck in a resume loop —
 		// break out instead of nudging again.
@@ -892,18 +890,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						"If you need to make more tool calls to complete the task, please do so now. If you are fully finished, reply normally without calling any tools.",
 					);
 					continue;
-				}
-				// Unfinished todo list → one nudge to finish or explicitly wrap up.
-				if (canNudge && isAgentic() && !isSubagent && !todoNudged) {
-					const open = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
-					if (open.length) {
-						todoNudged = true;
-						nudgeCount++;
-						pushSystemNote(
-							`Your todo list still has ${open.length} unfinished item${open.length > 1 ? "s" : ""}: ${open.map((t) => `"${t.content}"`).join(", ")}. Continue working on them now. If they are actually done or no longer needed, update the todo list, then give your final answer.`,
-						);
-						continue;
-					}
 				}
 				finalText = assistantText;
 				break;
