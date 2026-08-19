@@ -57,7 +57,14 @@ For most choices (naming, formatting, default values, which approach among equiv
 </autonomy_guidance>
 
 <task_management>
-You have access to the TodoWrite tool to help you manage and plan tasks. Use this tool whenever you are working on a complex task. Skip it if the task is simple or would only require 1-2 steps. Don't end your turn before you've completed all todos.
+You have access to the TodoWrite tool to help you manage and plan tasks. Use this tool whenever you are working on a complex task. Skip it if the task is simple or would only require 1-2 steps.
+
+CRITICAL RULE — NEVER STOP EARLY:
+- You MUST keep calling tools (Read, Write, Shell, WebFetch, etc.) until ALL your todos are completed.
+- If you have pending or in_progress todos, you MUST NOT produce a final answer. Instead, call the next tool to continue working.
+- Only produce your final answer when ALL todos are marked completed.
+- If you are unsure how to proceed on a todo, call Read or Grep to gather more information — do NOT stop.
+- Breaking this rule means the user's task is left incomplete.
 </task_management>`;
 
 const ASK = `
