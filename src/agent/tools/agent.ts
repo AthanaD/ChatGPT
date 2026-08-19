@@ -32,14 +32,12 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
   } else {
     ctx.todos = incoming;
   }
-  const render = ctx.todos
-    .map((t) => {
-      const mark =
-        t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-      return `${mark} ${t.content}`;
-    })
-    .join("\n");
-  return { output: `Updated todos:\n${render}` };
+  // Brief acknowledgment only — never echo the full list back. Returning the
+  // complete list in the tool output causes the model to see pending items and
+  // loop endlessly calling TodoWrite to step through them one by one.
+  const done = ctx.todos.filter((t) => t.status === "completed").length;
+  const open = ctx.todos.length - done;
+  return { output: `Todos updated: ${done} completed, ${open} remaining.` };
 });
 
 // ---- TodoRead ----
