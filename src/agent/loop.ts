@@ -542,6 +542,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// If the same tool+args signature appears repeatedly, the model is stuck.
 		const recentToolCalls = new Map<string, number>();
 		const TOOL_REPEAT_LIMIT = 2;
+		// Anti-loop: detect consecutive TodoWrite calls regardless of arguments.
+		// When the model updates todos one-by-one without doing real work, it
+		// burns through steps without progressing the task.
+		let consecutiveTodoWrites = 0;
+		const TODO_WRITE_LIMIT = 8;
 		// Anti-loop: detect duplicate text across turns. If the model produces
 		// nearly identical text twice, it's stuck in a thought loop.
 		let lastAssistantText = "";
@@ -908,20 +913,35 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				finalText = assistantText;
 				break;
 		} else {
-				// Model called tools — reset text-only counter.
-				consecutiveTextTurns = 0;
-				// Track tool call signatures to detect oscillation.
-				for (const c of calls) {
-					const sig = `${c.name}:${(c.arguments || "").slice(0, 200)}`;
-					const count = (recentToolCalls.get(sig) ?? 0) + 1;
-					recentToolCalls.set(sig, count);
-					if (count >= TOOL_REPEAT_LIMIT) {
-						finalText = `The model is repeating the same tool call (${c.name}) ${count} times. This indicates a loop. Stopping.`;
-						break;
-					}
+			// Model called tools — reset text-only counter.
+			consecutiveTextTurns = 0;
+			// Track tool call signatures to detect oscillation.
+			for (const c of calls) {
+				const sig = `${c.name}:${(c.arguments || "").slice(0, 200)}`;
+				const count = (recentToolCalls.get(sig) ?? 0) + 1;
+				recentToolCalls.set(sig, count);
+				if (count >= TOOL_REPEAT_LIMIT) {
+					finalText = `The model is repeating the same tool call (${c.name}) ${count} times. This indicates a loop. Stopping.`;
+					break;
 				}
-				if (finalText) break;
 			}
+			if (finalText) break;
+			// Anti-loop: consecutive TodoWrite calls indicate the model is stuck
+			// updating todos one-by-one instead of doing real work. Count ALL
+			// TodoWrite calls regardless of whether other tools are also in the
+			// batch — the model often interleaves TodoWrite with Read/Grep to
+			// look busy while just stepping through the list.
+			const todoCallCount = calls.filter((c) => c.name === "TodoWrite").length;
+			if (todoCallCount > 0) {
+				consecutiveTodoWrites += todoCallCount;
+				if (consecutiveTodoWrites >= TODO_WRITE_LIMIT) {
+					finalText = `The model has called TodoWrite ${consecutiveTodoWrites} times without finishing the task. Stop updating todos — either continue working on the task or give your final answer now.`;
+					break;
+				}
+			} else {
+				consecutiveTodoWrites = 0;
+			}
+		}
 
 			const parsed = calls.map((call) => {
 				let input: any = {};
