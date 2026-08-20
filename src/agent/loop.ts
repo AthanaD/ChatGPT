@@ -886,6 +886,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					);
 					continue;
 				}
+				// No todos created yet but model keeps producing text → force it to
+				// create a todo list and start working with tools.
+				if (canNudge && isAgentic() && toolCtx.todos.length === 0 && step >= 2) {
+					nudgeCount++;
+					pushSystemNote(
+						`CRITICAL: You have not created a todo list yet. ` +
+						`For complex tasks, you MUST first call TodoWrite to create a structured task list, ` +
+						`then work through each item systematically using the available tools (Read, Grep, Write, Shell, etc.). ` +
+						`Do NOT just describe what you will do — create the todo list and start working NOW.`,
+					);
+					continue;
+				}
 				// Only break on consecutive text turns when there are NO incomplete
 				// todos — meaning the model is genuinely done.
 				const effectiveLimit = isAgentic() ? CONSECUTIVE_TEXT_LIMIT : CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC;
