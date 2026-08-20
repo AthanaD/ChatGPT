@@ -7,15 +7,24 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
-/** Character-level similarity ratio between two strings (0..1). */
+/**
+ * Word-level Jaccard similarity ratio between two strings (0..1).
+ * Uses word tokens instead of character positions to avoid false positives
+ * when two texts share similar structure but different content (e.g., plan steps).
+ */
 function similarityRatio(a: string, b: string): number {
   if (a === b) return 1;
   if (!a || !b) return 0;
-  const maxLen = Math.max(a.length, b.length);
-  if (maxLen === 0) return 1;
-  let matches = 0;
-  for (let i = 0; i < maxLen; i++) { if (a[i] === b[i]) matches++; }
-  return matches / maxLen;
+  const tokenize = (s: string): Set<string> =>
+    new Set(s.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
+  const wordsA = tokenize(a);
+  const wordsB = tokenize(b);
+  if (wordsA.size === 0 && wordsB.size === 0) return 1;
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let intersection = 0;
+  for (const w of wordsA) { if (wordsB.has(w)) intersection++; }
+  const union = wordsA.size + wordsB.size - intersection;
+  return union > 0 ? intersection / union : 0;
 }
 
 import { streamChat, SamplingParams, ModelParams } from "./provider";
@@ -234,7 +243,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
 	// multitask/project are agentic (full tool access); treat them like agent for gating.
-	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug";
+	// plan mode is also agentic to enable truncation and thinking-only nudges.
+	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug" || mode === "plan";
+	// Plan mode needs more output tokens to compose long plans. Boost maxTokens
+	// if the user left it at default or a low value.
+	const planModeMaxTokens = mode === "plan" && (!maxTokens || maxTokens < 16384) ? 16384 : maxTokens;
 	/** Coordinator modes: the model delegates instead of implementing. */
 	const isCoordinator = () => mode === "multitask" || mode === "project";
 	// In project mode the roster is limited to the members of the assigned team(s).
@@ -527,15 +540,25 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	try {
 		let finalText = "";
 		let planWritten = false;
-		let planNudged = false;
+		let planNudgeCount = 0;
+		const MAX_PLAN_NUDGES = 3;
 		// Anti-loop: count consecutive text-only turns (no tool calls). After
 		// CONSECUTIVE_TEXT_LIMIT in a row, the model is stuck in a resume loop —
 		// break out instead of nudging again.
 		let consecutiveTextTurns = 0;
-		const CONSECUTIVE_TEXT_LIMIT = 2;
+		// Agentic modes (agent, plan, debug, etc.) need more text-only turns
+		// for complex tasks like plan composition or code analysis.
+		const CONSECUTIVE_TEXT_LIMIT = 6;
+		// Non-agentic modes (ask) keep a tighter limit.
+		const CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC = 2;
 		// Hard cap on total nudge injections per run to prevent infinite re-nudge.
 		let nudgeCount = 0;
-		const MAX_NUDGES = 3;
+		const MAX_NUDGES = 10;
+		// Track Task/explore subagent calls to detect when model is stuck
+		// calling subagents without creating a todo list.
+		let taskCallCount = 0;
+		let hasCalledTodoWrite = false;
+		const TASK_WITHOUT_TODO_LIMIT = 3;
 		// Anti-loop: track recent tool call signatures to detect oscillation.
 		// If the same tool+args signature appears repeatedly, the model is stuck.
 		const recentToolCalls = new Map<string, number>();
@@ -677,7 +700,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			// Auto context management. Budget = window minus the reply reservation.
 			const budget = contextTokens && contextTokens > 0
-				? Math.max(1024, contextTokens - (maxTokens ?? 4096) - 1024)
+				? Math.max(1024, contextTokens - (planModeMaxTokens ?? 4096) - 1024)
 				: 0;
 			// Tool schemas ride along on every request and are large; leaving them
 			// out of the estimate made the guard optimistic by 10k+ tokens.
@@ -713,6 +736,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						);
 						lastCompactionStep = step;
 						economizeHistory(history);
+						// After compaction, remind the model about existing todos so it
+						// doesn't call TodoWrite with an empty list. The structured
+						// toolCtx.todos persists, but the model may not realize this.
+						if (toolCtx.todos.length > 0) {
+							const todoSummary = toolCtx.todos
+								.map((t) => `- [${t.status}] ${t.content}`)
+								.join("\n");
+							pushSystemNote(
+								`IMPORTANT: Context was compacted but your todo list is preserved. ` +
+								`Current todos (${toolCtx.todos.length} items):\n${todoSummary}\n\n` +
+								`DO NOT call TodoWrite with an empty list. Continue working on the existing todos. ` +
+								`If you need to update them, use TodoWrite with merge=true to preserve existing items.`,
+							);
+						}
 						emit({ type: "compaction", status: "done", summary });
 					} catch {
 						emit({ type: "compaction", status: "failed" });
@@ -765,7 +802,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				model,
 				messages,
 				tools: activeTools,
-				maxTokens,
+				maxTokens: planModeMaxTokens,
 				sampling,
 				modelParams,
 				anthropic,
@@ -825,17 +862,45 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// calls), it's stuck in a "resume" echo chamber. Break after N
 				// consecutive text-only turns to prevent infinite nudge cycles.
 				consecutiveTextTurns++;
-				if (consecutiveTextTurns >= CONSECUTIVE_TEXT_LIMIT) {
+				// Agentic modes need more text-only turns for complex tasks.
+				// Non-agentic modes (ask) keep a tighter limit.
+				const effectiveLimit = isAgentic() ? CONSECUTIVE_TEXT_LIMIT : CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC;
+				if (consecutiveTextTurns >= effectiveLimit) {
 					finalText = assistantText;
 					break;
 				}
 				// Nudge budget: stop injecting system reminders after MAX_NUDGES
 				// total across the run to prevent infinite re-nudge loops.
 				const canNudge = nudgeCount < MAX_NUDGES;
-				// Plan mode must persist a plan file. If the model tries to end without
-				// calling write_plan, force it once.
-				if (canNudge && mode === "plan" && !planWritten && !planNudged) {
-					planNudged = true;
+				// CRITICAL: If there are incomplete todos, FORCE the model to continue.
+				// This prevents the model from stopping after completing one subtask.
+				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
+				if (canNudge && isAgentic() && incompleteTodos.length > 0 && consecutiveTextTurns >= 1) {
+					nudgeCount++;
+					const todoList = incompleteTodos.map((t) => `- [${t.status}] ${t.content}`).join("\n");
+					pushSystemNote(
+						`IMPORTANT: You have ${incompleteTodos.length} incomplete todo(s):\n${todoList}\n\n` +
+						`You MUST continue working on these tasks. Do NOT stop or produce a final answer. ` +
+						`Call the appropriate tools (Read, Grep, Write, Shell, etc.) to work on the next todo.`,
+					);
+					continue;
+				}
+				// After first text-only turn in agentic mode, remind model to use tools.
+				// This prevents the model from getting stuck in text-only mode.
+				if (canNudge && isAgentic() && consecutiveTextTurns === 1) {
+					nudgeCount++;
+					pushSystemNote(
+						"You produced a text response without calling any tools. " +
+						"To complete this task, you MUST use tools (Read, Grep, Write, Shell, etc.). " +
+						"Do not just describe what you will do — actually do it using the available tools.",
+					);
+					continue;
+				}
+				// Plan mode must persist a plan file. Allow multiple nudges
+				// (up to MAX_PLAN_NUDGES) since the model may need reminders
+				// when composing long plans.
+				if (canNudge && mode === "plan" && !planWritten && planNudgeCount < MAX_PLAN_NUDGES) {
+					planNudgeCount++;
 					nudgeCount++;
 					pushSystemNote(
 						"You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.",
@@ -873,7 +938,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 			// Anti-loop: detect duplicate text across turns. If the model produces
 			// nearly identical text twice, it's stuck in a thought loop.
-			if (assistantText && lastAssistantText && assistantText.trim().length > 20) {
+			// NOTE: Skip this check in plan mode — the model naturally produces
+			// similar text as it iterates on the plan composition.
+			if (mode !== "plan" && assistantText && lastAssistantText && assistantText.trim().length > 20) {
 				const similarity = similarityRatio(assistantText.trim(), lastAssistantText.trim());
 				if (similarity > 0.7) {
 					finalText = assistantText;
@@ -970,7 +1037,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					if (call.name === "TodoWrite" || call.name === "TodoRead") {
 						results[i] = {
 							status: "completed",
-							output: call.name === "TodoRead" ? "(no todos)" : "(todos: skipped due to truncated input)",
+							output: call.name === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first to create a structured task list." : "(todos: skipped due to truncated input)",
 						};
 						finishUi(i);
 						return;
@@ -1155,7 +1222,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						// TodoWrite/Read: abort or timeout should NOT produce error status.
 						// The red X in UI stops processing. Return success instead.
 						if (isTo && (call.name === "TodoWrite" || call.name === "TodoRead")) {
-							r = { output: call.name === "TodoRead" ? "(no todos)" : "(todos: skipped)" };
+							r = { output: call.name === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first." : "(todos: skipped)" };
 						} else {
 							r = {
 								output: isTo
@@ -1247,10 +1314,51 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (call.name === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
+				if (call.name === "TodoWrite" && r.status === "completed") {
+					hasCalledTodoWrite = true;
+				}
+				if (call.name === "Task") {
+					taskCallCount++;
+				}
+				// CRITICAL: If model calls TodoRead but there are no todos,
+				// force it to call TodoWrite first.
+				if (call.name === "TodoRead" && toolCtx.todos.length === 0 && nudgeCount < MAX_NUDGES) {
+					nudgeCount++;
+					pushSystemNote(
+						`CRITICAL: You called TodoRead but no todo list exists. ` +
+						`You MUST call TodoWrite NOW to create a structured task list. ` +
+						`List ALL the work that needs to be done, then work through each item systematically. ` +
+						`Do NOT proceed without a todo list.`
+					);
+				}
 				// Durable ledger backs the flat-cost <task_state> block; history itself
 				// keeps full tool results until auto-summarize / budget trim.
 				ledger.record(call.name, parsed[i].input, r.status, r.output);
 				pushHistory({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
+			}
+			// CRITICAL: After processing tool results, check if model called Task
+			// multiple times without creating a todo list. If so, force it to plan.
+			if (isAgentic() && !hasCalledTodoWrite && taskCallCount >= TASK_WITHOUT_TODO_LIMIT && nudgeCount < MAX_NUDGES) {
+				nudgeCount++;
+				pushSystemNote(
+					`CRITICAL: You have called Task/explore ${taskCallCount} times but have NOT created a todo list. ` +
+					`You MUST stop exploring and create a structured plan using TodoWrite. ` +
+					`List ALL the work that needs to be done, then work through each item systematically. ` +
+					`Do NOT launch more subagents until you have a todo list.`
+				);
+				continue;
+			}
+			// CRITICAL: After processing tool results, check if no todos exist
+			// and model has been running for 2+ turns. Force todo creation.
+			if (isAgentic() && !hasCalledTodoWrite && toolCtx.todos.length === 0 && step >= 2 && nudgeCount < MAX_NUDGES) {
+				nudgeCount++;
+				pushSystemNote(
+					`IMPORTANT: You have not created a todo list yet. ` +
+					`For complex tasks, you MUST first call TodoWrite to create a structured task list, ` +
+					`then work through each item systematically using the available tools. ` +
+					`Do NOT just describe what you will do — create the todo list and start working.`
+				);
+				continue;
 			}
 			// After launching background Task(s), wait for that wave before calling the
 			// model again. Otherwise the next turn (or empty-turn / todo nudge) races

@@ -28,6 +28,16 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     // Ensure ctx.todos is always an array (defensive — prevents throw).
     if (!Array.isArray(ctx.todos)) ctx.todos = [];
     const incoming: TodoItem[] = Array.isArray(input?.todos) ? input.todos : [];
+
+    // CRITICAL: If incoming is empty and no existing todos, force model to provide items.
+    if (incoming.length === 0 && ctx.todos.length === 0) {
+      return {
+        output: "ERROR: You called TodoWrite with an empty list. You MUST provide actual todo items. " +
+          "Example: TodoWrite with todos=[{content: 'Task 1', status: 'pending'}, {content: 'Task 2', status: 'pending'}]. " +
+          "Do NOT call TodoWrite with an empty todos array.",
+      };
+    }
+
     if (input?.merge) {
       // Merge mode: combine existing + incoming by id.
       // Auto-generate id if model (Mimo) omits it.
@@ -41,8 +51,21 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
       ctx.todos = [...byId.values()];
     } else if (incoming.length > 0) {
       // Replace mode: only replace if incoming is non-empty.
-      // Accept items even without id — model (Mimo) often omits it.
-      ctx.todos = incoming.filter((t) => t && typeof t === "object");
+      // PROTECTION: If incoming has fewer items than existing, merge instead
+      // of replace to prevent losing todos after context compaction.
+      if (ctx.todos.length > 0 && incoming.length < ctx.todos.length) {
+        // Auto-merge: combine existing + incoming by content matching
+        const existingByContent = new Map(ctx.todos.map((t) => [t.content, t]));
+        for (const t of incoming) {
+          if (t && typeof t === "object") {
+            existingByContent.set(t.content, { ...existingByContent.get(t.content), ...t });
+          }
+        }
+        ctx.todos = [...existingByContent.values()];
+      } else {
+        // Accept items even without id — model (Mimo) often omits it.
+        ctx.todos = incoming.filter((t) => t && typeof t === "object");
+      }
     }
     // Render in [x]/[ ] format so the webview TodoList component can parse it.
     const render = ctx.todos
@@ -52,7 +75,7 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
         return `${mark} ${t.content || "unnamed"}`;
       })
       .join("\n");
-    return { output: render || "(no todos)" };
+    return { output: render || "(no todos) Todos were processed but list is now empty." };
   } catch (e) {
     return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
   }
@@ -61,7 +84,11 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
 // ---- TodoRead ----
 export const todoReadTool = defineTool("TodoRead", false, async (_input, _abortSignal, _callId, ctx) => {
   if (!ctx) return { output: "error: todo context unavailable" };
-  if (!ctx.todos.length) return { output: "(no todos)" };
+  if (!ctx.todos.length) {
+    return {
+      output: "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first to create a structured task list before proceeding. Do NOT just describe what you will do — create the todo list now.",
+    };
+  }
   return { output: ctx.todos.map((t) => `- [${t.status}] ${t.content}`).join("\n") };
 });
 
