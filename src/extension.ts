@@ -36,6 +36,12 @@ export function activate(context: vscode.ExtensionContext) {
 
   const settingsManager = new SettingsManager(context);
   const featureStore = new FeatureStore(context);
+  // Reset edits approval to "ask" if it was set to "allow" in a previous session.
+  // Users must explicitly approve file writes — never silently allow.
+  const currentPolicy = featureStore.get().approvalPolicy;
+  if (currentPolicy?.edits?.mode === "allow") {
+    featureStore.set({ approvalPolicy: { ...currentPolicy, edits: { ...currentPolicy.edits, mode: "ask" } } });
+  }
   const syncToolTimeouts = () => setToolTimeoutOverrides(featureStore.get().toolTimeoutsSec);
   syncToolTimeouts();
   context.subscriptions.push(featureStore.onDidChange(syncToolTimeouts));
