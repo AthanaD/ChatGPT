@@ -97,8 +97,9 @@ export const askQuestionTool = defineTool("AskQuestion", false, async (input, ab
   const asker = ctx?.askUser ?? getQuestionAsker();
   if (!asker) return { output: "error: cannot ask questions in this context" };
 
-  // Cursor shape: questions:[{id, prompt, options:[{id,label}], allow_multiple}], title.
+// Cursor shape: questions:[{id, prompt, options:[{id,label}], allow_multiple}], title.
   // Back-compat: also accept {question, options:[string], multiple} and header.
+  // Structured inputs: {type: "text"|"textArea"|"number"|"date", required, placeholder}.
   const questions: AskQuestionItem[] = Array.isArray(input?.questions)
     ? input.questions
         .map((q: any) => ({
@@ -107,6 +108,9 @@ export const askQuestionTool = defineTool("AskQuestion", false, async (input, ab
             ? q.options.map((o: any) => (typeof o === "string" ? o : String(o?.label ?? o?.id ?? "")))
             : undefined,
           multiple: !!(q?.allow_multiple ?? q?.multiple),
+          type: typeof q?.type === "string" ? (q.type as AskQuestionItem["type"]) : undefined,
+          required: q?.required === true,
+          placeholder: typeof q?.placeholder === "string" ? q.placeholder : undefined,
         }))
         .filter((q: AskQuestionItem) => q.question)
     : [];

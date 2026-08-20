@@ -1554,6 +1554,34 @@ body {
 	outline: none;
 	border-color: var(--accent);
 }
+.qc-structured {
+	margin-top: 4px;
+}
+.qc-input,
+.qc-textarea {
+	width: 100%;
+	background: var(--bg-dark);
+	border: 1px solid var(--border-soft);
+	color: var(--fg);
+	border-radius: 7px;
+	padding: 8px 10px;
+	font-size: 12.5px;
+	font-family: inherit;
+	box-sizing: border-box;
+}
+.qc-input:focus,
+.qc-textarea:focus {
+	outline: none;
+	border-color: var(--accent);
+}
+.qc-textarea {
+	min-height: 80px;
+	resize: vertical;
+}
+.qc-required {
+	color: var(--error, #f44);
+	margin-left: 4px;
+}
 .qc-foot {
 	display: flex;
 	align-items: center;

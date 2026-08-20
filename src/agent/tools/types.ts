@@ -75,10 +75,19 @@ export type SubagentRunner = (
   opts?: SubagentOptions
 ) => Promise<string>;
 
+/** Structured input kinds supported by the AskQuestion chat UI. */
+export type AskQuestionType = "choices" | "text" | "textArea" | "number" | "date";
+
 export interface AskQuestionItem {
   question: string;
   options?: string[];
   multiple?: boolean;
+  /** Input kind. "choices" (default) keeps the multiple-choice UI. */
+  type?: AskQuestionType;
+  /** The user must answer before proceeding (default false). */
+  required?: boolean;
+  /** Placeholder for free-form fields (text/textArea/number/date). */
+  placeholder?: string;
 }
 export type QuestionAsker = (
   callId: string,

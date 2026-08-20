@@ -578,7 +578,7 @@ export function ReadLine({ block }: { block: ToolBlock }) {
   );
 }
 
-interface QItem { question: string; options?: string[]; multiple?: boolean }
+interface QItem { question: string; options?: string[]; multiple?: boolean; type?: "choices" | "text" | "textArea" | "number" | "date"; required?: boolean; placeholder?: string; id?: string }
 
 // Options may arrive as plain strings or Cursor-shape {id,label} objects; coerce to strings.
 function optLabel(o: any): string {
@@ -591,6 +591,10 @@ function QuestionCard({ block }: { block: ToolBlock }) {
     question: String(q?.question ?? q?.prompt ?? ""),
     options: Array.isArray(q?.options) ? q.options.map(optLabel) : undefined,
     multiple: !!(q?.multiple ?? q?.allow_multiple),
+    type: typeof q?.type === "string" ? q.type : undefined,
+    required: q?.required === true,
+    placeholder: typeof q?.placeholder === "string" ? q.placeholder : undefined,
+    id: typeof q?.id === "string" ? q.id : undefined,
   }));
   const answered = block.status !== "running";
   const [step, setStep] = React.useState(0);
@@ -601,12 +605,18 @@ function QuestionCard({ block }: { block: ToolBlock }) {
 
   if (questions.length === 0) return null;
 
-  const q = questions[step];
+const q = questions[step];
   const opts = q.options || [];
   const sel = answers[String(step)] || [];
   const customText = custom[String(step)] || "";
   const customSelected = customMode[String(step)] || false;
   const setCustomSelected = (on: boolean) => setCustomMode((c) => ({ ...c, [String(step)]: on }));
+  const isChoices = !q.type || q.type === "choices";
+  const structuredValue = custom[String(step)] || "";
+  // Required free-form fields block Continue/Submit until non-empty.
+  const choicesValid = !q.required || sel.length > 0 || (customSelected && customText.trim().length > 0);
+  const structuredValid = !q.required || structuredValue.trim().length > 0;
+  const isValid = isChoices ? choicesValid : structuredValid;
 
   const toggle = (opt: string) => {
     if (!q.multiple) setCustomSelected(false);
@@ -667,35 +677,63 @@ function QuestionCard({ block }: { block: ToolBlock }) {
         <span><Icon name="chat" size={14} /> {header}</span>
         <span className="qc-step">{step + 1} of {questions.length}</span>
       </div>
-      <div className="qc-question">{step + 1}. {q.question}</div>
-      {opts.map((opt, oi) => (
-        <button
-          key={oi}
-          className={"qc-option" + (sel.includes(opt) && !(!q.multiple && customSelected) ? " selected" : "")}
-          onClick={() => toggle(opt)}
-        >
-          <span className="qc-key">{String.fromCharCode(65 + oi)}</span>
-          <span>{opt}</span>
-        </button>
-      ))}
-      <button
-        className={"qc-option qc-option-custom" + (customSelected ? " selected" : "")}
-        onClick={() => (customSelected ? setCustomSelected(false) : pickCustom())}
-      >
-        <span className="qc-key">{String.fromCharCode(65 + opts.length)}</span>
-        <span>Other…</span>
-      </button>
-      {customSelected && (
-        <input
-          className="qc-custom"
-          placeholder="Type a custom answer…"
-          autoFocus
-          value={customText}
-          onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
-          onKeyDown={(e) => {
-            if (e.key === "Enter") (last ? submit() : advance());
-          }}
-        />
+      <div className="qc-question">{step + 1}. {q.question}{q.required && <span className="qc-required">*</span>}</div>
+      {isChoices ? (
+        <>
+          {opts.map((opt, oi) => (
+            <button
+              key={oi}
+              className={"qc-option" + (sel.includes(opt) && !(!q.multiple && customSelected) ? " selected" : "")}
+              onClick={() => toggle(opt)}
+            >
+              <span className="qc-key">{String.fromCharCode(65 + oi)}</span>
+              <span>{opt}</span>
+            </button>
+          ))}
+          <button
+            className={"qc-option qc-option-custom" + (customSelected ? " selected" : "")}
+            onClick={() => (customSelected ? setCustomSelected(false) : pickCustom())}
+          >
+            <span className="qc-key">{String.fromCharCode(65 + opts.length)}</span>
+            <span>Other…</span>
+          </button>
+          {customSelected && (
+            <input
+              className="qc-custom"
+              placeholder="Type a custom answer…"
+              autoFocus
+              value={customText}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (last ? submit() : advance());
+              }}
+            />
+          )}
+        </>
+      ) : (
+        <div className="qc-structured">
+          {q.type === "textArea" ? (
+            <textarea
+              className="qc-textarea"
+              placeholder={q.placeholder || "Type your answer…"}
+              autoFocus
+              value={structuredValue}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+            />
+          ) : (
+            <input
+              className="qc-input"
+              type={q.type === "number" ? "number" : q.type === "date" ? "date" : "text"}
+              placeholder={q.placeholder || "Type your answer…"}
+              autoFocus
+              value={structuredValue}
+              onChange={(e) => setCustom((c) => ({ ...c, [String(step)]: e.target.value }))}
+              onKeyDown={(e) => {
+                if (e.key === "Enter") (last ? submit() : advance());
+              }}
+            />
+          )}
+        </div>
       )}
       <div className="qc-foot">
         {step > 0 && <button className="qc-nav" onClick={() => setStep((s) => s - 1)}>Back</button>}

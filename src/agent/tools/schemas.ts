@@ -264,7 +264,7 @@ def({
 
 def({
   name: "AskQuestion",
-  description: "Collect structured multiple-choice answers from the user. Use this tool only when you are blocked on a decision that is genuinely the user's to make: one you cannot resolve from the request, the code, or sensible defaults.\n\nUsage notes:\n- Each question should have at least 2 options for the user to choose from\n- Users will always be able to select \"Other\" to provide custom text input\n- Use allow_multiple: true to allow multiple answers to be selected for a question\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label\n\nPrefer this tool over listing options in your final response text (as letters, numbers, bullet points, etc).",
+  description: "Collect answers from the user through the chat UI. Use this tool only when you are blocked on a decision that is genuinely the user's to make: one you cannot resolve from the request, the code, or sensible defaults.\n\nEach question can ask for a choice (multiple-choice options, with an optional free-text \"Other\") or for structured input (text, textArea, number, date).\n\nUsage notes:\n- For choice questions define at least 2 options; the user can always type \"Other\".\n- Use allow_multiple: true to allow multiple answers to be selected for a question\n- Use type: \"text\" / \"textArea\" / \"number\" / \"date\" (without options) when you need typed input, and set required: true when an answer is mandatory\n- If you recommend a specific option, make that the first option in the list and add \"(Recommended)\" at the end of the label\n- Prefer this tool over listing options in your final response text (as letters, numbers, bullet points, etc)",
   parameters: {
     type: "object",
     properties: {
@@ -276,6 +276,13 @@ def({
           properties: {
             id: { type: "string", description: "Unique identifier for this question" },
             prompt: { type: "string", description: "The question text to display to the user, without the options." },
+            type: {
+              type: "string",
+              enum: ["choices", "text", "textArea", "number", "date"],
+              description: "Input kind for this question. \"choices\" (default) renders the listed options; the others render a plain input field. Required questions can be marked with required: true.",
+            },
+            required: { type: "boolean", description: "If true, the user must answer before submitting (default false)." },
+            placeholder: { type: "string", description: "Placeholder text for text/textArea/number/date questions." },
             options: {
               type: "array",
               items: {
@@ -287,11 +294,11 @@ def({
                 required: ["id", "label"],
               },
               minItems: 2,
-              description: "Array of answer options (minimum 2 required)",
+              description: "Answer options for a \"choices\" question (minimum 2 required)",
             },
             allow_multiple: { type: "boolean", description: "If true, user can select multiple options. Defaults to false." },
           },
-          required: ["id", "prompt", "options"],
+          required: ["id", "prompt"],
         },
         minItems: 1,
         description: "Array of questions to present to the user (minimum 1 required)",
