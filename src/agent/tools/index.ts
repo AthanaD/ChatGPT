@@ -64,8 +64,9 @@ export const TOOLS: Record<string, Tool> = {
 export const MUTATING_TOOLS = new Set(["StrReplace", "Write", "Delete", "Shell", "EditNotebook"]);
 // File-editing tools (loop uses these for the auto-edit gate + afterEdit hook).
 export const EDIT_TOOLS = new Set(["StrReplace", "Write", "Delete", "EditNotebook"]);
-// WritePlan is exclusive to plan mode; it must never surface in agent/ask.
-const PLAN_ONLY = new Set(["WritePlan"]);
+// WritePlan available in plan AND agent modes — models need to save plans
+// during complex tasks. Only excluded from ask mode (read-only).
+const PLAN_ONLY = new Set<string>();
 
 // Multitask is a coordinator: it delegates to subagents (Task), manages todos,
 // and may read/search — but it must never mutate files or the shell itself.

@@ -203,7 +203,7 @@ async function* streamWithRetry(
   make: () => AsyncGenerator<ProviderEvent>,
   signal: AbortSignal,
   onRetry?: (attempt: number, max: number, delayMs: number, error: string) => void,
-  maxAttempts = 3,
+  maxAttempts = 5,
 ): AsyncGenerator<ProviderEvent> {
   for (let attempt = 1; ; attempt++) {
     // Stream live. Retry is only safe before the first event is emitted — once we
@@ -223,7 +223,7 @@ async function* streamWithRetry(
       if (emitted || attempt >= maxAttempts || !isRetryableError(e)) {
         throw e;
       }
-      const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
       onRetry?.(attempt, maxAttempts, delay, e instanceof Error ? e.message : String(e));
       await sleep(delay, signal);
     }
