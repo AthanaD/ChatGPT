@@ -1205,10 +1205,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 								timedOut = true;
 								killTool();
 								// Immediate UI settle on timeout — don't wait for tool cleanup.
-								results[i] = {
-									status: "error",
-									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
-								};
+								// TodoWrite/Read: use "completed" to avoid red X in UI.
+								if (call.name === "TodoWrite" || call.name === "TodoRead") {
+									results[i] = { status: "completed", output: "(todos: timeout)" };
+								} else {
+									results[i] = {
+										status: "error",
+										output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+									};
+								}
 								finishUi(i);
 							},
 							// Also settle when UI cancelSubagent aborts (countdown-0), not only wall timer.
@@ -1259,7 +1264,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					finishUi(i);
 				} catch (e) {
 					logError("tool.lifecycle", e, { tool: call.name, callId: call.id });
-					results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };
+					// TodoWrite/Read: use "completed" to avoid red X in UI
+					if (call.name === "TodoWrite" || call.name === "TodoRead") {
+						results[i] = { status: "completed", output: "(todos: error)" };
+					} else {
+						results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };
+					}
 					finishUi(i);
 				}
 			};
@@ -1272,7 +1282,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// Guarantee UI settles even if a branch forgot finishUi.
 					if (results[i]) finishUi(i);
 					else {
-						results[i] = { status: "error", output: "error: tool produced no result" };
+						// TodoWrite/Read: use "completed" to avoid red X in UI
+						const isTodo = parsed[i].call.name === "TodoWrite" || parsed[i].call.name === "TodoRead";
+						results[i] = { status: isTodo ? "completed" : "error", output: isTodo ? "(todos: no result)" : "error: tool produced no result" };
 						finishUi(i);
 					}
 				}
