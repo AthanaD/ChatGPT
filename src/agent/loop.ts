@@ -858,22 +858,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			}
 
 		if (!calls.length) {
-				// Anti-loop: if the model keeps producing text-only turns (no tool
-				// calls), it's stuck in a "resume" echo chamber. Break after N
-				// consecutive text-only turns to prevent infinite nudge cycles.
 				consecutiveTextTurns++;
-				// Agentic modes need more text-only turns for complex tasks.
-				// Non-agentic modes (ask) keep a tighter limit.
+				// CRITICAL: Wait for background subagents BEFORE checking consecutive
+				// text limit. Otherwise the loop breaks and the finally block
+				// force-marks all unsettled subagents as "(cancelled)".
+				if (bgPending()) {
+					await awaitPendingBg();
+					if (signal.aborted) {
+						emitSettled("cancelled");
+						return;
+					}
+					continue;
+				}
 				const effectiveLimit = isAgentic() ? CONSECUTIVE_TEXT_LIMIT : CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC;
 				if (consecutiveTextTurns >= effectiveLimit) {
 					finalText = assistantText;
 					break;
 				}
-				// Nudge budget: stop injecting system reminders after MAX_NUDGES
-				// total across the run to prevent infinite re-nudge loops.
 				const canNudge = nudgeCount < MAX_NUDGES;
-				// CRITICAL: If there are incomplete todos, FORCE the model to continue.
-				// This prevents the model from stopping after completing one subtask.
 				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
 				if (canNudge && isAgentic() && incompleteTodos.length > 0 && consecutiveTextTurns >= 1) {
 					nudgeCount++;
@@ -885,8 +887,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					);
 					continue;
 				}
-				// After first text-only turn in agentic mode, remind model to use tools.
-				// This prevents the model from getting stuck in text-only mode.
 				if (canNudge && isAgentic() && consecutiveTextTurns === 1) {
 					nudgeCount++;
 					pushSystemNote(
@@ -896,26 +896,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					);
 					continue;
 				}
-				// Plan mode must persist a plan file. Allow multiple nudges
-				// (up to MAX_PLAN_NUDGES) since the model may need reminders
-				// when composing long plans.
 				if (canNudge && mode === "plan" && !planWritten && planNudgeCount < MAX_PLAN_NUDGES) {
 					planNudgeCount++;
 					nudgeCount++;
 					pushSystemNote(
 						"You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.",
 					);
-					continue;
-				}
-				// In-flight background Task subagents: wait + feed results before any
-				// "continue" nudge. Otherwise the model gets another turn while workers
-				// are still running and often spawns a second wave of subagents.
-				if (bgPending()) {
-					await awaitPendingBg();
-					if (signal.aborted) {
-						emitSettled("cancelled");
-						return;
-					}
 					continue;
 				}
 				// Truncated response (hit max output tokens): the model didn't choose to
@@ -1427,8 +1413,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		try { emit({ type: "error", message: e instanceof Error ? e.message : String(e) }); } catch { /* ignore */ }
 		emitSettled("error");
 	} finally {
-		// Force-mark any still-unsettled bg slots so we never hang a follow-up wait.
-		if (signal.aborted || !settledEmitted) {
+		// Force-mark unsettled bg subagents ONLY when the user cancelled (abort).
+		// When run finishes normally, let subagents continue — their results
+		// will be delivered via emit and the model can process them on next run.
+		if (signal.aborted) {
 			for (let i = bgReported; i < bgSubagents.length; i++) {
 				if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
 			}
