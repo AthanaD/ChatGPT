@@ -859,9 +859,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 		if (!calls.length) {
 				consecutiveTextTurns++;
-				// CRITICAL: Wait for background subagents BEFORE checking consecutive
-				// text limit. Otherwise the loop breaks and the finally block
-				// force-marks all unsettled subagents as "(cancelled)".
+				// CRITICAL: Wait for bg subagents FIRST, then check incomplete todos,
+				// then check consecutive text limit. Order matters:
+				// 1. bgPending → wait (prevents subagent cancellation)
+				// 2. incomplete todos → nudge (prevents premature stop)
+				// 3. consecutiveTextTurns → break (only when truly stuck)
 				if (bgPending()) {
 					await awaitPendingBg();
 					if (signal.aborted) {
@@ -870,22 +872,26 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 					continue;
 				}
+				const canNudge = nudgeCount < MAX_NUDGES;
+				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
+				// ALWAYS nudge when there are incomplete todos — don't wait for
+				// consecutiveTextTurns >= 2. Mimo stops after 1 text turn.
+				if (canNudge && isAgentic() && incompleteTodos.length > 0) {
+					nudgeCount++;
+					const todoList = incompleteTodos.map((t) => `- [${t.status}] ${t.content}`).join("\n");
+					pushSystemNote(
+						`CRITICAL: You have ${incompleteTodos.length} incomplete todo(s):\n${todoList}\n\n` +
+						`You MUST continue working on these tasks NOW. Do NOT stop, do NOT produce a final answer. ` +
+						`Call the appropriate tools to work on the NEXT todo: "${incompleteTodos[0].content}"`,
+					);
+					continue;
+				}
+				// Only break on consecutive text turns when there are NO incomplete
+				// todos — meaning the model is genuinely done.
 				const effectiveLimit = isAgentic() ? CONSECUTIVE_TEXT_LIMIT : CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC;
 				if (consecutiveTextTurns >= effectiveLimit) {
 					finalText = assistantText;
 					break;
-				}
-				const canNudge = nudgeCount < MAX_NUDGES;
-				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
-				if (canNudge && isAgentic() && incompleteTodos.length > 0 && consecutiveTextTurns >= 1) {
-					nudgeCount++;
-					const todoList = incompleteTodos.map((t) => `- [${t.status}] ${t.content}`).join("\n");
-					pushSystemNote(
-						`IMPORTANT: You have ${incompleteTodos.length} incomplete todo(s):\n${todoList}\n\n` +
-						`You MUST continue working on these tasks. Do NOT stop or produce a final answer. ` +
-						`Call the appropriate tools (Read, Grep, Write, Shell, etc.) to work on the next todo.`,
-					);
-					continue;
 				}
 				if (canNudge && isAgentic() && consecutiveTextTurns === 1) {
 					nudgeCount++;
