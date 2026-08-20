@@ -888,13 +888,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// No todos created yet but model keeps producing text → force it to
 				// create a todo list and start working with tools.
-				if (canNudge && isAgentic() && toolCtx.todos.length === 0 && step >= 2) {
+				// Skip for subagents — they don't need their own todo list.
+				if (canNudge && isAgentic() && !isSubagent && !hasCalledTodoWrite && toolCtx.todos.length === 0 && step >= 2) {
 					nudgeCount++;
 					pushSystemNote(
-						`CRITICAL: You have not created a todo list yet. ` +
-						`For complex tasks, you MUST first call TodoWrite to create a structured task list, ` +
-						`then work through each item systematically using the available tools (Read, Grep, Write, Shell, etc.). ` +
-						`Do NOT just describe what you will do — create the todo list and start working NOW.`,
+						`IMPORTANT: You have not created a todo list yet. ` +
+						`Call TodoWrite to create a structured task list, then work through each item. ` +
+						`If you just ran a command, continue with the next step — do not stop.`,
 					);
 					continue;
 				}
