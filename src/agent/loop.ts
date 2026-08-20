@@ -558,6 +558,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// calling subagents without creating a todo list.
 		let taskCallCount = 0;
 		let hasCalledTodoWrite = false;
+		let hasDoneFirstEdit = false;
 		const TASK_WITHOUT_TODO_LIMIT = 3;
 		// Anti-loop: track recent tool call signatures to detect oscillation.
 		// If the same tool+args signature appears repeatedly, the model is stuck.
@@ -1148,7 +1149,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// Per-call action type: also gates ungated tools (e.g. Read) when they
 				// target paths outside the workspace.
 				const needsApproval = actionTypeForCall(call.name, input, getWorkspaceRoot()) !== undefined;
-				if (needsApproval && approve) {
+				// First edit in a run: ALWAYS ask for approval regardless of policy.
+				// This prevents the model from writing files silently on the first attempt.
+				const isFirstEdit = isEditTool && !hasDoneFirstEdit;
+				if (isFirstEdit) hasDoneFirstEdit = true;
+				if ((needsApproval || isFirstEdit) && approve) {
 					const approval = await approve(call.name, input, call.id);
 					if (approval !== true) {
 						const denied = approval && typeof approval === "object"
