@@ -36,20 +36,6 @@ export function activate(context: vscode.ExtensionContext) {
 
   const settingsManager = new SettingsManager(context);
   const featureStore = new FeatureStore(context);
-  // Reset ALL approval policies to "ask" on activation if they were set to
-  // "allow" in a previous session. Users must explicitly approve every action.
-  const currentPolicy = featureStore.get().approvalPolicy;
-  if (currentPolicy) {
-    let changed = false;
-    const resetMode = (key: keyof typeof currentPolicy) => {
-      if (currentPolicy[key]?.mode === "allow") {
-        (currentPolicy as any)[key] = { ...currentPolicy[key], mode: "ask" };
-        changed = true;
-      }
-    };
-    for (const key of ["edits", "shell", "delete", "mcp", "web", "outside"] as const) resetMode(key);
-    if (changed) featureStore.set({ approvalPolicy: currentPolicy });
-  }
   const syncToolTimeouts = () => setToolTimeoutOverrides(featureStore.get().toolTimeoutsSec);
   syncToolTimeouts();
   context.subscriptions.push(featureStore.onDidChange(syncToolTimeouts));
