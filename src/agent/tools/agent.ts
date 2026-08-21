@@ -27,6 +27,9 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     if (!ctx) return { output: "error: todo context unavailable" };
     if (!Array.isArray(ctx.todos)) ctx.todos = [];
 
+    // DEBUG: Log raw input to diagnose what models actually send
+    console.error("[TodoWrite] raw input:", JSON.stringify(input).slice(0, 500));
+
     // CRITICAL: Normalize incoming items. Models (Mimo, deepseek) send strings
     // instead of objects, or objects missing fields, or use wrong field names.
     // Accept 'todos', 'tasks', 'items', or any array field.
@@ -48,6 +51,7 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
       }
       return null;
     }).filter((t): t is TodoItem => t !== null);
+    console.error("[TodoWrite] normalized:", incoming.length, "items:", JSON.stringify(incoming).slice(0, 300));
 
     if (incoming.length === 0 && ctx.todos.length === 0) {
       return {
