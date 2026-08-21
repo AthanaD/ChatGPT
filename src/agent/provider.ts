@@ -175,11 +175,11 @@ export class ChatHTTPError extends Error {
   }
 }
 
-/** Transient if: no status (network/DNS/timeout), 408/425/429, or any 5xx. */
+/** Transient if: no status (network/DNS/timeout), 408/425/429/499, or any 5xx. */
 export function isRetryableError(e: unknown): boolean {
   if (e instanceof DOMException && e.name === "AbortError") return false;
   if (e instanceof ChatHTTPError) {
-    return e.status === 408 || e.status === 425 || e.status === 429 || e.status >= 500;
+    return e.status === 408 || e.status === 425 || e.status === 429 || e.status === 499 || e.status >= 500;
   }
   // fetch network failures (TypeError "Failed to fetch", ECONNRESET, etc.) are retryable.
   return true;
