@@ -54,10 +54,10 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     console.error("[TodoWrite] normalized:", incoming.length, "items:", JSON.stringify(incoming).slice(0, 300));
 
     if (incoming.length === 0 && ctx.todos.length === 0) {
+      // The proxy may have stripped arguments. Return a helpful message
+      // (NOT starting with "error:" to avoid red X in UI).
       return {
-        output: "ERROR: You called TodoWrite with an empty list. You MUST provide actual todo items. " +
-          "Example: TodoWrite with todos=[{content: 'Task 1', status: 'pending'}]. " +
-          "Do NOT call TodoWrite with an empty todos array.",
+        output: "TodoWrite requires items. Call again with: todos=[{content:'Task 1',status:'pending'}]",
       };
     }
 
