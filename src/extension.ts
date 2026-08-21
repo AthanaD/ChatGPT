@@ -47,7 +47,7 @@ export function activate(context: vscode.ExtensionContext) {
         changed = true;
       }
     };
-    for (const key of ["edits", "shell", "delete", "mcp", "web"] as const) resetMode(key);
+    for (const key of ["edits", "shell", "delete", "mcp", "web", "outside"] as const) resetMode(key);
     if (changed) featureStore.set({ approvalPolicy: currentPolicy });
   }
   const syncToolTimeouts = () => setToolTimeoutOverrides(featureStore.get().toolTimeoutsSec);
