@@ -25,49 +25,45 @@ import {
 export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abortSignal, _callId, ctx) => {
   try {
     if (!ctx) return { output: "error: todo context unavailable" };
-    // Ensure ctx.todos is always an array (defensive — prevents throw).
     if (!Array.isArray(ctx.todos)) ctx.todos = [];
-    const incoming: TodoItem[] = Array.isArray(input?.todos) ? input.todos : [];
 
-    // CRITICAL: If incoming is empty and no existing todos, force model to provide items.
+    // CRITICAL: Normalize incoming items. Models (Mimo, deepseek) send strings
+    // instead of objects, or objects missing fields. Convert everything to
+    // proper TodoItem objects so nothing gets filtered out.
+    const raw: any[] = Array.isArray(input?.todos) ? input.todos : [];
+    const incoming: TodoItem[] = raw.map((t, i) => {
+      if (typeof t === "string") {
+        return { id: `auto_${i}`, content: t, status: "pending" as const };
+      }
+      if (t && typeof t === "object") {
+        return {
+          id: t.id || `auto_${i}`,
+          content: String(t.content || t.text || t.title || t.name || "unnamed"),
+          status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status) ? t.status : "pending") as TodoItem["status"],
+        };
+      }
+      return null;
+    }).filter((t): t is TodoItem => t !== null);
+
     if (incoming.length === 0 && ctx.todos.length === 0) {
       return {
         output: "ERROR: You called TodoWrite with an empty list. You MUST provide actual todo items. " +
-          "Example: TodoWrite with todos=[{content: 'Task 1', status: 'pending'}, {content: 'Task 2', status: 'pending'}]. " +
+          "Example: TodoWrite with todos=[{content: 'Task 1', status: 'pending'}]. " +
           "Do NOT call TodoWrite with an empty todos array.",
       };
     }
 
     if (input?.merge) {
-      // Merge mode: combine existing + incoming by id.
-      // Auto-generate id if model (Mimo) omits it.
       const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
       for (const t of incoming) {
-        if (t && typeof t === "object") {
-          const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-          byId.set(key, { ...byId.get(key), ...t, id: key });
-        }
+        const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        byId.set(key, { ...byId.get(key), ...t, id: key });
       }
       ctx.todos = [...byId.values()];
     } else if (incoming.length > 0) {
-      // Replace mode: only replace if incoming is non-empty.
-      // PROTECTION: If incoming has fewer items than existing, merge instead
-      // of replace to prevent losing todos after context compaction.
-      if (ctx.todos.length > 0 && incoming.length < ctx.todos.length) {
-        // Auto-merge: combine existing + incoming by content matching
-        const existingByContent = new Map(ctx.todos.map((t) => [t.content, t]));
-        for (const t of incoming) {
-          if (t && typeof t === "object") {
-            existingByContent.set(t.content, { ...existingByContent.get(t.content), ...t });
-          }
-        }
-        ctx.todos = [...existingByContent.values()];
-      } else {
-        // Accept items even without id — model (Mimo) often omits it.
-        ctx.todos = incoming.filter((t) => t && typeof t === "object");
-      }
+      ctx.todos = incoming;
     }
-    // Render in [x]/[ ] format so the webview TodoList component can parse it.
+
     const render = ctx.todos
       .map((t) => {
         const mark =
@@ -75,7 +71,7 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
         return `${mark} ${t.content || "unnamed"}`;
       })
       .join("\n");
-    return { output: render || "(no todos) Todos were processed but list is now empty." };
+    return { output: render || "(no todos)" };
   } catch (e) {
     return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
   }
