@@ -985,17 +985,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			const parsed = calls.map((call) => {
 				let input: any = {};
 				let badArgs = false;
+				// Resolve truncated tool names (Mimo sends "Rea" instead of "Read").
+				let resolvedName = call.name;
+				if (!TOOLS[call.name] && !call.name.startsWith("mcp__")) {
+					const lc = call.name.toLowerCase();
+					const match = Object.keys(TOOLS).find((n) => n.toLowerCase().startsWith(lc) || lc.startsWith(n.toLowerCase()));
+					if (match) resolvedName = match;
+				}
 				try {
-					input = normalizeToolPaths(call.name, JSON.parse(call.arguments || "{}"), getWorkspaceRoot());
+					input = normalizeToolPaths(resolvedName, JSON.parse(call.arguments || "{}"), getWorkspaceRoot());
 				} catch {
 					// Truncated/invalid args JSON (common on very large edits). Executing
 					// with {} would call tools with missing params — fail the call instead.
 					badArgs = true;
 				}
 				// MCP tools share CallMcpTool budget when no per-name override.
-				const tMs = call.name.startsWith("mcp__")
+				const tMs = resolvedName.startsWith("mcp__")
 					? toolTimeoutMs("CallMcpTool")
-					: toolTimeoutMs(call.name);
+					: toolTimeoutMs(resolvedName);
 				// Shell foreground expiry backgrounds the command; it is not the tool's
 				// hard timeout. Keep the outer safety budget so cleanup can return smoothly.
 				let timeoutMs = tMs > 0 ? tMs : undefined;
@@ -1004,11 +1011,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				emit({
 					type: "tool-call-started",
 					callId: call.id,
-					name: call.name,
+					name: resolvedName,
 					input,
 					timeoutMs,
 				});
-				return { call, input, badArgs, timeoutMs };
+				return { call, input, badArgs, timeoutMs, resolvedName };
 			});
 
 			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; image?: { mime: string; base64: string } }>(parsed.length);
@@ -1033,28 +1040,28 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			};
 
 			const exec = async (i: number) => {
-				const { call, input, badArgs } = parsed[i];
+				const { call, input, badArgs, resolvedName } = parsed[i];
 				if (badArgs) {
 					// TodoWrite/Read with truncated JSON: don't error, just skip.
 					// The model's text response is still valid and should be displayed.
 					// Erroring here causes red X in UI and stops processing.
-					if (call.name === "TodoWrite" || call.name === "TodoRead") {
+					if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
 						results[i] = {
 							status: "completed",
-							output: call.name === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first to create a structured task list." : "(todos: skipped due to truncated input)",
+							output: resolvedName === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first to create a structured task list." : "(todos: skipped due to truncated input)",
 						};
 						finishUi(i);
 						return;
 					}
 					results[i] = {
 						status: "error",
-						output: `error: tool arguments were not valid JSON (likely truncated — the payload was too large). Retry with a smaller edit: split the change into multiple smaller ${call.name} calls.`,
+						output: `error: tool arguments were not valid JSON (likely truncated — the payload was too large). Retry with a smaller edit: split the change into multiple smaller ${resolvedName} calls.`,
 					};
 					finishUi(i);
 					return;
 				}
 				// MCP tool dispatch (same hard timeout + countdown as built-ins).
-				if (call.name.startsWith("mcp__")) {
+				if (resolvedName.startsWith("mcp__")) {
 					if (!isAgentic() || isCoordinator()) {
 						// MCP tools may mutate; only allow in agentic modes. Multitask is a
 						// coordinator and must delegate MCP work to subagents.
@@ -1124,42 +1131,42 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 					return;
 				}
-				const tool = TOOLS[call.name];
-				if (!tool || disabledToolNames.has(call.name)) {
+				let tool = TOOLS[resolvedName];
+				if (!tool || disabledToolNames.has(resolvedName)) {
 					results[i] = { status: "error", output: `unknown or disabled tool: ${call.name}` };
 					return;
 				}
 				// Multitask/project are coordinators: they can read/search/manage todos but
 				// must never mutate files or the shell — delegate that to a subagent.
-				if (isCoordinator() && !MULTITASK_TOOLS.has(call.name)) {
+				if (isCoordinator() && !MULTITASK_TOOLS.has(resolvedName)) {
 					results[i] = {
 						status: "error",
-						output: `tool ${call.name} not allowed in ${mode} mode — delegate file/shell edits to a background subagent with the Task tool.`,
+						output: `tool ${resolvedName} not allowed in ${mode} mode — delegate file/shell edits to a background subagent with the Task tool.`,
 					};
 					return;
 				}
-				if (!isAgentic() && !allowedNamesFor().has(call.name)) {
-					results[i] = { status: "error", output: `tool ${call.name} not allowed in ${mode} mode` };
+				if (!isAgentic() && !allowedNamesFor().has(resolvedName)) {
+					results[i] = { status: "error", output: `tool ${resolvedName} not allowed in ${mode} mode` };
 					return;
 				}
 				// Approval gate: every policy-covered action consults the approver, which
 				// resolves the per-type policy (allow silently / ask / deny) itself.
-				const isEditTool = EDIT_TOOLS.has(call.name);
+				const isEditTool = EDIT_TOOLS.has(resolvedName);
 				// Per-call action type: also gates ungated tools (e.g. Read) when they
 				// target paths outside the workspace.
-				const needsApproval = actionTypeForCall(call.name, input, getWorkspaceRoot()) !== undefined;
+				const needsApproval = actionTypeForCall(resolvedName, input, getWorkspaceRoot()) !== undefined;
 				if (needsApproval && approve) {
-					const approval = await approve(call.name, input, call.id);
+					const approval = await approve(resolvedName, input, call.id);
 					if (approval !== true) {
 						const denied = approval && typeof approval === "object"
 							? `user denied/blocked "${approval.blockedSubject}"`
-							: `user denied ${call.name}`;
+							: `user denied ${resolvedName}`;
 						results[i] = { status: "error", output: `${denied}; try a different approach or ask the user` };
 						return;
 					}
 				}
 				// beforeShell hook (may veto).
-				if (call.name === "Shell" && onBeforeShell) {
+				if (resolvedName === "Shell" && onBeforeShell) {
 					const veto = await onBeforeShell(String(input?.command ?? ""));
 					if (veto) {
 						results[i] = { status: "error", output: `blocked by hook: ${veto}` };
@@ -1167,7 +1174,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 				}
 				// beforeReadFile hook (may veto).
-				if (call.name === "Read") {
+				if (resolvedName === "Read") {
 					const veto = await onHook?.("beforeReadFile", { path: String(input?.path ?? "") });
 					if (veto) {
 						results[i] = { status: "error", output: `blocked by hook: ${veto}` };
@@ -1177,7 +1184,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				try {
 					// Per-tool hard timeout + linked abort. On timeout: kill immediately
 					// and settle UI — never leave the card spinning "Working".
-					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs(call.name);
+					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs(resolvedName);
 					const toolAc = new AbortController();
 					const killTool = () => {
 						try { toolAc.abort(); } catch { /* ignore */ }
@@ -1190,7 +1197,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					emit({
 						type: "tool-call-started",
 						callId: call.id,
-						name: call.name,
+						name: resolvedName,
 						input,
 						timeoutMs: limitMs > 0 ? limitMs : undefined,
 						startedAt: Date.now(),
@@ -1204,18 +1211,18 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						r = await withToolTimeout(
 							Promise.resolve().then(() => tool.execute(input, toolAc.signal, call.id, toolCtx)),
 							limitMs,
-							call.name,
+							resolvedName,
 							() => {
 								timedOut = true;
 								killTool();
 								// Immediate UI settle on timeout — don't wait for tool cleanup.
 								// TodoWrite/Read: use "completed" to avoid red X in UI.
-								if (call.name === "TodoWrite" || call.name === "TodoRead") {
+								if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
 									results[i] = { status: "completed", output: "(todos: timeout)" };
 								} else {
 									results[i] = {
 										status: "error",
-										output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+										output: `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
 									};
 								}
 								finishUi(i);
@@ -1225,17 +1232,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
-						logError("tool.execute", e, { tool: call.name, callId: call.id });
+						logError("tool.execute", e, { tool: resolvedName, callId: call.id });
 						try { toolAc.abort(); } catch { /* ignore */ }
 						const isTo = timedOut || msg.startsWith("timeout:") || msg.startsWith("aborted:");
 						// TodoWrite/Read: abort or timeout should NOT produce error status.
 						// The red X in UI stops processing. Return success instead.
-						if (isTo && (call.name === "TodoWrite" || call.name === "TodoRead")) {
-							r = { output: call.name === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first." : "(todos: skipped)" };
+						if (isTo && (resolvedName === "TodoWrite" || resolvedName === "TodoRead")) {
+							r = { output: resolvedName === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first." : "(todos: skipped)" };
 						} else {
 							r = {
 								output: isTo
-									? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
+									? `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
 									: `error: ${msg}`,
 							};
 						}
@@ -1246,12 +1253,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					if (timedOut || completedUi.has(i)) {
 						if (!results[i]) {
 							// TodoWrite/Read: don't error on abort/timeout — red X stops processing
-							if (call.name === "TodoWrite" || call.name === "TodoRead") {
+							if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
 								results[i] = { status: "completed", output: r?.output || "(todos: skipped)" };
 							} else {
 								results[i] = {
 									status: "error",
-									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+									output: `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
 								};
 							}
 						}
@@ -1267,9 +1274,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// Immediate UI settle (especially on timeout) — do not wait for siblings.
 					finishUi(i);
 				} catch (e) {
-					logError("tool.lifecycle", e, { tool: call.name, callId: call.id });
+					logError("tool.lifecycle", e, { tool: resolvedName, callId: call.id });
 					// TodoWrite/Read: use "completed" to avoid red X in UI
-					if (call.name === "TodoWrite" || call.name === "TodoRead") {
+					if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
 						results[i] = { status: "completed", output: "(todos: error)" };
 					} else {
 						results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };
@@ -1326,19 +1333,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			for (let i = 0; i < parsed.length; i++) {
 				const { call } = parsed[i];
+				const resolvedName = parsed[i].resolvedName;
 				const r = results[i] ?? { status: "error" as const, output: "error: tool produced no result" };
-				if (call.name === "WritePlan" && r.status === "completed") {
+				if (resolvedName === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				if (call.name === "TodoWrite" && r.status === "completed") {
+				if (resolvedName === "TodoWrite" && r.status === "completed") {
 					hasCalledTodoWrite = true;
 				}
-				if (call.name === "Task") {
+				if (resolvedName === "Task") {
 					taskCallCount++;
 				}
 				// CRITICAL: If model calls TodoRead but there are no todos,
 				// force it to call TodoWrite first.
-				if (call.name === "TodoRead" && toolCtx.todos.length === 0 && nudgeCount < MAX_NUDGES) {
+				if (resolvedName === "TodoRead" && toolCtx.todos.length === 0 && nudgeCount < MAX_NUDGES) {
 					nudgeCount++;
 					pushSystemNote(
 						`CRITICAL: You called TodoRead but no todo list exists. ` +
@@ -1349,8 +1357,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// Durable ledger backs the flat-cost <task_state> block; history itself
 				// keeps full tool results until auto-summarize / budget trim.
-				ledger.record(call.name, parsed[i].input, r.status, r.output);
-				pushHistory({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
+				ledger.record(resolvedName, parsed[i].input, r.status, r.output);
+				pushHistory({ kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, image: r.image });
 			}
 			// CRITICAL: After processing tool results, check if model called Task
 			// multiple times without creating a todo list. If so, force it to plan.
