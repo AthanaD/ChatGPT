@@ -54,11 +54,9 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     console.error("[TodoWrite] normalized:", incoming.length, "items:", JSON.stringify(incoming).slice(0, 300));
 
     if (incoming.length === 0 && ctx.todos.length === 0) {
-      // The proxy may have stripped arguments. Return a helpful message
-      // (NOT starting with "error:" to avoid red X in UI).
-      return {
-        output: "TodoWrite requires items. Call again with: todos=[{content:'Task 1',status:'pending'}]",
-      };
+      // The model called TodoWrite without arguments (common with glm/deepseek).
+      // Create a single placeholder todo so the UI shows something useful.
+      ctx.todos = [{ id: "auto_0", content: "Working on task...", status: "in_progress" }];
     }
 
     if (input?.merge) {
