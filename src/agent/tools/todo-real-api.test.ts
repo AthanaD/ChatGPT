@@ -24,10 +24,13 @@ function loadEnv() {
 }
 
 const ENV = loadEnv();
-const API_KEY = ENV.PROXY_AUTH_TOKEN || "";
-const BASE_URL = ENV.PROXY_BASE_URL || "";
-const MODEL = ENV.PROXY_MODEL || "deepseek-v4-flash-0731";
+// Prefer direct Verboo API (bypasses proxy auth issues)
+const DIRECT_KEY = ENV.VERBOO_API_KEY || "";
+const DIRECT_URL = ENV.VERBOO_BASE_URL || "";
+const MODEL = ENV.VERBOO_MODEL || "deepseek-v4-flash-0731";
 
+const API_KEY = DIRECT_KEY;
+const BASE_URL = DIRECT_URL;
 const hasConfig = API_KEY && BASE_URL;
 
 // ---- API client ----
@@ -69,7 +72,7 @@ async function sendTodoWritePrompt(prompt: string): Promise<{ modelOutput: strin
       method: "POST",
       headers: {
         "Content-Type": "application/json",
-        "x-api-key": API_KEY,
+        Authorization: `Bearer ${API_KEY}`,
       },
       body: JSON.stringify({
         model: MODEL,
