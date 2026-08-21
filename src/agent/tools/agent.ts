@@ -28,9 +28,13 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     if (!Array.isArray(ctx.todos)) ctx.todos = [];
 
     // CRITICAL: Normalize incoming items. Models (Mimo, deepseek) send strings
-    // instead of objects, or objects missing fields. Convert everything to
-    // proper TodoItem objects so nothing gets filtered out.
-    const raw: any[] = Array.isArray(input?.todos) ? input.todos : [];
+    // instead of objects, or objects missing fields, or use wrong field names.
+    // Accept 'todos', 'tasks', 'items', or any array field.
+    const raw: any[] = Array.isArray(input?.todos) ? input.todos
+      : Array.isArray(input?.tasks) ? input.tasks
+      : Array.isArray(input?.items) ? input.items
+      : Array.isArray(input) ? input
+      : [];
     const incoming: TodoItem[] = raw.map((t, i) => {
       if (typeof t === "string") {
         return { id: `auto_${i}`, content: t, status: "pending" as const };
