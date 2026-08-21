@@ -223,7 +223,7 @@ async function* streamWithRetry(
       if (emitted || attempt >= maxAttempts || !isRetryableError(e)) {
         throw e;
       }
-      const delay = Math.min(1000 * 2 ** (attempt - 1), 15000);
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 30000);
       onRetry?.(attempt, maxAttempts, delay, e instanceof Error ? e.message : String(e));
       await sleep(delay, signal);
     }
@@ -486,7 +486,7 @@ export function streamChat(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> 
     throw new Error("API Key not set");
   }
   const make = () => (useAnthropic ? streamAnthropic(opts) : streamOpenAI(opts));
-  return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3);
+  return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 10);
 }
 
 async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
