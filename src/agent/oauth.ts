@@ -61,8 +61,17 @@ let pendingKind: OAuthKind | undefined;
 const loginErrors: Partial<Record<OAuthKind, string>> = {};
 const emitter = new vscode.EventEmitter<OAuthStatus>();
 export const onOAuthStatus = emitter.event;
-/** In-flight login per kind: pkce + state + loopback server. */
-const pending = new Map<OAuthKind, { verifier: string; state: string; server: http.Server }>();
+interface LoginAttempt {
+  verifier: string;
+  state: string;
+  server: http.Server;
+  authorizationUrl: string;
+  callbackError?: string;
+  browserError?: string;
+  completing?: boolean;
+}
+/** In-flight login state stays local; only its browser link is exposed to the UI. */
+const pending = new Map<OAuthKind, LoginAttempt>();
 /** Single-flight refresh lock per account id (Codex rotates refresh tokens). */
 const refreshing = new Map<string, Promise<OAuthAccount>>();
 const resolvingProjects = new Map<string, Promise<OAuthAccount>>();
@@ -96,7 +105,9 @@ function emit() {
 }
 
 export function getStatus(): OAuthStatus {
-  return { accounts: [...accounts.values()].map(info), pending: pendingKind, errors: { ...loginErrors }, balanceStrategy: getBalanceStrategy() };
+  return { accounts: [...accounts.values()].map(info), pending: pendingKind,
+    ...(pendingKind && pending.get(pendingKind) ? { authorizationUrl: pending.get(pendingKind)!.authorizationUrl } : {}),
+    errors: { ...loginErrors }, balanceStrategy: getBalanceStrategy() };
 }
 
 // ---- Enable/disable + load balancing ----
@@ -208,9 +219,8 @@ export async function disconnect(id: string) {
 // ---- Login flow (loopback redirect) ----
 
 export async function login(kind: OAuthKind) {
-  // Tear down any previous attempt for this kind.
-  pending.get(kind)?.server.close();
-  pending.delete(kind);
+  // The UI has one active sign-in. A replacement must invalidate all older callbacks.
+  for (const active of pending.keys()) cancelLogin(active);
   delete loginErrors[kind];
 
   const { verifier, challenge } = pkce();
@@ -218,46 +228,134 @@ export async function login(kind: OAuthKind) {
   const cfg = kind === "claude-code" ? ANTHROPIC : kind === "codex" ? CODEX : ANTIGRAVITY;
 
   const server = http.createServer(async (req, res) => {
+    const reply = (status: number, text: string) => res.writeHead(status, { "content-type": "text/plain; charset=utf-8" }).end(text);
     try {
       const url = new URL(req.url || "/", `http://localhost:${cfg.port}`);
-      if (!url.pathname.startsWith(cfg.path)) {
-        res.writeHead(404).end();
-        return;
-      }
+      if (url.pathname !== cfg.path) { reply(404, "Not found"); return; }
+      if (pending.get(kind) !== attempt || attempt.completing) { reply(409, "This sign-in attempt is no longer waiting for a callback."); return; }
       const code = url.searchParams.get("code") || "";
       const retState = url.searchParams.get("state") || "";
-      res.writeHead(200, { "content-type": "text/html" }).end(
+      if (!retState || retState !== attempt.state) { reply(400, "OAuth state mismatch. Return to OpenCursor and use the current sign-in link."); return; }
+      if (url.searchParams.has("error")) {
+        clearLoginAttempt(kind, attempt);
+        loginErrors[kind] = "Sign-in was declined or cancelled in the browser. Add the account again to retry.";
+        emit();
+        reply(400, "Sign-in was not completed. Return to OpenCursor to try again.");
+        return;
+      }
+      if (!code) { reply(400, "No authorization code returned. Finish signing in and try again."); return; }
+      await finishLoginAttempt(kind, attempt, code, retState);
+      res.writeHead(200, { "content-type": "text/html; charset=utf-8" }).end(
         "<html><body style='font-family:sans-serif;padding:40px'><h2>Login successful</h2><p>You can close this tab and return to VS Code.</p></body></html>"
       );
-      server.close();
-      pending.delete(kind);
-      pendingKind = undefined;
-      await completeLogin(kind, code, retState, state, verifier);
-    } catch (e: any) {
-      loginErrors[kind] = String(e?.message || e);
-      pendingKind = undefined;
-      emit();
+    } catch {
+      reply(400, "Sign-in failed. Return to OpenCursor to see the error and try again.");
     }
   });
-
-  await new Promise<void>((resolve, reject) => {
-    server.on("error", reject);
-    server.listen(cfg.port, "127.0.0.1", resolve);
-  });
-
-  pending.set(kind, { verifier, state, server });
+  const attempt: LoginAttempt = { verifier, state, server, authorizationUrl: buildAuthUrl(kind, challenge, state) };
+  pending.set(kind, attempt);
   pendingKind = kind;
   emit();
 
-  const authUrl = buildAuthUrl(kind, challenge, state);
-  await vscode.env.openExternal(vscode.Uri.parse(authUrl));
+  // A failed local listener must not prevent browser sign-in or manual callback entry.
+  server.on("error", (error: NodeJS.ErrnoException) => {
+    if (pending.get(kind) !== attempt) return;
+    attempt.callbackError = error.code === "EADDRINUSE"
+      ? `Port ${cfg.port} is already in use. After signing in, paste the full callback URL from your browser below.`
+      : `The local sign-in callback could not start${error.code ? ` (${error.code})` : ""}. After signing in, paste the full callback URL from your browser below.`;
+    updateLoginError(kind, attempt);
+  });
+  try {
+    await new Promise<void>((resolve, reject) => {
+      const settle = (error?: Error) => {
+        server.removeListener("error", fail);
+        server.removeListener("close", closed);
+        if (error) reject(error);
+        else resolve();
+      };
+      const fail = (error: Error) => settle(error);
+      const closed = () => settle();
+      server.once("error", fail);
+      server.once("close", closed);
+      try { server.listen(cfg.port, "127.0.0.1", () => settle()); }
+      catch (error) { settle(error instanceof Error ? error : new Error(String(error))); }
+    });
+  } catch {
+    if (pending.get(kind) === attempt && !attempt.callbackError) {
+      attempt.callbackError = "The local sign-in callback could not start. After signing in, paste the full callback URL from your browser below.";
+      updateLoginError(kind, attempt);
+    }
+  }
+  if (pending.get(kind) !== attempt) { closeLoginServer(attempt); return; }
+  await openLoginInBrowser(kind);
+}
+
+function closeLoginServer(attempt: LoginAttempt) {
+  try { attempt.server.close(); } catch { /* A failed listener may never have started. */ }
+}
+
+function clearLoginAttempt(kind: OAuthKind, attempt: LoginAttempt) {
+  if (pending.get(kind) === attempt) {
+    pending.delete(kind);
+    if (pendingKind === kind) pendingKind = undefined;
+  }
+  closeLoginServer(attempt);
+}
+
+function updateLoginError(kind: OAuthKind, attempt: LoginAttempt) {
+  if (pending.get(kind) !== attempt) return;
+  const error = [attempt.callbackError, attempt.browserError].filter(Boolean).join(" ");
+  if (error) loginErrors[kind] = error;
+  else delete loginErrors[kind];
+  emit();
+}
+
+/** Retry the current link without replacing its PKCE verifier or state. */
+export async function openLoginInBrowser(kind: OAuthKind): Promise<void> {
+  const attempt = pending.get(kind);
+  if (!attempt) throw new Error("No login in progress — click Add account first");
+  if (attempt.completing) throw new Error("Sign-in is already being completed.");
+  try {
+    const opened = await vscode.env.openExternal(vscode.Uri.parse(attempt.authorizationUrl));
+    attempt.browserError = opened ? undefined : "VS Code could not open your browser. Use Copy link and open it in your browser manually.";
+  } catch {
+    attempt.browserError = "VS Code could not open your browser. Use Copy link and open it in your browser manually.";
+  }
+  updateLoginError(kind, attempt);
 }
 
 export function cancelLogin(kind: OAuthKind) {
-  pending.get(kind)?.server.close();
-  pending.delete(kind);
-  pendingKind = undefined;
+  const attempt = pending.get(kind);
+  if (attempt) clearLoginAttempt(kind, attempt);
+  delete loginErrors[kind];
   emit();
+}
+
+async function finishLoginAttempt(kind: OAuthKind, attempt: LoginAttempt, code: string, retState: string) {
+  if (pending.get(kind) !== attempt || attempt.completing) throw new Error("This sign-in attempt is no longer waiting for a callback.");
+  // Invalid pasted callbacks must not consume the current login session.
+  if (!code || retState !== attempt.state) {
+    loginErrors[kind] = !code ? "No authorization code returned" : "OAuth state mismatch";
+    emit();
+    throw new Error(loginErrors[kind]);
+  }
+  attempt.completing = true;
+  closeLoginServer(attempt);
+  try {
+    await completeLogin(kind, code, retState, attempt.state, attempt.verifier, () => pending.get(kind) === attempt);
+    if (pending.get(kind) === attempt) {
+      clearLoginAttempt(kind, attempt);
+      delete loginErrors[kind];
+      emit();
+    }
+  } catch (error) {
+    if (pending.get(kind) === attempt) {
+      clearLoginAttempt(kind, attempt);
+      loginErrors[kind] = error instanceof Error ? error.message : String(error);
+      emit();
+    }
+    throw error;
+  }
 }
 
 /**
@@ -273,23 +371,14 @@ export async function completeManual(kind: OAuthKind, pasted: string): Promise<v
   try {
     const url = new URL(text);
     code = url.searchParams.get("code") || "";
-    retState = url.searchParams.get("state") || retState;
+    retState = url.searchParams.get("state") || "";
   } catch {
     // Not a URL — accept "code#state" (Anthropic's copy box) or a bare code.
     const [c, s] = text.split("#");
     code = c;
-    if (s) retState = s;
+    if (s !== undefined) retState = s;
   }
-  try {
-    p.server.close();
-    pending.delete(kind);
-    pendingKind = undefined;
-    await completeLogin(kind, code, retState, p.state, p.verifier);
-  } catch (e: any) {
-    loginErrors[kind] = String(e?.message || e);
-    emit();
-    throw e;
-  }
+  await finishLoginAttempt(kind, p, code, retState);
 }
 
 function buildAuthUrl(kind: OAuthKind, challenge: string, state: string): string {
@@ -324,14 +413,14 @@ function buildAuthUrl(kind: OAuthKind, challenge: string, state: string): string
   return `${CODEX.authUrl}?${params.toString()}`;
 }
 
-async function completeLogin(kind: OAuthKind, code: string, retState: string, expectState: string, verifier: string) {
+async function completeLogin(kind: OAuthKind, code: string, retState: string, expectState: string, verifier: string, isCurrent: () => boolean) {
   if (!code) throw new Error("No authorization code returned");
   if (retState !== expectState) throw new Error("OAuth state mismatch");
   const acc = kind === "claude-code" ? await exchangeAnthropic(code, verifier, expectState)
     : kind === "codex" ? await exchangeCodex(code, verifier)
     : await exchangeAntigravity(code);
+  if (!isCurrent()) throw new Error("This sign-in attempt was cancelled or replaced. Use the current sign-in link.");
   await saveAccount(acc);
-  emit();
 }
 
 // ---- Token exchange / refresh ----

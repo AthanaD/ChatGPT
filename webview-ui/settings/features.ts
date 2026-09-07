@@ -237,6 +237,8 @@ export interface OAuthLimit {
 export interface OAuthStatus {
   accounts: OAuthAccountInfo[];
   pending?: OAuthKind;
+  /** Authorization URL for the current pending login; contains no tokens or verifier. */
+  authorizationUrl?: string;
   errors: Partial<Record<OAuthKind, string>>;
   balanceStrategy?: OAuthBalanceStrategy;
 }

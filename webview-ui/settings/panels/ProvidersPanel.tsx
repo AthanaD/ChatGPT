@@ -16,6 +16,7 @@ import {
   OAUTH_LABEL,
   OAUTH_PROVIDERS,
   OAuthAccountInfo,
+  OAuthKind,
   OAuthLimit,
   OAuthStatus,
   POPULAR_KINDS,
@@ -300,28 +301,55 @@ export function OAuthAccountCard({ account, defaultOpen }: { account: OAuthAccou
 /** "Add account" button with a kind-picker menu (Claude Code / OpenAI Codex). */
 function OAuthAddMenu({ status }: { status: OAuthStatus }) {
   const [open, setOpen] = React.useState(false);
+  const [starting, setStarting] = React.useState<OAuthKind>();
   const [manual, setManual] = React.useState("");
-  const pending = status.pending;
+  const [copied, setCopied] = React.useState(false);
+  const pending = status.pending ?? starting;
+  // A menu selection should give immediate feedback even before the host replies.
+  React.useEffect(() => { setStarting(undefined); }, [status]);
+  React.useEffect(() => { setManual(""); setCopied(false); }, [pending, status.authorizationUrl]);
+  React.useEffect(() => {
+    const onMessage = (event: MessageEvent) => {
+      const message = event.data;
+      if (message?.type === "oauthLinkCopied" && message.kind === pending && message.authorizationUrl === status.authorizationUrl) setCopied(true);
+    };
+    window.addEventListener("message", onMessage);
+    return () => window.removeEventListener("message", onMessage);
+  }, [pending, status.authorizationUrl]);
   const submitManual = () => {
     if (!manual.trim() || !pending) return;
     vscode.postMessage({ type: "oauthManualCallback", kind: pending, url: manual.trim() });
-    setManual("");
   };
   return (
-    <div className="oauth-add" style={{ position: "relative", display: "inline-block" }}>
+    <div className="oauth-add" style={{ position: "relative", display: "inline-block", ...(pending ? { width: "100%" } : {}) }}>
       {pending ? (
-        <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
-          <button className="btn-ghost" onClick={() => vscode.postMessage({ type: "oauthCancel", kind: pending })}>
-            Waiting for browser… Cancel
-          </button>
-          <input
-            style={{ minWidth: 260 }}
-            placeholder="Or paste the callback URL / code here"
-            value={manual}
-            onChange={(e) => setManual(e.target.value)}
-            onKeyDown={(e) => { if (e.key === "Enter") submitManual(); }}
-          />
-          <button className="btn-ghost" disabled={!manual.trim()} onClick={submitManual}>Submit</button>
+        <div style={{ display: "flex", flexDirection: "column", gap: 8 }}>
+          <div style={{ display: "flex", alignItems: "center", gap: 8, flexWrap: "wrap" }}>
+            <span>{status.pending ? "Signing in to" : "Starting sign-in to"} {OAUTH_LABEL[pending]}…</span>
+            <button className="btn-ghost" onClick={() => { setStarting(undefined); vscode.postMessage({ type: "oauthCancel", kind: pending }); }}>Cancel</button>
+          </div>
+          {status.authorizationUrl && (
+            <>
+              <p className="panel-hint" style={{ margin: 0 }}>If the browser did not open, open or copy this link.</p>
+              <input aria-label="Authorization URL" readOnly value={status.authorizationUrl} onFocus={(event) => event.currentTarget.select()} style={{ width: "100%", boxSizing: "border-box" }} />
+              <div style={{ display: "flex", gap: 6 }}>
+                <button className="btn-ghost" onClick={() => vscode.postMessage({ type: "oauthOpenLogin", kind: pending })}>Open browser</button>
+                <button className="btn-ghost" onClick={() => vscode.postMessage({ type: "oauthCopyLogin", kind: pending })}>{copied ? "Copied" : "Copy link"}</button>
+              </div>
+            </>
+          )}
+          <p className="panel-hint" style={{ margin: 0 }}>After signing in, if the browser cannot return to VS Code, paste the full callback URL from its address bar below.</p>
+          <div style={{ display: "flex", alignItems: "center", gap: 6, flexWrap: "wrap" }}>
+            <input
+              aria-label="Callback URL or authorization code"
+              style={{ minWidth: 260, flex: 1 }}
+              placeholder="Callback URL or authorization code"
+              value={manual}
+              onChange={(e) => setManual(e.target.value)}
+              onKeyDown={(e) => { if (e.key === "Enter") submitManual(); }}
+            />
+            <button className="btn-ghost" disabled={!manual.trim()} onClick={submitManual}>Submit</button>
+          </div>
         </div>
       ) : (
         <button className="btn-ghost" onClick={() => setOpen((v) => !v)}>
@@ -335,7 +363,7 @@ function OAuthAddMenu({ status }: { status: OAuthStatus }) {
               key={p.kind}
               className="menu-item"
               style={{ display: "block", width: "100%", textAlign: "left", padding: "8px 12px", background: "none", border: "none", color: "inherit", cursor: "pointer" }}
-              onClick={() => { setOpen(false); vscode.postMessage({ type: "oauthLogin", kind: p.kind }); }}
+              onClick={() => { setOpen(false); setStarting(p.kind); vscode.postMessage({ type: "oauthLogin", kind: p.kind }); }}
             >
               {p.label}
             </button>
@@ -432,9 +460,9 @@ export function ProvidersPanel({
             ⚠️ This isn't an official integration. Your provider's terms may not allow it, so the account could be rate-limited, restricted, or banned. Use at your own risk.
           </div>
           <p className="panel-hint">Sign in with your existing subscription. Tokens are stored securely and refreshed automatically. You can add multiple accounts.</p>
-          {(oauthStatus.errors["claude-code"] || oauthStatus.errors.codex) && (
-            <div className="fc-error">{oauthStatus.errors["claude-code"] || oauthStatus.errors.codex}</div>
-          )}
+          {[...OAUTH_PROVIDERS].sort((a, b) => Number(b.kind === oauthStatus.pending) - Number(a.kind === oauthStatus.pending))
+            .filter((provider) => oauthStatus.errors[provider.kind])
+            .map((provider) => <div className="fc-error" role="alert" key={provider.kind}><strong>{provider.label}:</strong> {oauthStatus.errors[provider.kind]}</div>)}
           {oauthStatus.accounts.length > 1 && (
             <div className="settings-row" style={{ marginBottom: 10 }}>
               <div className="row-text">

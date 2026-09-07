@@ -453,20 +453,43 @@ export class SettingsPanel {
             this._panel.webview.postMessage({ type: "oauthStatus", status: oauth.getStatus() });
             break;
           case "oauthLogin":
-            oauth.login(message.kind).catch((e) =>
-              this._panel.webview.postMessage({ type: "oauthStatus", status: { ...oauth.getStatus(), errors: { ...oauth.getStatus().errors, [message.kind]: String(e?.message || e) } } })
-            );
+            oauth.login(message.kind).catch((error) => this._postOAuthError(message.kind, error));
             break;
+          case "oauthOpenLogin":
+            oauth.openLoginInBrowser(message.kind).catch((error) => this._postOAuthError(message.kind, error));
+            break;
+          case "oauthCopyLogin": {
+            const status = oauth.getStatus();
+            if (status.pending !== message.kind || !status.authorizationUrl) {
+              this._postOAuthError(message.kind, new Error("No login in progress — click Add account first."));
+              break;
+            }
+            try {
+              // Copy the host's active URL, never a URL supplied by the webview.
+              await vscode.env.clipboard.writeText(status.authorizationUrl);
+              this._panel.webview.postMessage({ type: "oauthLinkCopied", kind: status.pending, authorizationUrl: status.authorizationUrl });
+            } catch (error) {
+              this._postOAuthError(message.kind, error);
+            }
+            break;
+          }
           case "oauthCancel":
             oauth.cancelLogin(message.kind);
             break;
-          case "oauthManualCallback":
+          case "oauthManualCallback": {
+            const authorizationUrl = oauth.getStatus().authorizationUrl;
             try {
               await oauth.completeManual(message.kind, message.url);
-            } catch {
-              // Error already surfaced via oauthStatus.errors.
+            } catch (error) {
+              const current = oauth.getStatus();
+              // A cancelled/replaced exchange must not overwrite a newer login.
+              // A failed exchange may already have cleared its URL and saved its error.
+              if (current.authorizationUrl === authorizationUrl || (!current.authorizationUrl && current.errors[message.kind as oauth.OAuthKind])) {
+                this._postOAuthError(message.kind, error);
+              }
             }
             break;
+          }
           case "oauthDisconnect":
             await oauth.disconnect(message.id);
             this.featureStore.notifyChanged();
@@ -608,6 +631,14 @@ export class SettingsPanel {
     const llamacppModels = [...f.llamacppModels.filter((m) => m.id !== model.id), model];
     await this.featureStore.set({ llamacppModels });
     await this._sendFeatures();
+  }
+
+  private _postOAuthError(kind: oauth.OAuthKind, error: unknown) {
+    const status = oauth.getStatus();
+    this._panel.webview.postMessage({
+      type: "oauthStatus",
+      status: { ...status, errors: { ...status.errors, [kind]: String((error as Error)?.message || error) } },
+    });
   }
 
   private async _sendOllamaModels() {
