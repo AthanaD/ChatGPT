@@ -12,6 +12,7 @@ import { streamOAuthChat, type OAuthKind } from "./oauth";
 import type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
 import { MODEL_CATALOG } from "../stores/featureStore";
 import { defaultAnthropicMaxTokens } from "./providerLimits";
+import { applyAnthropicReasoning, needsContext1mBeta } from "./provider/anthropicReasoning";
 import { AnthropicUsageTracker } from "./anthropicUsage";
 import { toAnthropic } from "./provider/anthropicMessages";
 import { sseData } from "./provider/sse";
@@ -37,88 +38,10 @@ function applyOpenAISampling(body: Record<string, unknown>, s?: SamplingParams) 
   if (s.topK != null) body.top_k = s.topK;
 }
 
-/** Models that take the `effort` param as a stable feature (no beta header). */
-const ANTHROPIC_EFFORT_STABLE = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-/** Opus 4.5 needs the effort beta header + manual thinking budget. */
-const ANTHROPIC_EFFORT_BETA = /claude-opus-4-5/i;
-/** Models that support adaptive thinking (no budget_tokens). */
-const ANTHROPIC_ADAPTIVE = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-/** Models that reject manual `thinking:{type:enabled,budget_tokens}` with a 400.
- * Per docs: Opus 5, Opus 4.8/4.7, Sonnet 5, Fable 5, Mythos 5 → adaptive only. */
-const ANTHROPIC_NO_MANUAL = /claude-(opus-4-[78]|opus-5|sonnet-5|fable-5|mythos)/i;
-/** Opus 5 rejects `thinking:{type:disabled}` when effort is xhigh/max (400). */
-const ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT = /claude-opus-5/i;
-/** Fable 5 / Mythos 5: thinking is always on — `disabled` returns 400 at any effort. */
-const ANTHROPIC_NO_DISABLE = /claude-(fable-5|mythos)/i;
+export { applyAnthropicReasoning, needsContext1mBeta } from "./provider/anthropicReasoning";
+
 /** Models that reject temperature / top_p / top_k with a 400. */
 const ANTHROPIC_NO_SAMPLING = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-/** Models where 1M context is the default (no context-1m beta header needed). */
-const ANTHROPIC_NATIVE_1M = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-
-/** Whether the retired context-1m beta header is still useful for this model. */
-export function needsContext1mBeta(model: string): boolean {
-  return !ANTHROPIC_NATIVE_1M.test(model);
-}
-
-/**
- * Apply Anthropic thinking + effort to a request body, returning any beta flags
- * to add to the `anthropic-beta` header. Centralizes the per-model rules:
- *  - effort → `output_config.effort` (low/medium/high/xhigh/max)
- *  - 4.6+ → adaptive thinking (no budget); Opus 4.5 → manual budget + beta header
- */
-export function applyAnthropicReasoning(
-  body: Record<string, unknown>,
-  model: string,
-  maxTokens: number,
-  params?: ModelParams,
-): string[] {
-  const betas: string[] = [];
-  let mode = params?.thinking; // "disabled" | "adaptive" | "enabled" | undefined
-  let effort = params?.reasoningEffort;
-
-  // Fable/Mythos reject thinking:{disabled} entirely — coerce to adaptive.
-  if (mode === "disabled" && ANTHROPIC_NO_DISABLE.test(model)) {
-    mode = "adaptive";
-  }
-
-  // Opus 5 rejects thinking:{disabled} above `high` effort. Clamp rather than
-  // sending a request we know will 400.
-  if (mode === "disabled" && effort && ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT.test(model)
-    && (effort === "xhigh" || effort === "max")) {
-    effort = "high";
-  }
-
-  if (effort && (ANTHROPIC_EFFORT_STABLE.test(model) || ANTHROPIC_EFFORT_BETA.test(model))) {
-    body.output_config = { effort };
-    if (ANTHROPIC_EFFORT_BETA.test(model)) betas.push("effort-2025-11-24");
-  }
-
-  // Thinking is on by default from Opus 5 onward, so opting out has to be explicit.
-  if (mode === "disabled" && ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT.test(model)) {
-    body.thinking = { type: "disabled" };
-  }
-
-  if (mode && mode !== "disabled") {
-    const canAdaptive = ANTHROPIC_ADAPTIVE.test(model);
-    const canManual = !ANTHROPIC_NO_MANUAL.test(model);
-    // Manual mode only where the API still accepts it AND the user asked for it
-    // (or the model can't do adaptive, e.g. Haiku 4.5 / older Claude 4).
-    const useManual = canManual && (mode === "enabled" || !canAdaptive);
-    if (useManual) {
-      // `thinking.enabled` requires budget_tokens; scale it by effort.
-      const frac = { low: 0.15, medium: 0.3, high: 0.5, xhigh: 0.7, max: 0.85 }[effort ?? "high"] ?? 0.5;
-      body.thinking = { type: "enabled", budget_tokens: Math.max(1024, Math.floor(maxTokens * frac)) };
-      body.temperature = 1; // required when manual thinking is enabled
-    } else {
-      // Adaptive-only models (Opus 5/4.8/4.7, Sonnet 5, Fable 5, Mythos): the model
-      // decides when/how much to think; effort steers depth. No budget_tokens.
-      // `display` defaults to "omitted" → thinking happens but blocks come back
-      // empty; ask for "summarized" so summaries stream.
-      body.thinking = { type: "adaptive", display: "summarized" };
-    }
-  }
-  return betas;
-}
 
 function applyAnthropicSampling(body: Record<string, unknown>, model: string, s?: SamplingParams) {
   if (!s || ANTHROPIC_NO_SAMPLING.test(model)) return;
@@ -289,7 +212,7 @@ function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknow
       // Never send null/empty content — Grok 400 "Empty content block".
       if (text) msg.content = text;
       else if (!m.tool_calls?.length) msg.content = "(empty)";
-      if (m.tool_calls?.length) msg.tool_calls = m.tool_calls;
+      if (m.tool_calls?.length) msg.tool_calls = m.tool_calls.map(({ id, type, function: fn }) => ({ id, type, function: fn }));
       out.push(msg);
       continue;
     }
@@ -507,7 +430,7 @@ function cleanTitle(s: string): string {
 /** Public entry: streams a chat completion with transient-error retry. */
 export function streamChat(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
   if (opts.oauthKind) {
-    const make = () => streamOAuthChat(opts.oauthKind!, { model: opts.model, messages: opts.messages, tools: opts.tools, maxTokens: opts.maxTokens, modelParams: opts.modelParams, promptCacheKey: opts.promptCacheKey, signal: opts.signal });
+    const make = () => streamOAuthChat(opts.oauthKind!, { model: opts.model, messages: opts.messages, tools: opts.tools, maxTokens: opts.maxTokens, modelParams: opts.modelParams, sampling: opts.sampling, temperature: opts.temperature, promptCacheKey: opts.promptCacheKey, signal: opts.signal });
     return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3, opts.model);
   }
   const useAnthropic = opts.anthropic ?? isAnthropic(opts.apiBaseUrl);

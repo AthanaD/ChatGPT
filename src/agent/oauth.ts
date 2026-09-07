@@ -11,11 +11,13 @@ import * as vscode from "vscode";
 import * as crypto from "crypto";
 import * as http from "http";
 import { ProviderEvent, ToolSchema, WireMessage } from "./types";
-import { ChatHTTPError, applyAnthropicReasoning, defaultAnthropicMaxTokens, needsContext1mBeta } from "./provider";
+import { ChatHTTPError } from "./provider";
 import { AnthropicUsageTracker } from "./anthropicUsage";
-import { toAnthropic } from "./provider/anthropicMessages";
 import { sseData } from "./provider/sse";
-import { UsageTracker } from "./provider/usage";
+import { CLAUDE_OAUTH_CONFIG as ANTHROPIC, buildClaudeAuthorizationUrl, buildClaudeMessagesRequest, claudeOAuthHeaders } from "./oauth/claude";
+import { CODEX_CONFIG as CODEX, codexHeaders, createCodexRequest, parseCodexStream, CodexProtocolError } from "./oauth/codex";
+import { ANTIGRAVITY_CONFIG as ANTIGRAVITY, antigravityHeaders, toAntigravityRequest, parseAntigravityStream, resolveAntigravityProject, AntigravityProtocolError } from "./oauth/antigravity";
+import type { ModelParams, SamplingParams } from "./provider/types";
 
 export type {
   OAuthKind,
@@ -43,68 +45,6 @@ export const BALANCE_LABELS: Record<OAuthBalanceStrategy, string> = {
   "nearest-reset": "Nearest reset time",
 };
 
-// ---- Constants (verified against auth2api / codex-rs / claude-code) ----
-
-const ANTHROPIC = {
-  authUrl: "https://claude.ai/oauth/authorize",
-  tokenUrl: "https://api.anthropic.com/v1/oauth/token",
-  clientId: "9d1c250a-e61b-44d9-88ed-5944d1962f5e",
-  port: 54545,
-  path: "/callback",
-  scope: "org:create_api_key user:profile user:inference",
-  // Curated Claude Code subscription models. Merged with /v1/models so new
-  // aliases (opus-5 / fable-5 / sonnet-5) stay selectable even when the list
-  // endpoint lags or omits them.
-  models: [
-    "claude-fable-5",
-    "claude-opus-5",
-    "claude-sonnet-5",
-    "claude-opus-4-8",
-    "claude-opus-4-7",
-    "claude-sonnet-4-6",
-    "claude-opus-4-5",
-    "claude-haiku-4-5"
-  ],
-} as const;
-
-const CODEX = {
-  authUrl: "https://auth.openai.com/oauth/authorize",
-  tokenUrl: "https://auth.openai.com/oauth/token",
-  clientId: "app_EMoamEEZ73f0CkXaXp7hrann",
-  port: 1455,
-  path: "/auth/callback",
-  scope: "openid profile email offline_access api.connectors.read api.connectors.invoke",
-  originator: "codex_cli_rs",
-  cliVersion: "0.136.0",
-  responsesUrl: "https://chatgpt.com/backend-api/codex/responses",
-  modelsUrl: "https://chatgpt.com/backend-api/codex/models",
-  fallbackModels: ["gpt-5.6", "gpt-5.6-sol", "gpt-5.6-terra", "gpt-5.6-luna", "gpt-5.5", "gpt-5.4", "gpt-5.4-mini", "gpt-5.3-codex"],
-} as const;
-
-const ANTIGRAVITY = {
-  authUrl: "https://accounts.google.com/o/oauth2/v2/auth",
-  tokenUrl: "https://oauth2.googleapis.com/token",
-  userInfoUrl: "https://www.googleapis.com/oauth2/v1/userinfo",
-  clientId: "1071006060591-tmhssin2h21lcre235vtolojh4g403ep.apps.googleusercontent.com",
-  clientSecret: "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",
-  port: 8723,
-  path: "/callback",
-  scopes: [
-    "https://www.googleapis.com/auth/cloud-platform",
-    "https://www.googleapis.com/auth/userinfo.email",
-    "https://www.googleapis.com/auth/userinfo.profile",
-    "https://www.googleapis.com/auth/cclog",
-    "https://www.googleapis.com/auth/experimentsandconfigs",
-  ],
-  loadCodeAssistUrl: "https://cloudcode-pa.googleapis.com/v1internal:loadCodeAssist",
-  onboardUserUrl: "https://cloudcode-pa.googleapis.com/v1internal:onboardUser",
-  quotaUrl: "https://cloudcode-pa.googleapis.com/v1internal:fetchAvailableModels",
-  apiBase: "https://cloudcode-pa.googleapis.com",
-  userAgent: "antigravity/ide/2.1.1 darwin/arm64",
-  apiClient: "google-cloud-sdk vscode_cloudshelleditor/0.1",
-  models: ["gemini-3-flash-agent", "gemini-3.5-flash-low", "gemini-3.5-flash-extra-low", "gemini-pro-agent", "gemini-3.1-pro-low", "claude-sonnet-4-6", "claude-opus-4-6-thinking", "gpt-oss-120b-medium", "gemini-3-flash"],
-} as const;
-
 export const OAUTH_LABEL: Record<OAuthKind, string> = { "claude-code": "Claude Code", codex: "OpenAI Codex", antigravity: "Google Antigravity" };
 
 const redirectUri = (k: OAuthKind) =>
@@ -125,6 +65,8 @@ export const onOAuthStatus = emitter.event;
 const pending = new Map<OAuthKind, { verifier: string; state: string; server: http.Server }>();
 /** Single-flight refresh lock per account id (Codex rotates refresh tokens). */
 const refreshing = new Map<string, Promise<OAuthAccount>>();
+const resolvingProjects = new Map<string, Promise<OAuthAccount>>();
+let persistence: Promise<void> = Promise.resolve();
 
 /** Index of account ids persisted in globalState. */
 const INDEX_KEY = "ocursor.oauth.accountIds";
@@ -239,14 +181,27 @@ function pkce() {
 
 async function saveAccount(acc: OAuthAccount) {
   accounts.set(acc.id, acc);
-  await ctx?.secrets.store(SECRET_KEY(acc.id), JSON.stringify(acc));
-  await ctx?.globalState.update(INDEX_KEY, [...accounts.keys()]);
+  const context = ctx;
+  const ids = [...accounts.keys()];
+  const raw = JSON.stringify(acc);
+  const write = persistence.then(async () => {
+    await context?.secrets.store(SECRET_KEY(acc.id), raw);
+    await context?.globalState.update(INDEX_KEY, ids);
+  });
+  persistence = write.catch(() => {});
+  await write;
 }
 
 export async function disconnect(id: string) {
   accounts.delete(id);
-  await ctx?.secrets.delete(SECRET_KEY(id));
-  await ctx?.globalState.update(INDEX_KEY, [...accounts.keys()]);
+  const context = ctx;
+  const ids = [...accounts.keys()];
+  const write = persistence.then(async () => {
+    await context?.secrets.delete(SECRET_KEY(id));
+    await context?.globalState.update(INDEX_KEY, ids);
+  });
+  persistence = write.catch(() => {});
+  await write;
   emit();
 }
 
@@ -339,18 +294,7 @@ export async function completeManual(kind: OAuthKind, pasted: string): Promise<v
 
 function buildAuthUrl(kind: OAuthKind, challenge: string, state: string): string {
   if (kind === "claude-code") {
-    // Anthropic requires unencoded colons + `+`-joined scope and a `code=true` flag.
-    const scope = ANTHROPIC.scope.replace(/ /g, "+");
-    return (
-      `${ANTHROPIC.authUrl}?code=true` +
-      `&client_id=${ANTHROPIC.clientId}` +
-      `&response_type=code` +
-      `&redirect_uri=${encodeURIComponent(redirectUri(kind))}` +
-      `&code_challenge=${challenge}` +
-      `&code_challenge_method=S256` +
-      `&state=${state}` +
-      `&scope=${scope}`
-    );
+    return buildClaudeAuthorizationUrl({ challenge, state, redirectUri: redirectUri(kind) });
   }
   if (kind === "antigravity") {
     // Standard Google OAuth2 code flow (no PKCE; uses client secret).
@@ -402,6 +346,27 @@ function decodeJwt(token: string): any {
   }
 }
 
+/** Decode identity hints locally; authentication is still performed upstream. */
+function codexIdentity(tokens: { id_token?: string; access_token?: string }) {
+  const claims = decodeJwt(tokens.id_token || "");
+  const access = decodeJwt(tokens.access_token || "");
+  const auth = claims["https://api.openai.com/auth"] || {};
+  const accessAuth = access["https://api.openai.com/auth"] || {};
+  return {
+    accountId: auth.chatgpt_account_id || claims.chatgpt_account_id || claims.account_id || accessAuth.chatgpt_account_id,
+    email: claims.email || access.email || access.preferred_username,
+  };
+}
+
+function tokenExpiry(data: any): number {
+  if (typeof data?.access_token !== "string" || !data.access_token.trim()) {
+    throw new Error("OAuth response did not include an access token");
+  }
+  const seconds = Number(data.expires_in ?? 3600);
+  if (!Number.isFinite(seconds) || seconds <= 0) throw new Error("OAuth response included an invalid token expiry");
+  return Date.now() + seconds * 1000;
+}
+
 /** Build a stable account id; fall back to a random suffix if no native id. */
 function accountId(kind: OAuthKind, nativeId?: string): string {
   return `${kind}:${nativeId || crypto.randomBytes(6).toString("hex")}`;
@@ -410,7 +375,8 @@ function accountId(kind: OAuthKind, nativeId?: string): string {
 async function exchangeAnthropic(code: string, verifier: string, state: string): Promise<OAuthAccount> {
   const r = await fetch(ANTHROPIC.tokenUrl, {
     method: "POST",
-    headers: { "content-type": "application/json" },
+    headers: { "content-type": "application/json", accept: "application/json" },
+    signal: AbortSignal.timeout(30_000),
     body: JSON.stringify({
       code,
       grant_type: "authorization_code",
@@ -428,7 +394,7 @@ async function exchangeAnthropic(code: string, verifier: string, state: string):
     kind: "claude-code",
     accessToken: d.access_token,
     refreshToken: d.refresh_token,
-    expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000,
+    expiresAt: tokenExpiry(d),
     email: d.account?.email_address,
     accountId: acctUuid,
   };
@@ -444,37 +410,22 @@ async function exchangeCodex(code: string, verifier: string): Promise<OAuthAccou
   });
   const r = await fetch(CODEX.tokenUrl, {
     method: "POST",
-    headers: { "content-type": "application/x-www-form-urlencoded" },
+    headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    signal: AbortSignal.timeout(30_000),
     body: body.toString(),
   });
   if (!r.ok) throw new Error(`Codex token exchange ${r.status}: ${(await r.text()).slice(0, 300)}`);
   const d: any = await r.json();
-  const claims = decodeJwt(d.id_token || "");
-  const authClaims = claims["https://api.openai.com/auth"] || {};
-  const chatgptAccountId = authClaims.chatgpt_account_id || claims.chatgpt_account_id || "";
+  const identity = codexIdentity(d);
   return {
-    id: accountId("codex", chatgptAccountId),
+    id: accountId("codex", identity.accountId),
     kind: "codex",
     accessToken: d.access_token,
     refreshToken: d.refresh_token,
     idToken: d.id_token,
-    expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000,
-    email: claims.email,
-    accountId: chatgptAccountId,
-  };
-}
-
-const AG_PLATFORM = process.platform === "win32" ? 5 : process.platform === "linux" ? 3 : process.arch === "arm64" ? 2 : 1;
-const AG_METADATA = { ideType: 9, platform: AG_PLATFORM, pluginType: 2 };
-
-function agHeaders(token: string) {
-  return {
-    authorization: `Bearer ${token}`,
-    "content-type": "application/json",
-    "user-agent": "google-api-nodejs-client/9.15.1",
-    "x-goog-api-client": ANTIGRAVITY.apiClient,
-    "client-metadata": JSON.stringify(AG_METADATA),
-    "x-request-source": "local",
+    expiresAt: tokenExpiry(d),
+    email: identity.email,
+    accountId: identity.accountId,
   };
 }
 
@@ -482,6 +433,7 @@ async function exchangeAntigravity(code: string): Promise<OAuthAccount> {
   const r = await fetch(ANTIGRAVITY.tokenUrl, {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+    signal: AbortSignal.timeout(30_000),
     body: new URLSearchParams({
       grant_type: "authorization_code",
       client_id: ANTIGRAVITY.clientId,
@@ -492,91 +444,79 @@ async function exchangeAntigravity(code: string): Promise<OAuthAccount> {
   });
   if (!r.ok) throw new Error(`Antigravity token exchange ${r.status}: ${(await r.text()).slice(0, 300)}`);
   const d: any = await r.json();
+  const expiresAt = tokenExpiry(d);
   const token = d.access_token as string;
 
   // Identify the user + resolve the Google Cloud project for Code Assist.
   let email: string | undefined;
   try {
-    const ui = await fetch(`${ANTIGRAVITY.userInfoUrl}?alt=json`, { headers: { authorization: `Bearer ${token}`, accept: "application/json" } });
+    const ui = await fetch(`${ANTIGRAVITY.userInfoUrl}?alt=json`, { headers: { authorization: `Bearer ${token}`, accept: "application/json" }, signal: AbortSignal.timeout(15_000) });
     if (ui.ok) email = ((await ui.json()) as any)?.email;
   } catch { /* non-fatal */ }
 
-  const { projectId, tierId } = await agLoadCodeAssist(token);
-  if (projectId && tierId) { try { await agOnboard(token, tierId); } catch { /* best effort */ } }
+  const { projectId } = await resolveAntigravityProject(token, { signal: AbortSignal.timeout(30_000) });
 
   return {
     id: accountId("antigravity", email || projectId),
     kind: "antigravity",
     accessToken: token,
     refreshToken: d.refresh_token,
-    expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000,
+    expiresAt,
     email,
     accountId: email,
     projectId,
   };
 }
 
-async function agLoadCodeAssist(token: string): Promise<{ projectId?: string; tierId?: string }> {
-  const r = await fetch(ANTIGRAVITY.loadCodeAssistUrl, {
-    method: "POST",
-    headers: agHeaders(token),
-    body: JSON.stringify({ metadata: AG_METADATA }),
-  });
-  if (!r.ok) return {};
-  const d: any = await r.json();
-  let projectId = d.cloudaicompanionProject;
-  if (projectId && typeof projectId === "object") projectId = projectId.id;
-  let tierId = "legacy-tier";
-  if (Array.isArray(d.allowedTiers)) {
-    const def = d.allowedTiers.find((t: any) => t.isDefault && t.id);
-    if (def) tierId = String(def.id).trim();
-  }
-  return { projectId, tierId };
-}
-
-async function agOnboard(token: string, tierId: string) {
-  await fetch(ANTIGRAVITY.onboardUserUrl, {
-    method: "POST",
-    headers: agHeaders(token),
-    body: JSON.stringify({ tierId, metadata: AG_METADATA }),
-  });
-}
-
 async function refreshAccount(acc: OAuthAccount): Promise<OAuthAccount> {
   const existing = refreshing.get(acc.id);
   if (existing) return existing;
   const p = (async () => {
+    if (!acc.refreshToken) throw new Error(`${OAUTH_LABEL[acc.kind]} needs to be reconnected: no refresh token`);
     let next: OAuthAccount;
     if (acc.kind === "claude-code") {
       const r = await fetch(ANTHROPIC.tokenUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
         body: JSON.stringify({ client_id: ANTHROPIC.clientId, grant_type: "refresh_token", refresh_token: acc.refreshToken }),
       });
       if (!r.ok) throw new Error(`Anthropic refresh ${r.status}: ${(await r.text()).slice(0, 200)}`);
       const d: any = await r.json();
-      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000 };
+      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, expiresAt: tokenExpiry(d) };
     } else if (acc.kind === "antigravity") {
       const r = await fetch(ANTIGRAVITY.tokenUrl, {
         method: "POST",
         headers: { "content-type": "application/x-www-form-urlencoded", accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
         body: new URLSearchParams({ grant_type: "refresh_token", client_id: ANTIGRAVITY.clientId, client_secret: ANTIGRAVITY.clientSecret, refresh_token: acc.refreshToken }).toString(),
       });
       if (!r.ok) throw new Error(`Antigravity refresh ${r.status}: ${(await r.text()).slice(0, 200)}`);
       const d: any = await r.json();
-      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000 };
+      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, expiresAt: tokenExpiry(d) };
     } else {
       const r = await fetch(CODEX.tokenUrl, {
         method: "POST",
-        headers: { "content-type": "application/json" },
+        headers: { "content-type": "application/json", accept: "application/json" },
+        signal: AbortSignal.timeout(30_000),
         body: JSON.stringify({ client_id: CODEX.clientId, grant_type: "refresh_token", refresh_token: acc.refreshToken }),
       });
       if (!r.ok) throw new Error(`Codex refresh ${r.status}: ${(await r.text()).slice(0, 200)}`);
       const d: any = await r.json();
-      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, idToken: d.id_token || acc.idToken, expiresAt: Date.now() + (d.expires_in ?? 3600) * 1000 };
+      const identity = codexIdentity(d);
+      next = { ...acc, accessToken: d.access_token, refreshToken: d.refresh_token || acc.refreshToken, idToken: d.id_token || acc.idToken,
+        accountId: identity.accountId || acc.accountId, email: identity.email || acc.email, expiresAt: tokenExpiry(d) };
     }
+    // A delayed refresh must not reconnect a removed account or undo a toggle.
+    const current = accounts.get(acc.id);
+    if (!current) throw new Error(`Account ${acc.id} is no longer connected`);
+    if (current.accessToken !== acc.accessToken || current.refreshToken !== acc.refreshToken) return current;
+    next.disabled = current.disabled;
     await saveAccount(next);
-    return next;
+    delete loginErrors[acc.kind];
+    const saved = accounts.get(acc.id);
+    if (!saved) throw new Error(`Account ${acc.id} is no longer connected`);
+    return saved;
   })();
   refreshing.set(acc.id, p);
   try {
@@ -591,7 +531,7 @@ async function validAccount(id: string): Promise<OAuthAccount> {
   const acc = accounts.get(id);
   if (!acc) throw new Error(`Account ${id} is not connected`);
   // Refresh 5 min before expiry.
-  if (Date.now() > acc.expiresAt - 5 * 60 * 1000) {
+  if (!acc.accessToken || !Number.isFinite(acc.expiresAt) || Date.now() > acc.expiresAt - 5 * 60 * 1000) {
     try {
       return await refreshAccount(acc);
     } catch (e) {
@@ -603,13 +543,76 @@ async function validAccount(id: string): Promise<OAuthAccount> {
   return acc;
 }
 
+/** A caller may stop waiting without cancelling another request's token rotation. */
+async function waitForAccount<T>(work: Promise<T>, signal?: AbortSignal): Promise<T> {
+  if (!signal) return work;
+  let abort: () => void = () => {};
+  const cancelled = new Promise<never>((_resolve, reject) => {
+    abort = () => reject(signal.reason ?? new DOMException("Aborted", "AbortError"));
+    if (signal.aborted) abort();
+    else signal.addEventListener("abort", abort, { once: true });
+  });
+  try { return await Promise.race([work, cancelled]); }
+  finally { signal.removeEventListener("abort", abort); }
+}
+
+/** Replay a rejected request once, sharing rotated tokens across concurrent calls. */
+async function oauthFetch(id: string, build: (account: OAuthAccount) => { url: string; init: RequestInit }, signal?: AbortSignal): Promise<Response> {
+  signal?.throwIfAborted();
+  const account = await waitForAccount(validAccount(id), signal);
+  signal?.throwIfAborted();
+  if (!accounts.has(id)) throw new Error(`Account ${id} is no longer connected`);
+  const request = build(account);
+  const init = { ...request.init, signal: signal ?? request.init.signal ?? AbortSignal.timeout(30_000) };
+  const response = await fetch(request.url, init);
+  if (response.status !== 401 || !account.refreshToken) return response;
+  await response.body?.cancel().catch(() => {});
+  signal?.throwIfAborted();
+  const current = accounts.get(id);
+  if (!current) throw new Error(`Account ${id} is no longer connected`);
+  const fresh = await waitForAccount(current.accessToken !== account.accessToken ? validAccount(id) : refreshAccount(current), signal);
+  signal?.throwIfAborted();
+  if (!accounts.has(id)) throw new Error(`Account ${id} is no longer connected`);
+  const headers = Object.fromEntries(new Headers(init.headers).entries());
+  headers.authorization = `Bearer ${fresh.accessToken}`;
+  if (fresh.kind === "codex") {
+    delete headers["chatgpt-account-id"];
+    if (fresh.accountId) headers["chatgpt-account-id"] = fresh.accountId;
+  }
+  return fetch(request.url, { ...init, headers });
+}
+
+async function ensureAntigravityProject(id: string, signal?: AbortSignal): Promise<OAuthAccount> {
+  signal?.throwIfAborted();
+  const account = await waitForAccount(validAccount(id), signal);
+  if (account.projectId?.trim()) return account;
+  let work = resolvingProjects.get(id);
+  if (!work) {
+    work = (async () => {
+      const deadline = AbortSignal.timeout(30_000);
+      const project = await resolveAntigravityProject(account.accessToken, {
+        signal: deadline,
+        fetch: (url, init) => oauthFetch(id, (fresh) => ({ url: String(url), init: {
+          ...init, headers: antigravityHeaders(fresh.accessToken, { purpose: "project" }),
+        } }), deadline),
+      });
+      const current = accounts.get(id);
+      if (!current) throw new Error(`Account ${id} is no longer connected`);
+      const next = { ...current, projectId: project.projectId };
+      await saveAccount(next);
+      return next;
+    })().finally(() => resolvingProjects.delete(id));
+    resolvingProjects.set(id, work);
+  }
+  return waitForAccount(work, signal);
+}
+
 /** First enabled account of a kind (default for routing). */
 function firstOfKind(kind: OAuthKind): OAuthAccount | undefined {
   return [...accounts.values()].find((a) => a.kind === kind && !a.disabled);
 }
 
 // ---- Usage limits ----
-// ponytail: placeholder values — real limit-fetching backend wired in later.
 
 /** Parse a reset value (epoch s/ms or ISO string) into epoch ms. */
 function parseResetMs(v: unknown): number | undefined {
@@ -634,13 +637,7 @@ export async function getAccountLimits(id: string): Promise<OAuthUsage> {
 
 // Claude Code usage: % utilization per rolling window (5h + weekly).
 async function getClaudeLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
-  const r = await fetch("https://api.anthropic.com/api/oauth/usage", {
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "anthropic-beta": "oauth-2025-04-20",
-      "anthropic-version": "2023-06-01",
-    },
-  });
+  const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTHROPIC.usageUrl, init: { method: "GET", headers: claudeOAuthHeaders(fresh.accessToken) } }));
   if (!r.ok) throw new Error(`Claude usage ${r.status}`);
   const d: any = await r.json();
   const out: OAuthLimit[] = [];
@@ -658,9 +655,7 @@ async function getClaudeLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
 
 // Codex usage: rate_limit primary/secondary windows + available reset credits.
 async function getCodexUsage(acc: OAuthAccount): Promise<OAuthUsage> {
-  const r = await fetch("https://chatgpt.com/backend-api/wham/usage", {
-    headers: { authorization: `Bearer ${acc.accessToken}`, accept: "application/json" },
-  });
+  const r = await oauthFetch(acc.id, (fresh) => ({ url: "https://chatgpt.com/backend-api/wham/usage", init: { method: "GET", headers: codexHeaders(fresh) } }));
   if (!r.ok) throw new Error(`Codex usage ${r.status}`);
   const d: any = await r.json();
   const rl = d.rate_limit ?? d.rate_limits ?? d.rate_limits_by_limit_id?.codex ?? d;
@@ -684,7 +679,7 @@ export async function consumeCodexResetCredit(id: string): Promise<{ ok: boolean
   const redeemId = crypto.randomUUID();
   const r = await fetch("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume", {
     method: "POST",
-    headers: { authorization: `Bearer ${fresh.accessToken}`, accept: "application/json", "content-type": "application/json" },
+    headers: codexHeaders(fresh),
     body: JSON.stringify({ redeem_request_id: redeemId }),
   });
   const text = await r.text();
@@ -695,16 +690,11 @@ export async function consumeCodexResetCredit(id: string): Promise<{ ok: boolean
 
 // Antigravity usage: per-model remainingFraction via fetchAvailableModels.
 async function getAntigravityLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
-  const r = await fetch(ANTIGRAVITY.quotaUrl, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "user-agent": ANTIGRAVITY.userAgent,
-      "content-type": "application/json",
-      "x-request-source": "local",
-    },
-    body: JSON.stringify(acc.projectId ? { project: acc.projectId } : {}),
-  });
+  await ensureAntigravityProject(acc.id);
+  const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTIGRAVITY.quotaUrl, init: {
+    method: "POST", headers: antigravityHeaders(fresh.accessToken, { purpose: "catalog" }),
+    body: JSON.stringify({ project: fresh.projectId }),
+  } }));
   if (!r.ok) throw new Error(`Antigravity usage ${r.status}`);
   const d: any = await r.json();
   const out: OAuthLimit[] = [];
@@ -724,16 +714,8 @@ export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
     const acc = firstOfKind("claude-code");
     if (!acc) return curated;
     try {
-      const fresh = await validAccount(acc.id);
       // /v1/models is reachable with the OAuth bearer + oauth beta header.
-      const r = await fetch("https://api.anthropic.com/v1/models?limit=1000", {
-        headers: {
-          authorization: `Bearer ${fresh.accessToken}`,
-          "anthropic-version": "2023-06-01",
-          "anthropic-beta": "oauth-2025-04-20",
-          "anthropic-dangerous-direct-browser-access": "true",
-        },
-      });
+      const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTHROPIC.modelsUrl, init: { method: "GET", headers: claudeOAuthHeaders(fresh.accessToken) } }));
       if (r.ok) {
         const d: any = await r.json();
         const ids = (d?.data ?? []).map((m: any) => m.id).filter(Boolean) as string[];
@@ -758,12 +740,11 @@ export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
     const acc = firstOfKind("antigravity");
     if (!acc) return [...ANTIGRAVITY.models];
     try {
-      const fresh = await validAccount(acc.id);
-      const r = await fetch(ANTIGRAVITY.quotaUrl, {
-        method: "POST",
-        headers: { authorization: `Bearer ${fresh.accessToken}`, "user-agent": ANTIGRAVITY.userAgent, "content-type": "application/json", "x-request-source": "local" },
-        body: JSON.stringify(fresh.projectId ? { project: fresh.projectId } : {}),
-      });
+      await ensureAntigravityProject(acc.id);
+      const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTIGRAVITY.quotaUrl, init: {
+        method: "POST", headers: antigravityHeaders(fresh.accessToken, { purpose: "catalog" }),
+        body: JSON.stringify({ project: fresh.projectId }),
+      } }));
       if (r.ok) {
         const d: any = await r.json();
         const ids = Object.entries<any>(d.models ?? {})
@@ -779,14 +760,10 @@ export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
   const acc = firstOfKind("codex");
   if (!acc) return [...CODEX.fallbackModels];
   try {
-    const fresh = await validAccount(acc.id);
-    const r = await fetch(`${CODEX.modelsUrl}?client_version=${encodeURIComponent(CODEX.cliVersion)}`, {
-      headers: {
-        authorization: `Bearer ${fresh.accessToken}`,
-        accept: "application/json",
-        ...(fresh.accountId ? { "ChatGPT-Account-ID": fresh.accountId } : {}),
-      },
-    });
+    const r = await oauthFetch(acc.id, (fresh) => ({
+      url: `${CODEX.modelsUrl}?client_version=${encodeURIComponent(CODEX.cliVersion)}`,
+      init: { method: "GET", headers: codexHeaders(fresh) },
+    }));
     if (r.ok) {
       const d: any = await r.json();
       const ids = (d?.models ?? []).map((m: any) => m.slug).filter(Boolean);
@@ -801,7 +778,7 @@ export async function listOAuthModels(kind: OAuthKind): Promise<string[]> {
 /** Whether a model id belongs to a connected OAuth provider. */
 export async function oauthKindForModel(modelId: string): Promise<OAuthKind | undefined> {
   if (isConnected("claude-code") && /^claude-/i.test(modelId)) return "claude-code";
-  if (isConnected("codex") && /^(gpt-5(\.|-|$)|o\d|codex-)/i.test(modelId)) return "codex";
+  if (isConnected("codex") && /^(gpt-[56](\.|-|$)|o\d|codex-)/i.test(modelId)) return "codex";
   return undefined;
 }
 
@@ -814,121 +791,37 @@ export async function* streamOAuthChat(kind: OAuthKind, opts: {
   maxTokens?: number;
   promptCacheKey?: string;
   modelParams?: { thinking?: string; reasoningEffort?: string; maxContext?: string };
+  temperature?: number;
+  sampling?: SamplingParams;
   signal: AbortSignal;
 }): AsyncGenerator<ProviderEvent> {
-  const acc = (await pickAccount(kind)) ?? firstOfKind(kind);
+  opts.signal.throwIfAborted();
+  const acc = (await waitForAccount(pickAccount(kind), opts.signal)) ?? firstOfKind(kind);
+  opts.signal.throwIfAborted();
   if (!acc) throw new Error(`${OAUTH_LABEL[kind]} is not connected`);
   if (kind === "claude-code") return yield* streamClaudeCode(acc.id, opts);
   if (kind === "antigravity") return yield* streamAntigravity(acc.id, opts);
   return yield* streamCodex(acc.id, opts);
 }
 
-// Claude Code reuses Anthropic message shaping but with Bearer + oauth beta and
-// the mandated "You are Claude Code" system prefix.
-async function* streamClaudeCode(id: string, opts: {
-  model: string;
-  messages: WireMessage[];
-  tools?: ToolSchema[];
-  maxTokens?: number;
-  modelParams?: { thinking?: string; reasoningEffort?: string; maxContext?: string };
-  signal: AbortSignal;
-}): AsyncGenerator<ProviderEvent> {
-  const acc = await validAccount(id);
-  const { system, messages } = toAnthropic(opts.messages);
-  // OAuth requires the Claude Code identity as the first system block.
-  system.unshift({ type: "text", text: "You are Claude Code, Anthropic's official CLI for Claude." });
-  const maxTokens = opts.maxTokens && opts.maxTokens > 0
-    ? opts.maxTokens
-    : defaultAnthropicMaxTokens(opts.model, opts.modelParams?.reasoningEffort);
-  const body: Record<string, unknown> = { model: opts.model, system, messages, stream: true, max_tokens: maxTokens };
-  const reasoningBetas = applyAnthropicReasoning(body, opts.model, maxTokens, opts.modelParams);
-  if (opts.tools?.length) {
-    body.tools = opts.tools.map((t) => ({ name: t.function.name, description: t.function.description, input_schema: t.function.parameters }));
+async function* streamClaudeCode(id: string, opts: Parameters<typeof buildClaudeMessagesRequest>[1]): AsyncGenerator<ProviderEvent> {
+  const response = await oauthFetch(id, (account) => buildClaudeMessagesRequest(account.accessToken, opts), opts.signal);
+  if (!response.ok || !response.body) {
+    throw new ChatHTTPError(response.ok ? 502 : response.status, `claude-code ${response.status}: ${(await response.text().catch(() => "")).slice(0, 500)}`);
   }
-
-  const betas = new Set(["claude-code-20250219", "oauth-2025-04-20", "interleaved-thinking-2025-05-14", ...reasoningBetas]);
-  // 1M is the default on Opus 5 / Fable 5 / Sonnet 5 / 4.6+ — beta only for older models.
-  if (opts.modelParams?.maxContext === "1m" && needsContext1mBeta(opts.model)) {
-    betas.add("context-1m-2025-08-07");
-  }
-  const r = await fetch("https://api.anthropic.com/v1/messages?beta=true", {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "anthropic-version": "2023-06-01",
-      "anthropic-beta": [...betas].join(","),
-      "anthropic-dangerous-direct-browser-access": "true",
-      "content-type": "application/json",
-      accept: "text/event-stream",
-      "user-agent": "claude-cli/2.1.92 (external, sdk-cli)",
-      "x-app": "cli",
-    },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
-  if (!r.ok || !r.body) {
-    throw new ChatHTTPError(r.status, `claude-code ${r.status}: ${(await r.text().catch(() => "")).slice(0, 500)}`);
-  }
-  yield* parseAnthropicStream(r.body.getReader());
+  yield* parseAnthropicStream(response.body.getReader());
 }
 
-// Codex talks the Responses API: translate chat messages → input items, stream
-/** Stable UUID v5 for the session header; the cache key itself stays opaque. */
-function codexSessionId(promptCacheKey: string): string {
-  // Standard URL namespace; a namespaced name avoids mixing application keys.
-  const namespace = Buffer.from("6ba7b8119dad11d180b400c04fd430c8", "hex");
-  const bytes = crypto.createHash("sha1").update(namespace).update(`OpenCursor:${promptCacheKey}`).digest().subarray(0, 16);
-  bytes[6] = (bytes[6] & 0x0f) | 0x50;
-  bytes[8] = (bytes[8] & 0x3f) | 0x80;
-  const hex = bytes.toString("hex");
-  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
-}
-
-// Responses SSE → ProviderEvents.
-async function* streamCodex(id: string, opts: {
-  model: string;
-  messages: WireMessage[];
-  tools?: ToolSchema[];
-  modelParams?: { reasoningEffort?: string };
-  promptCacheKey?: string;
-  signal: AbortSignal;
-}): AsyncGenerator<ProviderEvent> {
-  const acc = await validAccount(id);
-  const { instructions, input } = toResponsesInput(opts.messages);
-  const body: Record<string, unknown> = {
-    model: opts.model,
-    instructions: instructions || "",
-    input,
-    stream: true,
-    store: false,
-  };
-  body.reasoning = { effort: opts.modelParams?.reasoningEffort || "medium", summary: "auto" };
-  if (opts.tools?.length) {
-    body.tools = opts.tools.map((t) => ({ type: "function", name: t.function.name, description: t.function.description, parameters: t.function.parameters }));
+async function* streamCodex(id: string, opts: Parameters<typeof createCodexRequest>[0]): AsyncGenerator<ProviderEvent> {
+  const response = await oauthFetch(id, (account) => createCodexRequest(opts, account), opts.signal);
+  if (!response.ok || !response.body) {
+    throw new ChatHTTPError(response.ok ? 502 : response.status, `codex ${response.status}: ${(await response.text().catch(() => "")).slice(0, 500)}`);
   }
-
-  // Cache routing belongs to a conversation, not an individual HTTP request.
-  // Callers without a conversation/run key still get an isolated session.
-  const sessionId = opts.promptCacheKey ? codexSessionId(opts.promptCacheKey) : crypto.randomUUID();
-  body.prompt_cache_key = opts.promptCacheKey || sessionId;
-  const r = await fetch(CODEX.responsesUrl, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "content-type": "application/json",
-      accept: "text/event-stream",
-      originator: CODEX.originator,
-      "user-agent": `codex_cli_rs/${CODEX.cliVersion}`,
-      session_id: sessionId,
-      ...(acc.accountId ? { "ChatGPT-Account-ID": acc.accountId } : {}),
-    },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
-  if (!r.ok || !r.body) {
-    throw new ChatHTTPError(r.status, `codex ${r.status}: ${(await r.text().catch(() => "")).slice(0, 500)}`);
+  try { yield* parseCodexStream(response.body.getReader(), opts.signal); }
+  catch (error) {
+    if (error instanceof CodexProtocolError) throw new ChatHTTPError(error.status, error.message);
+    throw error;
   }
-  yield* parseCodexStream(r.body.getReader());
 }
 
 async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
@@ -981,264 +874,38 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
   yield { type: "done", finishReason };
 }
 
-// ---- Codex Responses API translation ----
-
-function toResponsesInput(messages: WireMessage[]): { instructions: string; input: any[] } {
-  const instr: string[] = [];
-  const input: any[] = [];
-  let toolImages: { type: "input_image"; image_url: string }[] = [];
-  const flushImages = () => {
-    if (toolImages.length) input.push({ role: "user", content: toolImages });
-    toolImages = [];
-  };
-  for (const m of messages) {
-    if (m.role !== "tool") flushImages();
-    if (m.role === "system") {
-      instr.push(typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n"));
-    } else if (m.role === "user") {
-      if (typeof m.content === "string") input.push({ role: "user", content: [{ type: "input_text", text: m.content }] });
-      else {
-        const parts = m.content.map((p: any) => (p.type === "text" ? { type: "input_text", text: p.text } : { type: "input_image", image_url: p.image_url.url }));
-        input.push({ role: "user", content: parts });
-      }
-    } else if (m.role === "assistant") {
-      if (m.content) input.push({ role: "assistant", content: [{ type: "output_text", text: m.content }] });
-      for (const tc of m.tool_calls ?? []) {
-        input.push({ type: "function_call", call_id: tc.id, name: tc.function.name, arguments: tc.function.arguments || "{}" });
-      }
-    } else if (m.role === "tool") {
-      const out = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      input.push({ type: "function_call_output", call_id: m.tool_call_id, output: out });
-      if (Array.isArray(m.content)) for (const part of m.content) {
-        if (part.type === "image_url") toolImages.push({ type: "input_image", image_url: part.image_url.url });
-      }
-    }
-  }
-  flushImages();
-  return { instructions: instr.filter(Boolean).join("\n\n"), input };
-}
-
-async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
-  const finishReason = "stop";
-  let finished = false;
-  const usage = new UsageTracker();
-  let toolIndex = 0;
-  // Map internal item_id (fc_…) → tool call index/metadata.
-  const items = new Map<string, { index: number; id: string; name: string; args: string }>();
-  for await (const data of sseData(reader)) {
-      if (!data || data === "[DONE]") continue;
-      let ev: any;
-      try { ev = JSON.parse(data); } catch { continue; }
-      if (ev.response?.usage) {
-        const event = usage.update(ev.response.usage.input_tokens, ev.response.usage.output_tokens, ev.response.usage.input_tokens_details?.cached_tokens);
-        if (event) yield event;
-      }
-      switch (ev.type) {
-        case "response.output_text.delta":
-          if (ev.delta) yield { type: "text-delta", text: ev.delta };
-          break;
-        case "response.reasoning_summary_text.delta":
-          if (ev.delta) yield { type: "thinking-delta", text: ev.delta };
-          break;
-        case "response.output_item.added": {
-          const it = ev.item;
-          if (it?.type === "function_call") {
-            const meta = { index: toolIndex++, id: it.call_id || it.id, name: it.name || "", args: "" };
-            items.set(it.id, meta);
-            yield { type: "tool-call-start", index: meta.index, id: meta.id, name: meta.name };
-          }
-          break;
-        }
-        case "response.function_call_arguments.delta": {
-          const meta = items.get(ev.item_id);
-          if (meta) { meta.args += ev.delta ?? ""; yield { type: "tool-call-args-delta", index: meta.index, delta: ev.delta ?? "" }; }
-          break;
-        }
-        case "response.output_item.done": {
-          const it = ev.item;
-          if (it?.type === "function_call") {
-            const meta = items.get(it.id);
-            if (meta) { meta.name = it.name || meta.name; meta.args = it.arguments ?? meta.args; }
-          }
-          break;
-        }
-        case "response.completed":
-          finished = true;
-          break;
-        case "error":
-          throw new ChatHTTPError(502, `codex stream error: ${ev.message || ev.error?.message || "unknown error"}`);
-        case "response.incomplete":
-          throw new ChatHTTPError(400, `codex response incomplete: ${ev.response?.incomplete_details?.reason || "interrupted generation"}`);
-        case "response.failed":
-          throw new ChatHTTPError(500, `codex: ${ev.response?.error?.message || "response failed"}`);
-      }
-  }
-  if (!finished) throw new ChatHTTPError(502, "codex stream ended before completion");
-  for (const meta of [...items.values()].sort((a, b) => a.index - b.index)) {
-    if (meta.name) yield { type: "tool-call", call: { id: meta.id, name: meta.name, arguments: meta.args || "{}" } };
-  }
-  yield { type: "done", finishReason };
-}
-
 // ---- Antigravity (Google Cloud Code, Gemini wire format) ----
-
-interface GeminiPart { text?: string; thought?: boolean; thoughtSignature?: string; functionCall?: { name: string; args: any }; functionResponse?: { name: string; response: any }; inlineData?: { mimeType: string; data: string }; }
-
-/**
- * Gemini 3+ (via Antigravity) rejects history `functionCall` parts that lack a
- * `thoughtSignature` ("Function call is missing a thought_signature"). Clients
- * don't persist the per-call signature, so we backfill this default placeholder
- * on every replayed function call — matching the Antigravity Cloud Code backend.
- */
-const ANTIGRAVITY_THOUGHT_SIGNATURE =
-  "EuwGCukGAXLI2nxwZIq54WWSoL/YN0P3TsDZ7zRnLi8g0S4aVr2HUGxvaHKySuY6HAVzcE0GPGjXrytLIldxthSvfxgUlJh6Qa9Z+Oj5QZBlYdg6HaJ6yuY5R7waE6rdwBsRf7Ft2j3DJ9rMi9qhWFqApewYtPhls3VHtuvND3l8Rm09+lbAXQs6KKWEWrxNLKTBkfpMgXhRERc/TQRMZu1twAablm6/Zk1tsYRvfWKLsNbeKF+CCojJdXJKvnR/8Ouuoa+Y2Ti20hcW7aZIIjZDFYPU//k6Ybmhg69J/imbFai2ckhfLaisqdDkdoIiBJScTOUvYqP6AE9d4MsydSC+UlhIMk4hoP76R8vUSCZRMkjOaDXstf/QoVZKbt94wyRZgAJ1G0BqI8L5ow86kLpA4wJEtxsRGymOE4bKUvApveBakYDNM9APkf+LbtbzWSseGjoZcSlycF9iN8Q2XNYKRrHbv3Lr5Y8JjdH/5y/6SHkNehTEZugaeGnSPSyCTWto1kQgHpxdWmhkLfJGNUGLmue7Mesj4TSms4J33mRpYVhNB/J333FCqIP0hr/E7BkkjEn7yZ4X7SQlh+xKPurapsnHRwiKmtsilmEFrnTE9iQr+pMr6M29qqFNv1tr5yumbaJw8JW9sB15tNsRv+dW6BjNanbsKz7HCgKUBc8tGy+7YuhXzAfViyRefcjK7eZW0Fbyt7AbybJTKz78W8NH7ye6LAwzOebXpeZ4D43fNIt8bKh26qgduSQv/7o+pAflkuqHZ99YWgHQ8h8OkZFi3eOiSYjsjhdZ/czWOdoPI/OnqIldzMPF5YlrKBLFX8VhRKVmqgsmWf5PHGulHhMkVlS+XG2UIseGy69ARa93D78Gsa+1n1kJr7EEB7Rh+27vUMxVYLdz1yMSvE5nalTAlg/ZeG8+XQ0cHuAI3KbQpHW2Q++RdXfm5JzD5WdJZUU+Zn8t8UUn85BH4RxZLeE0qJikgSsKoYVBc6YhiMjhPgkR95ReimY4Z0xCJdRo1gjexOFeODZMpQF6Yxnoic7IrdgsFA3iePTbFnPp3IAM1fAThWhXJUn3QInUOTd5o1qmTmn6REbL15g/JQNl+dqUoPkhleeb2V3kjqp1okmO3wMZbPknR3S1LZNmlS72/iBQUm+n2b/RCn4PjmM2";
-
-/** Convert our wire messages into Gemini `contents` + `systemInstruction`. */
-function toGemini(messages: WireMessage[]): { system?: { parts: GeminiPart[] }; contents: { role: "user" | "model"; parts: GeminiPart[] }[] } {
-  const sys: GeminiPart[] = [];
-  const contents: { role: "user" | "model"; parts: GeminiPart[] }[] = [];
-  const toolNames = new Map<string, string>();
-  const pushUserPart = (p: GeminiPart) => {
-    const last = contents[contents.length - 1];
-    if (last && last.role === "user") last.parts.push(p);
-    else contents.push({ role: "user", parts: [p] });
-  };
-  for (const m of messages) {
-    if (m.role === "system") {
-      const t = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      if (t) sys.push({ text: t });
-    } else if (m.role === "user") {
-      if (typeof m.content === "string") pushUserPart({ text: m.content });
-      else for (const part of m.content) {
-        if (part.type === "text") pushUserPart({ text: part.text });
-        else if (part.type === "image_url") {
-          const mt = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
-          if (mt) pushUserPart({ inlineData: { mimeType: mt[1], data: mt[2] } });
-        }
-      }
-    } else if (m.role === "assistant") {
-      const parts: GeminiPart[] = [];
-      if (m.content) parts.push({ text: m.content });
-      for (const tc of m.tool_calls ?? []) {
-        let args: any = {};
-        try { args = JSON.parse(tc.function.arguments || "{}"); } catch { /* keep {} */ }
-        toolNames.set(tc.id, tc.function.name);
-        // Gemini 3+ requires a thoughtSignature on every function call in history.
-        parts.push({ thoughtSignature: ANTIGRAVITY_THOUGHT_SIGNATURE, functionCall: { name: tc.function.name, args } });
-      }
-      contents.push({ role: "model", parts: parts.length ? parts : [{ text: "" }] });
-    } else if (m.role === "tool") {
-      const out = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      let response: any;
-      try { response = JSON.parse(out); } catch { response = { result: out }; }
-      pushUserPart({ functionResponse: { name: toolNames.get(m.tool_call_id) ?? m.tool_call_id, response } });
-      if (Array.isArray(m.content)) for (const part of m.content) {
-        if (part.type !== "image_url") continue;
-        const match = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
-        if (match) pushUserPart({ inlineData: { mimeType: match[1], data: match[2] } });
-      }
-    }
-  }
-  return { system: sys.length ? { parts: sys } : undefined, contents };
-}
 
 async function* streamAntigravity(id: string, opts: {
   model: string;
   messages: WireMessage[];
   tools?: ToolSchema[];
   maxTokens?: number;
-  modelParams?: { thinking?: string; reasoningEffort?: string; maxContext?: string };
+  modelParams?: ModelParams;
+  sampling?: SamplingParams;
+  temperature?: number;
+  promptCacheKey?: string;
   signal: AbortSignal;
 }): AsyncGenerator<ProviderEvent> {
-  const acc = await validAccount(id);
-  const { system, contents } = toGemini(opts.messages);
-  const maxTokens = Math.min(opts.maxTokens && opts.maxTokens > 0 ? opts.maxTokens : 8192, 64000);
-
-  const request: Record<string, unknown> = {
-    contents,
-    generationConfig: {
-      maxOutputTokens: maxTokens,
-      temperature: 1,
-      thinkingConfig: { includeThoughts: true },
-    },
-  };
-  if (system) request.systemInstruction = system;
-  if (opts.tools?.length) {
-    request.tools = [{ functionDeclarations: opts.tools.map((t) => ({ name: t.function.name, description: t.function.description, parameters: t.function.parameters })) }];
-    request.toolConfig = { functionCallingConfig: { mode: "VALIDATED" } };
+  try {
+    await ensureAntigravityProject(id, opts.signal);
+    const sessionId = opts.promptCacheKey
+      ? crypto.createHash("sha256").update(`${id}:${opts.promptCacheKey}`).digest().readBigUInt64BE().toString()
+      : undefined;
+    const response = await oauthFetch(id, (account) => ({
+      url: `${ANTIGRAVITY.apiBase}/v1internal:streamGenerateContent?alt=sse`,
+      init: {
+        method: "POST",
+        headers: antigravityHeaders(account.accessToken, { purpose: "generation" }),
+        body: JSON.stringify(toAntigravityRequest({ ...opts, projectId: account.projectId!, sessionId })),
+      },
+    }), opts.signal);
+    if (!response.ok || !response.body) {
+      throw new ChatHTTPError(response.ok ? 502 : response.status, `antigravity ${response.status}: ${(await response.text().catch(() => "")).slice(0, 500)}`);
+    }
+    yield* parseAntigravityStream(response.body.getReader(), { signal: opts.signal });
+  } catch (error) {
+    if (error instanceof AntigravityProtocolError) throw new ChatHTTPError(error.status, error.message);
+    throw error;
   }
-
-  const body = {
-    project: acc.projectId,
-    model: opts.model,
-    userAgent: "antigravity",
-    requestType: "agent",
-    requestId: `agent/${crypto.randomUUID()}/${Date.now()}/${crypto.randomUUID()}/0`,
-    request,
-  };
-
-  const r = await fetch(`${ANTIGRAVITY.apiBase}/v1internal:streamGenerateContent?alt=sse`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${acc.accessToken}`,
-      "content-type": "application/json",
-      "user-agent": ANTIGRAVITY.userAgent,
-      accept: "text/event-stream",
-    },
-    body: JSON.stringify(body),
-    signal: opts.signal,
-  });
-  if (!r.ok || !r.body) {
-    throw new ChatHTTPError(r.status, `antigravity ${r.status}: ${(await r.text().catch(() => "")).slice(0, 500)}`);
-  }
-  yield* parseGeminiStream(r.body.getReader());
-}
-
-async function* parseGeminiStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
-  let finishReason = "stop";
-  let finished = false;
-  const usage = new UsageTracker();
-  let toolIndex = 0;
-  const calls: { id: string; name: string; args: string }[] = [];
-  for await (const data of sseData(reader)) {
-      if (!data || data === "[DONE]") continue;
-      let chunk: any;
-      try { chunk = JSON.parse(data); } catch { continue; }
-      // Antigravity may wrap the Gemini payload under `response`.
-      const resp = chunk.response ?? chunk;
-      if (resp.usageMetadata) {
-        const u = resp.usageMetadata;
-        const output = typeof u.candidatesTokenCount === "number" || typeof u.thoughtsTokenCount === "number"
-          ? (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0) : undefined;
-        const event = usage.update(u.promptTokenCount, output, u.cachedContentTokenCount);
-        if (event) yield event;
-      }
-      if (resp.error) throw new ChatHTTPError(Number(resp.error.code) || 502, `antigravity stream error: ${resp.error.message || "unknown error"}`);
-      if (resp.promptFeedback?.blockReason) throw new ChatHTTPError(400, `antigravity blocked prompt: ${resp.promptFeedback.blockReason}`);
-      const cand = resp.candidates?.[0];
-      if (!cand) {
-        continue;
-      }
-      for (const part of cand.content?.parts ?? []) {
-        if (part.functionCall) {
-          const id = `call_${toolIndex}`;
-          const name = part.functionCall.name;
-          const args = JSON.stringify(part.functionCall.args ?? {});
-          yield { type: "tool-call-start", index: toolIndex, id, name };
-          calls.push({ id, name, args });
-          toolIndex++;
-        } else if (typeof part.text === "string") {
-          if (part.thought) yield { type: "thinking-delta", text: part.text };
-          else yield { type: "text-delta", text: part.text };
-        }
-      }
-      if (cand.finishReason) {
-        finishReason = String(cand.finishReason).toLowerCase();
-        finished = true;
-        if (!["stop", "max_tokens"].includes(finishReason)) throw new ChatHTTPError(400, `antigravity ended generation: ${finishReason}`);
-      }
-  }
-  if (!finished) throw new ChatHTTPError(502, "antigravity stream ended before completion");
-  for (const c of calls) yield { type: "tool-call", call: { id: c.id, name: c.name, arguments: c.args || "{}" } };
-  yield { type: "done", finishReason: finishReason === "stop" && calls.length ? "tool_calls" : finishReason };
 }

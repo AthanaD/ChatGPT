@@ -45,6 +45,12 @@ async function collect(options: Partial<StreamChatOpts> = {}, events: ProviderEv
   return events;
 }
 
+it("does not send Google replay signatures to an OpenAI-compatible endpoint", async () => {
+  await collect({ messages: [{ role: "assistant", content: null, tool_calls: [{ id: "call", type: "function", function: { name: "Read", arguments: "{}" }, thoughtSignature: "google-only" }] },
+    { role: "tool", tool_call_id: "call", content: "contents" }] });
+  expect(requests[0].body.messages[0].tool_calls[0]).toEqual({ id: "call", type: "function", function: { name: "Read", arguments: "{}" } });
+});
+
 describe("complete provider request contracts", () => {
   it.each([undefined, "claude-code"] as const)("limits Anthropic cache breakpoints for %s without modifying history", async (oauthKind) => {
     const messages = buildMessages("System", [{ kind: "user", text: "Previous request" }, { kind: "assistant", text: "Previous answer", calls: [] }, { kind: "user", text: "Follow-up" }], { userInfo: "Workspace", openFiles: "src/example.ts", timestamp: "fixture" });

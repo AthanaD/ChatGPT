@@ -13,6 +13,8 @@ export interface ToolCall {
   id: string;
   name: string;
   arguments: string;
+  /** Opaque Gemini signature returned with this exact tool call. */
+  thoughtSignature?: string;
 }
 
 export interface Attachment {
@@ -60,6 +62,8 @@ export interface WireToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
+  /** Internal replay metadata, serialized only by the Google OAuth client. */
+  thoughtSignature?: string;
 }
 
 export type ProviderEvent =

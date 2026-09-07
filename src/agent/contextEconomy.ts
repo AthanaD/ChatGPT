@@ -36,7 +36,7 @@ export function stepTokens(s: Step): number {
     // thinking is UI-only — never sent on the wire (see buildMessages).
     chars += s.text?.length || 0;
     for (const c of s.calls || []) {
-      chars += (c.arguments?.length || 0) + c.name.length + c.id.length + 48;
+      chars += (c.arguments?.length || 0) + (c.thoughtSignature?.length || 0) + c.name.length + c.id.length + 48;
     }
     return Math.ceil(chars / 4) + 4;
   }

@@ -149,6 +149,8 @@ function shrinkGroup(group: Step[], budget: number): Step[] | undefined {
         text: clipToBudget(s.text, cap),
         calls: s.calls.map((call) => ({
           ...call,
+          // A signature must not be replayed with rewritten arguments.
+          thoughtSignature: call.arguments.length <= cap ? call.thoughtSignature : undefined,
           // Historical calls are never replayed. Use valid JSON with an explicit
           // marker instead of slicing JSON halfway through a string escape.
           arguments: call.arguments.length <= cap
@@ -344,6 +346,7 @@ export function buildMessages(system: string, steps: Step[], ctx?: CursorContext
           id: c.id,
           type: "function",
           function: { name: c.name, arguments: c.arguments || "{}" },
+          ...(c.thoughtSignature ? { thoughtSignature: c.thoughtSignature } : {}),
         }));
       }
       out.push(msg);

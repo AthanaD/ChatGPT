@@ -34,6 +34,21 @@ function expectCompleteExchanges(steps: Step[]): void {
 }
 
 describe("context budget fitting", () => {
+  it("drops signatures when emergency fitting rewrites historical call arguments", () => {
+    const steps: Step[] = [{ kind: "user", text: "Read the file" },
+      { kind: "assistant", text: "", calls: [{ id: "signed-call", name: "Read", arguments: JSON.stringify({ path: "x".repeat(8000) }), thoughtSignature: "original-signature" }] },
+      { kind: "tool-result", callId: "signed-call", name: "Read", output: "contents", status: "completed" }];
+    const original = structuredClone(steps);
+    const fitted = fitStepsToBudget(steps, 0, 400);
+    const assistant = fitted.find((step) => step.kind === "assistant");
+    expect(assistant?.kind).toBe("assistant");
+    if (assistant?.kind === "assistant") {
+      expect(assistant.calls[0].arguments).toContain("_context_omitted");
+      expect(assistant.calls[0].thoughtSignature).toBeUndefined();
+    }
+    expect(steps).toEqual(original);
+  });
+
   it("returns no steps when request overhead exhausts the budget", () => {
     const steps: Step[] = [{ kind: "user", text: "Fix the failure" }];
     expect(fitStepsToBudget(steps, 100, 100)).toEqual([]);
