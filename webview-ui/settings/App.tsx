@@ -13,6 +13,7 @@ import { vscode } from "../shared/vscode";
 import { ApprovalActionType, ApprovalMode, ApprovalPolicy, DEFAULT_APPROVAL, EMPTY_FEATURES, FeatureConfig, LlamacppStatus, McpStatus, ModelDef, ModelUsage, OAUTH_LABEL, OAuthStatus, OllamaModel, OllamaStatus, Persona, RuleInfo, SkillInfo } from "./features";
 import { HooksPanel, LlamacppPanel, McpPanel, ModelsPanel, OAuthAccountCard, OllamaPanel, PersonasPanel, ProvidersPanel, RulesPanel, SubagentsPanel } from "./FeaturePanels";
 import { ModelSelect } from "../shared/ModelSelect";
+import { CacheUsage } from "./CacheUsage";
 
 interface Settings {
   model: string;
@@ -329,7 +330,7 @@ function UsagePanel({
       <div className="index-card">
         <div className="index-card-title">Total</div>
         <p className="row-desc">
-          {fmtTokens(totals.p)} input · {fmtTokens(totals.c)} output tokens across {totals.r} request{totals.r === 1 ? "" : "s"}. Tracked locally on this machine.
+          {fmtTokens(totals.p)} input · {fmtTokens(totals.c)} output tokens across {totals.r} request attempt{totals.r === 1 ? "" : "s"} with reported usage. Includes billed retries. Tracked locally on this machine.
         </p>
         {rows.length === 0 ? (
           <div className="empty-card" style={{ marginTop: 12 }}>No usage recorded yet. Start chatting to see per-model token usage.</div>
@@ -343,10 +344,9 @@ function UsagePanel({
                     <span style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{model}</span>
                     <span className="row-desc" style={{ flex: "0 0 auto" }}>
                       {fmtTokens(u.promptTokens)} in · {fmtTokens(u.completionTokens)} out · {u.requests} req
-                      {!!u.cachedReadTokens && <> · {fmtTokens(u.cachedReadTokens)} cached read</>}
-                      {!!u.cachedWriteTokens && <> · {fmtTokens(u.cachedWriteTokens)} cache write</>}
                     </span>
                   </div>
+                  <div className="row-desc" style={{ marginBottom: 4 }}><CacheUsage usage={u} /></div>
                   <div className="index-bar"><div className="index-bar-fill" style={{ width: `${Math.max(2, Math.round((total / max) * 100))}%` }} /></div>
                 </div>
               );

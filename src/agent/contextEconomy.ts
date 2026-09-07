@@ -25,6 +25,11 @@ export function stepTokens(s: Step): number {
   let chars = 0;
   if (s.kind === "user") {
     chars += s.text.length;
+    if (s.context && !s.synthetic) {
+      chars += (s.context.omitUserInfo ? 0 : s.context.userInfo.length) +
+        (s.context.omitOpenFiles ? 0 : s.context.openFiles.length) +
+        s.context.timestamp.length + (s.context.reminder?.length || 0) + 66;
+    }
     for (const a of s.attachments || []) {
       if (a.kind === "text") chars += (a.data?.length || 0) + a.name.length + 42;
     }

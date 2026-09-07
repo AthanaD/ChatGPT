@@ -103,3 +103,18 @@ describe("ActivityLedger", () => {
 		expect(ledger.render({ request: "", todos: [], maxActions: 2.9 }).match(/^  ✓/gm)).toHaveLength(2);
 	});
 });
+
+
+it("distinguishes running jobs, cancelled waits, and verified exit outcomes", () => {
+  const ledger = new ActivityLedger();
+  ledger.record("Shell", { command: "long job" }, "completed", "started", { status: "running", processStatus: "running", jobId: "job" });
+  ledger.record("AwaitShell", { shell_id: "job" }, "error", "wait cancelled", { status: "aborted", processStatus: "running", jobId: "job" });
+  ledger.record("Shell", { command: "verify" }, "error", "Some progress text", { status: "failed", processStatus: "failed", exitCode: 1 });
+  ledger.record("Shell", { command: "verify after fix" }, "completed", "all checks pass", { status: "completed", processStatus: "completed", exitCode: 0 });
+  const state = ledger.render({ request: "Verify changes", todos: [] });
+  expect(state).toContain("… Shell long job — running");
+  expect(state).toContain("aborted (process running)");
+  expect(state).toContain("failed (exit 1)");
+  expect(state).toContain("completed (exit 0)");
+  expect(state).not.toContain("Some progress text");
+});

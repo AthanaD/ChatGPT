@@ -44,7 +44,9 @@ export function toAnthropic(messages: WireMessage[]): { system: AnthropicBlock[]
       system.push(...systemToBlocks(m.content));
     } else if (m.role === "user") {
       if (typeof m.content === "string") {
-        out.push({ role: "user", content: m.content });
+        // Use one stable shape even after this turn stops being a rolling cache
+        // boundary. Cache metadata must never change its text representation.
+        out.push({ role: "user", content: [{ type: "text", text: m.content }] });
       } else {
         const blocks: AnthropicBlock[] = [];
         for (const part of m.content) {
@@ -104,8 +106,10 @@ export function toAnthropic(messages: WireMessage[]): { system: AnthropicBlock[]
       }
     }
   }
-  // Anthropic counts breakpoints across the entire serialized request. Keep
-  // two early stable boundaries and the two newest boundaries when necessary.
+  // Tool results grow after the original query. Cache their completed batches,
+  // not just the initial supplied user/system blocks. Keep the prior batch
+  // boundary too: a large new batch may exceed the provider's prefix lookback.
+  // A newly appended user turn takes the newest slot and includes that query.
   const marked: AnthropicBlock[] = [];
   const collect = (blocks: AnthropicBlock[]) => {
     for (const block of blocks) {
@@ -115,7 +119,26 @@ export function toAnthropic(messages: WireMessage[]): { system: AnthropicBlock[]
   };
   collect(system);
   for (const message of out) if (Array.isArray(message.content)) collect(message.content);
-  for (const block of marked.slice(2, Math.max(2, marked.length - 2))) delete block.cache_control;
+  const boundaries = out.flatMap((message) => {
+    if (message.role !== "user" || !Array.isArray(message.content)) return [];
+    const last = message.content[message.content.length - 1];
+    return last && (last.type !== "text" || !!last.text) ? [last] : [];
+  });
+  const keep = new Set(marked.slice(0, 2));
+  // Generic callers need stable early anchors even without explicit markers.
+  const initialUser = out.find(message => message.role === "user" && Array.isArray(message.content) && !message.content.some(block => block.type === "tool_result"));
+  const initialBlocks = initialUser && Array.isArray(initialUser.content) ? initialUser.content.slice(0, 1) : [];
+  for (const block of [...system, ...initialBlocks]) {
+    if (keep.size >= 2) break;
+    if (block.type !== "text" || block.text) keep.add(block);
+  }
+  for (const block of boundaries.slice(-2)) keep.add(block);
+  // Retain useful supplied boundaries when rolling slots overlap early ones.
+  for (const block of [...marked].reverse()) {
+    if (keep.size >= 4) break;
+    keep.add(block);
+  }
+  for (const block of marked) delete block.cache_control;
+  for (const block of keep) block.cache_control = { type: "ephemeral" };
   return { system, messages: out };
 }
-

@@ -14,7 +14,7 @@ import { TOOLS, schemasForMode, toolsForMode, disposeShellSession, EDIT_TOOLS, M
 import { actionTypeForCall } from "./approvalPolicy";
 import { getWorkspaceRoot, normalizeToolPaths } from "../context/workspaceUtils";
 import { systemPrompt } from "./prompt";
-import { buildMessages, clip, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
+import { buildMessages, snapshotUserContext, clip, fitStepsToBudget, splitForCompaction, stepsToTranscript, stepsTokens, type CursorContextBlocks } from "./messages";
 import {
 	economizeHistory,
 	COMPACT_AT_FILL,
@@ -25,6 +25,9 @@ import {
 	currentRequestText,
 	isCompactionBoundary,
 } from "./contextEconomy";
+import { createHash } from "node:crypto";
+import { BackgroundTasks } from "./backgroundTasks";
+import type { ToolOutcome } from "./toolOutcome";
 import { ActivityLedger } from "./taskState";
 import { ContextArchive } from "./contextArchive";
 import { DeferredToolSchemas } from "./deferredTools";
@@ -45,21 +48,20 @@ import {
 import { logError } from "../logging";
 import { planRelativePath } from "../shared/planPath";
 
-// Appended after every live user query in multitask mode so the model never
-// forgets it is a COORDINATOR: edit tools are disabled and all work must be
-// delegated to parallel background subagents via the Task tool.
+// Persisted with each new coordinator-mode user turn. Required mode
+// transitions append an explicit superseding instruction.
 const MULTITASK_REMINDER =
 	"<reminder>\nYou are in MULTITASK mode: you are a COORDINATOR, not an implementer. " +
 	"Do NOT edit files, run terminal commands, or do the work yourself — the edit tools are DISABLED and will refuse. " +
 	"Break the request into independent units, then delegate EVERY unit to a background subagent via the Task tool " +
-	"(run_in_background=true), launching multiple subagents AT THE SAME TIME in a single turn.\n</reminder>";
+	"(run_in_background=true), with at most four active tasks. Batch independent launches and do not duplicate running work.\n</reminder>";
 
 // Project-mode counterpart: the model is the lead of the assigned team(s).
 const PROJECT_REMINDER =
 	"<reminder>\nYou are in PROJECT mode: you are the PROJECT LEAD of the team(s) in <assigned_teams>, not an implementer. " +
 	"Do NOT edit files or run terminal commands yourself — those tools are DISABLED and will refuse. " +
 	"Plan the project with TodoWrite, then delegate each unit of work to the right team member with the Task tool " +
-	'(run_in_background=true, subagent_type set to the member name), launching every independent member AT THE SAME TIME in a single turn.\n</reminder>';
+	'(run_in_background=true, subagent_type set to the member name), batching independent launches with at most four active tasks and avoiding duplicate running work.\n</reminder>';
 
 const MAX_STEPS = 200;
 
@@ -261,24 +263,34 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			? resolveTeamSubagents(teams, customSubagents ?? [], activeTeamIds)
 			: undefined;
 	const roster = teamRoster?.length ? teamRoster : customSubagents;
-	// In-flight background subagents. The run is not "finished" until these settle,
-	// so the chat stays busy (and can't be closed) while they keep working. When they
-	// finish, their summaries are fed back into the loop so the model can synthesize.
-	const bgSubagents: Promise<{ title: string; text: string }>[] = [];
-	// Settled bg results (parallel to bgSubagents), so exit paths can flush them
-	// into history without re-awaiting.
-	const bgSettled: ({ title: string; text: string } | undefined)[] = [];
-	// Background subagent results already fed back into the conversation.
-	let bgReported = 0;
+	const background = new BackgroundTasks();
+	let childSequence = 0;
 	const started = Date.now();
 	// Frozen per run: a changing timestamp inside the cached query block would
 	// break the provider prompt-cache prefix on every step of a multi-step run.
 	const runTimestamp = new Date(started).toLocaleString();
 	// Per-run tool context (avoids module globals so chats run concurrently).
 	const shellSessionKey = `run_${started}_${Math.random().toString(36).slice(2, 8)}`;
+	const observedOutcomes = new Map<string, ToolOutcome>();
+	const failedOutcome = (callId: string, status: ToolOutcome["status"]): ToolOutcome => ({ ...observedOutcomes.get(callId), status });
+	const failureText = (callId: string, text: string) => {
+		const observed = observedOutcomes.get(callId);
+		return observed?.jobId ? `${text}\nProcess status: ${observed.processStatus ?? "unknown"}; terminal evidence: ReadContext {"id":"${observed.jobId}"}.` : text;
+	};
 	const toolCtx: ToolContext = {
+		recordToolOutcome: (callId, outcome) => { observedOutcomes.set(callId, outcome); },
 		todos: opts.contextState?.todos?.map((todo) => ({ ...todo })) ?? [],
 		readContext: (input) => {
+			if (input.id === "parent_history") {
+				if (!opts.inheritedContext) return "error: this run has no parent request history";
+				const id = archive.store(opts.inheritedContext.userRequests, "Parent user instructions");
+				return archive.read({ ...input, id });
+			}
+			if (input.id === "capabilities") {
+				refreshCapabilities();
+				const id = archive.store(capabilityText(), "Runtime capabilities");
+				return archive.read({ ...input, id });
+			}
 			if (input.id === "history") {
 				// Do not retain another full transcript snapshot on each page read.
 				// The history alias stays valid as the append-only transcript grows.
@@ -286,7 +298,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				const id = snapshot.store(archivedTranscript(persistedHistory), "Conversation history");
 				return snapshot.read({ ...input, id }).replace(`id: ${id}`, "id: history");
 			}
-			const id = input.id === "mcp" ? deferredTools?.catalogId ?? input.id : input.id;
+			const id = input.id === "mcp" ? deferredTools?.catalogId ?? archive.store(mcpSchemas.map(s => JSON.stringify(s)).join("\n"), "MCP tool catalog") : input.id;
 			const output = archive.read({ ...input, id });
 			if (!output.startsWith("Error:") && deferredTools?.activate(id)) {
 				schemaCache.clear();
@@ -296,6 +308,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		},
 		askUser,
 		shellSessionKey,
+		shellOwnerKey: opts.shellOwnerKey ?? opts.promptCacheKey ?? shellSessionKey,
 		getMode: () => mode,
 		changeOwner,
 		beforeResourceWrite: async (path, content, resourceSignal) => onHook?.("beforeEdit", { path, tool_input: JSON.stringify({ file_path: path, content }) }, "Write", resourceSignal ?? signal),
@@ -311,14 +324,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		}
 		const prev = mode;
 		mode = next;
+		system = makeSystem();
+		cursorCtx = { ...cursorCtx!, userInfo: `${baseUserInfo}\n\n${capabilityText()}`.trim() };
+		pushSystemNote(`Mode changed from ${prev} to ${next}. Follow the current mode instructions; previous mode reminders are superseded.\n${capabilityText()}`);
 		emit({ type: "mode-changed", mode: next });
 		return `Switched from ${prev} mode to ${next} mode.`;
 	};
 	if (!isSubagent) {
 		// Subagent runner for the `task` tool (top-level runs only).
-		toolCtx.runSubagent = async (subPrompt, readonly, subagentName, subSignal, callId, opts) => {
+		toolCtx.runSubagent = async (subPrompt, readonly, subagentName, subSignal, callId, taskOpts) => {
 			// resume/interrupt aren't representable in this single-shot runtime.
-			if (opts?.resume) {
+			if (taskOpts?.resume) {
 				return "error: resuming or forking subagents is not supported in this runtime; launch a fresh subagent instead.";
 			}
 			const def = subagentName ? findSubagentByName(roster, subagentName) : undefined;
@@ -332,7 +348,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (!availableModels?.length) return id;
 				return availableModels.some((m) => m.toLowerCase() === id.toLowerCase()) ? id : undefined;
 			};
-			const subModel = known(opts?.model) || known(def?.model) || known(subagentModel) || model;
+			const subModel = known(taskOpts?.model) || known(def?.model) || known(subagentModel) || model;
 			// Surface the resolved model on the Task card even when the call didn't name one.
 			if (callId) {
 				emit({
@@ -343,9 +359,22 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				});
 			}
 			// Attach any provided files to the subagent prompt as context.
-			if (opts?.fileAttachments?.length) {
-				subPrompt = `${subPrompt}\n\n<attached_files>\n${opts.fileAttachments.join("\n")}\n</attached_files>`;
+			if (taskOpts?.fileAttachments?.length) {
+				subPrompt = `${subPrompt}\n\n<attached_files>\n${taskOpts.fileAttachments.join("\n")}\n</attached_files>`;
 			}
+			const taskKey = createHash("sha256").update(JSON.stringify([subPrompt.trim(), subModel, subReadonly, subagentName])).digest("hex");
+			const duplicate = background.findActive(taskKey);
+			if (duplicate) return `Task ${duplicate} is already running. Its result will be delivered automatically; continue independent work.`;
+			if (background.active >= background.limit) return `error: ${background.limit} background tasks are already running. Continue independent work or yield for a result before delegating more.`;
+			const childId = callId || `task_${++childSequence}`;
+			const parentRequests = persistedHistory.filter((s): s is Extract<Step, { kind: "user" }> => s.kind === "user" && !s.synthetic).map((s, i) => `User request ${i + 1}:\n${s.text}`).join("\n\n");
+			const parentSummary = history.find(s => s.kind === "user" && s.synthetic && s.text.startsWith("Earlier conversation summary"));
+			const inheritedContext = {
+				instructions: cursorCtx?.userInfo.match(/<rules>[\s\S]*?<\/rules>/)?.[0] || extraInstructions || "",
+				userRequests: parentRequests,
+				summary: parentSummary?.kind === "user" ? clip(parentSummary.text, 4000) : undefined,
+			};
+			const childConfig = subModel === model ? { contextTokens, maxTokens, sampling, modelParams } : opts.resolveModelOptions?.(subModel) ?? {};
 			// Per-subagent abort: child controller linked to the parent signal so the
 			// user can stop just this subagent and return to the parent.
 			const childAC = new AbortController();
@@ -361,12 +390,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				});
 			}
 			let finalText = "";
+			let childError = "";
+			let childPaused = false;
+			const childReport = () => childAC.signal.aborted ? "(subagent cancelled)"
+				: childError ? `(subagent failed: ${childError})`
+					: childPaused ? `(subagent reached its step limit; work is incomplete)${finalText ? `\n${finalText}` : ""}`
+						: finalText || "(subagent finished with no summary; verify whether its task is complete)";
 			// No outer Task/subagent wall clock — nested tools already have per-tool timeouts.
 			// Parent Stop still aborts via childAC.
-			// Same context window + step budget as the parent agent (compaction/summarize
-			// runs inside the child loop against this budget).
-			const subContextTokens =
-				contextTokens && contextTokens > 0 ? contextTokens : undefined;
 			const runP = runAgent({
 				apiBaseUrl,
 				apiKey,
@@ -374,12 +405,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				mode: subReadonly ? "ask" : "agent",
 				prompt: subPrompt,
 				history: [],
-				maxTokens,
+				maxTokens: childConfig.maxTokens,
 				maxSteps,
 				autoContinue,
-				contextTokens: subContextTokens,
-				sampling,
-				modelParams,
+				contextTokens: childConfig.contextTokens,
+				sampling: childConfig.sampling,
+				modelParams: childConfig.modelParams,
+				promptCacheKey: `${opts.promptCacheKey ?? shellSessionKey}/task/${childId}`,
+				shellOwnerKey: toolCtx.shellOwnerKey,
 				anthropic,
 				oauthKind,
 				systemPromptOverride: subSystemOverride,
@@ -391,6 +424,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				changeOwner,
 				approve,
 				isSubagent: true,
+				inheritedContext,
 				// Nested Task disabled; child still needs hooks for compaction etc.
 				onHook,
 				onBeforeShell,
@@ -398,37 +432,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				signal: childAC.signal,
 				emit: (e) => {
 					if (e.type === "run-result") finalText = e.text;
-					if (e.type === "usage") emit({ ...e, model: e.model ?? subModel, source: "subagent" });
+					if (e.type === "error") childError = e.message;
+					if (e.type === "run-status" && e.status === "error" && !childError) childError = "the child run ended with an error";
+					if (e.type === "max-steps") childPaused = true;
+					if (e.type === "usage") emit({ ...e, model: e.model ?? subModel, source: e.source === "summary" ? "summary" : "subagent" });
 					// UI stream only — not parent history. Coalesced via parent emit.
 					if (callId) emit({ type: "subagent-event", callId, event: e });
 				},
 			});
 			// Background subagents return immediately; they keep streaming via emit.
-			if (opts?.runInBackground) {
-				const title = opts.description || subagentName || "subagent";
-				// Track the work so the parent run waits for it before reporting "finished",
-				// and capture its summary so it can be fed back into the loop on completion.
-				const idx = bgSubagents.length;
-				const tracked = runP
-					.then(() => ({
-						title,
-						text: finalText || "(subagent finished with no summary)",
-					}))
-					.catch((e) => {
-						logError("task.background", e, { title, callId });
-						return {
-							title,
-							text: `(subagent failed: ${e instanceof Error ? e.message : String(e)})`,
-						};
-					})
-					.finally(() => {
-						parentSig.removeEventListener("abort", onParentAbort);
-						onHook?.("subagentStop", { subagent: title });
-					});
-				bgSubagents.push(tracked);
-				void tracked.then((v) => { bgSettled[idx] = v; });
-				if (callId) emit({ type: "subagent-event", callId, event: { type: "run-status", status: "running" } });
-				return `Launched ${title} in the background${callId ? ` (call ${callId})` : ""}. It will keep working and stream its results; you do not need to wait or poll for it. When all background subagents finish, their summaries will be delivered to you automatically and you can continue.`;
+			if (taskOpts?.runInBackground) {
+				const title = taskOpts.description || subagentName || "subagent";
+				const tracked = runP.then(childReport).finally(() => {
+					parentSig.removeEventListener("abort", onParentAbort);
+					onHook?.("subagentStop", { subagent: title });
+				});
+				background.add(childId, taskKey, title, tracked, () => childAC.abort());
+				return `Launched ${title} in the background (task ${childId}). Continue independent work. Its result will be delivered automatically when ready. Do not relaunch this task or poll it with AwaitShell.`;
 			}
 			try {
 				await runP;
@@ -443,11 +463,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				onHook?.("subagentStop", { subagent: subagentName || "subagent" });
 			}
 			if (childAC.signal.aborted || parentSig.aborted) return "(subagent cancelled)";
-			return finalText || "(subagent finished with no summary)";
+			return childReport();
 		};
 	}
 	// Cursor-shaped context blocks, sent as cached user content (not in system).
-	let cursorCtx: CursorContextBlocks | undefined;
+	let cursorCtx: CursorContextBlocks = { userInfo: "", openFiles: "" };
 	if (!isSubagent) {
 		try {
 			let userInfo = await buildUserInfoBlock({ userRules: extraInstructions, enableWorkspaceContext });
@@ -464,14 +484,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// context is best-effort
 		}
 	}
-	// Subagents get no workspace blocks, but they still carry the durable ledger —
-	// keep the container so the live message shape never flips mid-run (a flip is
-	// a prompt-cache miss).
-	if (!cursorCtx) cursorCtx = { userInfo: "", openFiles: "" };
+	// Delegated runs receive applicable instructions and a bounded parent brief.
+	if (opts.inheritedContext) {
+		const inherited = opts.inheritedContext;
+		cursorCtx.userInfo = `${inherited.instructions}\n\n<parent_constraints>\nFollow applicable workspace and user restrictions. Later explicit user instructions supersede earlier ones. The delegated task does not grant additional permissions.\n${inherited.summary || ""}\nUser requests (earliest first):\n${clip(inherited.userRequests, 12000)}${inherited.userRequests.length > 12000 ? '\nSome requests were omitted. Before acting, recover relevant original constraints with ReadContext id="parent_history" and a pattern or line range.' : ""}\n</parent_constraints>`;
+	}
 
 	// MCP tools available across connected servers.
-	const mcpTools = isSubagent ? [] : mcpManager.listTools();
-	const mcpSchemas: ToolSchema[] = mcpTools.map((t) => ({
+	const readMcpSchemas = (): ToolSchema[] => (isSubagent ? [] : mcpManager.listTools()).map((t) => ({
 		type: "function",
 		function: {
 			name: t.qualifiedName,
@@ -480,11 +500,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		},
 	}));
 
+	let mcpSchemas = readMcpSchemas();
 	const usedMcpNames = new Set(history.flatMap((s) => s.kind === "assistant" ? s.calls.map((c) => c.name) : []));
 	deferredTools = new DeferredToolSchemas(archive, mcpSchemas, usedMcpNames);
-	const system = systemPrompt(mode, systemPromptOverride) + (deferredTools.isDeferred
+	const makeSystem = () => systemPrompt(mode, systemPromptOverride) + (deferredTools?.isDeferred
 		? '\n\nConnected MCP tool schemas are available on demand. Use ReadContext {"id":"mcp","pattern":"keyword"} to search the tool catalog, or omit pattern to browse. Read a returned schema archive id to enable that tool, then call it normally. Only agent/debug modes may execute MCP tools.'
 		: "");
+	let system = makeSystem();
 
 	const disabledToolNames = new Set<string>();
 	if (!enableFileReading) {
@@ -555,7 +577,43 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				.filter((n) => initialToolNames.has(n) && !disabledToolNames.has(n)),
 		);
 
-	pushHistory({ kind: "user", text: prompt, attachments: attachments && attachments.length ? attachments : undefined });
+	const serverStates = () => (typeof mcpManager.status === "function" ? mcpManager.status() : []).map(s => ({ name: s.name, state: s.connected ? "connected" : s.error ? "failed" : "disconnected" }));
+	const capabilityText = () => {
+		const servers = serverStates();
+		return `<capabilities>\nBuilt-in tools currently available: ${[...allowedNamesFor()].sort().join(", ")}.\nDisabled by settings: ${[...disabledToolNames].sort().join(", ") || "none"}.\nOther built-ins remain restricted by the selected mode and the run permission ceiling.\nMCP execution: ${canExecuteMcp(mode) ? "enabled" : "unavailable in this mode"}.\nConnected MCP namespaces: ${[...new Set(mcpSchemas.map(s => s.function.name.split("__")[1]))].sort().join(", ") || "none"}.\nMCP servers: ${servers.map(s => `${s.name}=${s.state}`).join(", ") || "none configured"}.\nMCP schemas: ${deferredTools?.isDeferred ? 'deferred; search ReadContext id="mcp" and read a schema to activate it' : "loaded"}.\nA namespace absent from this inventory is unavailable. Do not retry guessed names. ReadContext id="capabilities" refreshes this inventory after configuration or connection changes.\n</capabilities>`;
+	};
+	const baseUserInfo = cursorCtx.userInfo;
+	const unavailableCapabilities = new Set<string>();
+	let registryFingerprint = JSON.stringify([mcpSchemas, serverStates()]);
+	const refreshCapabilities = () => {
+		const next = readMcpSchemas();
+		const fingerprint = JSON.stringify([next, serverStates()]);
+		if (fingerprint === registryFingerprint) return;
+		const active = new Set(deferredTools?.activeSchemas().map(s => s.function.name));
+		mcpSchemas = next;
+		registryFingerprint = fingerprint;
+		unavailableCapabilities.clear();
+		deferredTools = new DeferredToolSchemas(archive, next, active);
+		schemaCache.clear();
+		toolTokenCache.clear();
+		system = makeSystem();
+		cursorCtx = { ...cursorCtx, userInfo: `${baseUserInfo}\n\n${capabilityText()}`.trim() };
+		pushSystemNote(`Tool registry changed.\n${capabilityText()}`);
+	};
+	cursorCtx = { ...cursorCtx, userInfo: `${baseUserInfo}\n\n${capabilityText()}`.trim() };
+	const previousContext = [...history].reverse().find((s) => s.kind === "user" && !s.synthetic && s.context);
+	pushHistory({ kind: "user", text: prompt,
+		attachments: attachments?.length ? attachments.map(a => ({ ...a })) : undefined,
+		context: snapshotUserContext({ ...cursorCtx, timestamp: runTimestamp, reminder: mode === "multitask" ? MULTITASK_REMINDER : mode === "project" ? PROJECT_REMINDER : undefined }, previousContext?.kind === "user" ? previousContext.context : undefined),
+	});
+	if (previousContext?.kind === "user" && previousContext.context) {
+		if (previousContext.context.userInfo !== cursorCtx.userInfo) {
+			pushSystemNote("The workspace and rule snapshot attached to the latest user turn replaces earlier environment snapshots. Instructions in the user's conversation remain applicable until explicitly superseded.");
+		}
+		if (previousContext.context.openFiles && !cursorCtx.openFiles) {
+			pushSystemNote("No editor context is supplied for this turn; earlier editor snapshots are historical.");
+		}
+	}
 	let settledEmitted = false;
 	const emitSettled = (status: "finished" | "cancelled" | "error") => {
 		if (settledEmitted) return;
@@ -591,20 +649,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// Feed already-finished (but unreported) background subagent results into the
 		// conversation, so the model always knows what has completed. Returns count.
 		const flushSettledBg = (): number => {
-			const done: { title: string; text: string }[] = [];
-			while (bgReported < bgSubagents.length && bgSettled[bgReported] !== undefined) {
-				done.push(bgSettled[bgReported]!);
-				bgReported++;
-			}
+			const done = background.drain();
 			if (done.length) {
 				pushSystemNote(
-					`Background subagent${done.length > 1 ? "s" : ""} finished — results below.\n\n${done.map((v) => `### ${v.title}\n${v.text}`).join("\n\n")}`,
+					`Background subagent${done.length > 1 ? "s" : ""} finished — results below.\n\n${done.map((v) => `### ${v.title} (task ${v.id})\n${v.text}`).join("\n\n")}`,
 				);
 			}
 			return done.length;
 		};
 
-		const bgPending = () => bgSubagents.length > bgReported;
+		const bgPending = () => background.pending;
 
 		/** Race a promise against user abort. No wall clock: a subagent's own
 		 *  per-tool timeouts + step limit guarantee it terminates, so declaring
@@ -628,28 +682,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				);
 			});
 
-		/** Block until all unreported background subagents settle, then flush into history. */
+		/** Yield only when the parent has no useful tool work; deliver any ready child. */
 		const awaitPendingBg = async (): Promise<boolean> => {
 			if (!bgPending()) return false;
-			flushSettledBg();
-			if (!bgPending()) return true;
-			const pending = bgSubagents.slice(bgReported);
-			const n = pending.length;
-			emit({ type: "run-status", status: "running" });
-			emit({
-				type: "shell-notify",
-				message: `Waiting for ${n} background subagent${n > 1 ? "s" : ""} to finish — will resume when done…`,
-			});
-			// Wait until every launched subagent actually settles (or the user
-			// aborts). Never declare a still-running subagent "timed out".
-			const outcome = await raceAbort(Promise.allSettled(pending));
-			if (outcome === "aborted" || signal.aborted) {
-				for (let i = bgReported; i < bgSubagents.length; i++) {
-					if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
-				}
-				flushSettledBg();
-				return true;
-			}
+			if (flushSettledBg()) return true;
+			emit({ type: "shell-notify", message: `Waiting for a result from ${background.active} background task(s)…` });
+			await raceAbort(background.waitForNext());
+			if (signal.aborted) background.cancelAll();
 			flushSettledBg();
 			return true;
 		};
@@ -662,15 +701,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				"decisions, changed file paths, test outcomes, errors, and unfinished work. Distinguish observed " +
 				"facts from assumptions. Keep archive references when relevant. Merge any existing summary once. " +
 				"Use concise bullets; omit narration, reasoning traces, and file bodies. Do not invent details.";
+			const summaryModel = subagentModel && (!availableModels?.length || availableModels.some(m => m.toLowerCase() === subagentModel.toLowerCase())) ? subagentModel : model;
+			const summaryConfig = summaryModel === model ? { contextTokens, modelParams } : opts.resolveModelOptions?.(summaryModel) ?? {};
 			const summaryMaxTokens = 1536;
-			const summaryBudget = contextTokens && contextTokens > 0
-				? Math.floor((contextTokens - summaryMaxTokens - 1024) / promptTokenRatio) - Math.ceil(sys.length / 4)
+			const summaryBudget = summaryConfig.contextTokens && summaryConfig.contextTokens > 0
+				? Math.floor((summaryConfig.contextTokens - summaryMaxTokens - 1024) / promptTokenRatio) - Math.ceil(sys.length / 4)
 				: 24000;
 			const transcript = clip(stepsToTranscript(steps), Math.max(256, Math.min(24000, summaryBudget) * 4));
-			const summaryModel =
-				subagentModel && (!availableModels?.length || availableModels.some((m) => m.toLowerCase() === subagentModel.toLowerCase()))
-					? subagentModel
-					: model;
 			let text = "";
 			for await (const ev of streamChat({
 				apiBaseUrl,
@@ -681,6 +718,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					{ role: "user", content: transcript },
 				],
 				maxTokens: summaryMaxTokens,
+				modelParams: summaryConfig.modelParams,
 				anthropic,
 				oauthKind,
 				signal,
@@ -716,31 +754,27 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// Any background subagents that finished while the model was busy? Report
 			// them now so it never reasons about "still running" work that's done.
 			flushSettledBg();
+			refreshCapabilities();
 
 			// Refresh mutable workspace context before accounting for it in the budget.
 			if (!isSubagent && enableWorkspaceContext !== false && step > 0 && step % 6 === 0) {
 				try {
 					const fresh = await buildOpenFilesBlock();
-					if (fresh !== cursorCtx.openFiles) cursorCtx = { ...cursorCtx, openFiles: fresh };
+					if (fresh !== cursorCtx.openFiles) {
+						cursorCtx = { ...cursorCtx, openFiles: fresh };
+						pushSystemNote(`Editor context updated:\n${fresh || "No open editor context is currently available."}`);
+					}
 				} catch { /* context is best-effort */ }
 			}
-			const taskState = ledger.isEmpty && !toolCtx.todos.length
-				? undefined
-				: ledger.render({ request: currentRequestText(history), todos: toolCtx.todos });
-			const liveCtx: CursorContextBlocks = {
-				...cursorCtx,
-				reminder: mode === "multitask" ? MULTITASK_REMINDER : mode === "project" ? PROJECT_REMINDER : undefined,
-				timestamp: runTimestamp,
-				taskState,
-			};
 			const limitedContext = !!contextTokens && contextTokens > 0;
 			const budget = limitedContext
 				? Math.max(0, contextTokens! - responseTokens - 1024)
 				: 0;
 			const fittingBudget = Math.floor(budget / promptTokenRatio);
-			const contextChars = Object.values(liveCtx).reduce((n, value) => n + (value?.length ?? 0), 0);
-			const overheadTokens = Math.ceil((system.length + contextChars) / 4) + toolSchemaTokens() + 128;
-			if (limitedContext && fittingBudget <= overheadTokens + 64) {
+			const overheadTokens = Math.ceil(system.length / 4) + toolSchemaTokens() + 128;
+			const latestUser = [...history].reverse().find(s => s.kind === "user" && !s.synthetic);
+			const requiredContextTokens = latestUser?.kind === "user" && latestUser.context ? stepsTokens([{ kind: "user", text: "", context: latestUser.context }]) : 0;
+			if (limitedContext && fittingBudget <= overheadTokens + requiredContextTokens + 64) {
 				throw new Error("The context window is too small for the instructions, tools, and response limit. Increase the context window or reduce the response limit or workspace instructions.");
 			}
 
@@ -770,7 +804,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 							kind: "user",
 							synthetic: true,
 							text: `Earlier conversation summary (verify details when needed):\n${summary}\n\nFull transcript: ReadContext {"id":"history"}; use pattern or line ranges to recover details.`,
-						}, ...tail);
+						}, ...tail, {
+							kind: "user", synthetic: true,
+							text: `Current context restored after compaction (supersedes older environment snapshots):\n${cursorCtx.userInfo}\n${cursorCtx.openFiles}\n\n${ledger.render({ request: currentRequestText(history), todos: toolCtx.todos })}`,
+						});
 						modelHistory = archive.prepareSteps(history);
 						if (opts.contextState) saveContext(persistedHistory, modelHistory, opts.contextState);
 						emit({ type: "compaction", status: "done", summary });
@@ -786,7 +823,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			if (fitted.length < modelHistory.length) {
 				onHook?.("preCompact", { dropped: String(modelHistory.length - fitted.length) });
 			}
-			const messages = buildMessages(system, fitted, liveCtx);
+			const messages = buildMessages(system, fitted);
 			const requestTokenEstimate = stepsTokens(fitted) + overheadTokens;
 
 			let assistantText = "";
@@ -970,7 +1007,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				return { call, input, badArgs, timeoutMs, resolvedName };
 			});
 
-			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; image?: { mime: string; base64: string } }>(parsed.length);
+			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; outcome?: ToolOutcome; image?: { mime: string; base64: string } }>(parsed.length);
 			const completedUi = new Set<number>();
 			const finishUi = (i: number) => {
 				if (completedUi.has(i) || !results[i]) return;
@@ -988,6 +1025,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					diff: r.diff,
 					startLine: r.startLine,
 					endLine: r.endLine,
+					outcome: r.outcome,
 				});
 			};
 
@@ -1030,6 +1068,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						results[i] = { status: "error", output: `MCP tools not allowed in ${mode} mode` };
 						return;
 					}
+					if (!mcpSchemas.some(s => s.function.name === mcpName)) {
+						const namespace = mcpName.split("__")[1];
+						const key = mcpSchemas.some(s => s.function.name.startsWith(`mcp__${namespace}__`)) ? mcpName : `namespace ${namespace}`;
+						const repeated = unavailableCapabilities.has(key);
+						unavailableCapabilities.add(key);
+						results[i] = { status: "error", output: repeated
+							? `error: ${key} remains unavailable; the registry has not changed. Choose an available capability instead of retrying names.`
+							: `error: ${mcpName} is unavailable in the current tool registry. Do not retry guessed names. Use ReadContext id="capabilities" if configuration has changed, or choose an available tool.` };
+						return;
+					}
 					// Approval policy decides silently (allow/deny) or prompts (ask/review).
 					if (approve) {
 						const approval = await approve(mcpName, mcpInput, call.id);
@@ -1047,7 +1095,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs("CallMcpTool");
 					const toolAc = new AbortController();
 					const killTool = () => { try { toolAc.abort(); } catch { /* ignore */ } };
-					if (registerSubagentAbort) registerSubagentAbort(call.id, killTool);
+					if (registerSubagentAbort) registerSubagentAbort(call.id, () => killTool());
 					emit({
 						type: "tool-call-started",
 						callId: call.id,
@@ -1167,12 +1215,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// and settle UI — never leave the card spinning "Working".
 					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs(resolvedName);
 					const toolAc = new AbortController();
-					const killTool = () => {
-						try { toolAc.abort(); } catch { /* ignore */ }
+					const killTool = (reason?: Error) => {
+						try { toolAc.abort(reason); } catch { /* ignore */ }
 					};
 					// Register so UI countdown-0 / cancelSubagent can kill any tool.
 					if (registerSubagentAbort) {
-						registerSubagentAbort(call.id, killTool);
+						registerSubagentAbort(call.id, () => killTool());
 					}
 					// Countdown clock starts now (not when the card was announced).
 					emit({
@@ -1195,7 +1243,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 							resolvedName,
 							() => {
 								timedOut = true;
-								killTool();
+								killTool(Object.assign(new Error("timeout: tool deadline exceeded"), { name: "TimeoutError" }));
 								// Immediate UI settle on timeout — don't wait for tool cleanup.
 								// TodoWrite/Read: use "completed" to avoid red X in UI.
 								if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
@@ -1203,7 +1251,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 								} else {
 									results[i] = {
 										status: "error",
-										output: `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+										outcome: failedOutcome(call.id, "timed_out"),
+										output: failureText(call.id, `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`),
 									};
 								}
 								finishUi(i);
@@ -1224,9 +1273,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 							r = { output: resolvedName === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first." : "(todos: skipped)" };
 						} else {
 							r = {
-								output: cancelled ? "error: cancelled" : isTo
+								outcome: failedOutcome(call.id, cancelled ? "aborted" : isTo ? "timed_out" : "failed"),
+								output: failureText(call.id, cancelled ? "error: cancelled" : isTo
 									? `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
-									: `error: ${msg}`,
+									: `error: ${msg}`),
 							};
 						}
 					} finally {
@@ -1241,15 +1291,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 							} else {
 								results[i] = {
 									status: "error",
-									output: `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+									outcome: failedOutcome(call.id, "timed_out"),
+									output: failureText(call.id, `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`),
 								};
 							}
 						}
 						finishUi(i);
 						return;
 					}
-					const status: "completed" | "error" = r.output.startsWith("error:") ? "error" : "completed";
-					results[i] = { status, output: r.output, diff: r.diff, startLine: r.startLine, endLine: r.endLine, image: r.image };
+					const status: "completed" | "error" = (r.output.startsWith("error:") || (r.outcome && ["failed", "aborted", "timed_out"].includes(r.outcome.status))) ? "error" : "completed";
+					results[i] = { status, output: r.output, diff: r.diff, startLine: r.startLine, endLine: r.endLine, outcome: r.outcome, image: r.image };
 					// afterEdit hook on successful edits.
 					if (status === "completed" && isEditTool && onAfterEdit) {
 						onAfterEdit(String(input?.path ?? input?.target_notebook ?? input?.downloadPath ?? (resolvedName === "WritePlan" ? planRelativePath(input.title) : "")));
@@ -1321,28 +1372,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (resolvedName === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				// Durable ledger backs the flat-cost <task_state> block; history itself
-				// keeps full tool results until auto-summarize / budget trim.
-				ledger.record(resolvedName, parsed[i].input, r.status, r.output);
-				pushHistory({ kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, image: r.image });
+				// Keep a bounded recovery ledger for compaction; ordinary requests
+				// retain their original tool results without a changing state suffix.
+				ledger.record(resolvedName, parsed[i].input, r.status, r.output, r.outcome);
+				pushHistory({ kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, outcome: r.outcome, image: r.image });
 			}
-			// After launching background Task(s), wait for that wave before calling the
-			// model again. Otherwise the next turn (or empty-turn / todo nudge) races
-			// ahead and the coordinator spawns more subagents while workers still run.
-			if (bgPending()) {
-				const launchedBg = parsed.some((p, i) => {
-					if (p.call.name !== "Task") return false;
-					const out = results[i]?.output || "";
-					return /Launched .+ in the background/i.test(out);
-				});
-				if (launchedBg) {
-					await awaitPendingBg();
-					if (signal.aborted) {
-						emitSettled("cancelled");
-						return;
-					}
-				}
-			}
+
 		}
 
 		// Paused at the step limit with work still in flight → surface a Continue
@@ -1356,7 +1391,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		// Crucially, flush their summaries into history too — otherwise the persisted
 		// conversation only contains "launched in background…" and a follow-up message
 		// makes the model believe the subagent is still running.
-		if (bgSubagents.length > bgReported) {
+		while (bgPending()) {
 			await awaitPendingBg();
 			if (signal.aborted) {
 				emitSettled("cancelled");
@@ -1382,15 +1417,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		emitSettled("error");
 	} finally {
 		if (opts.contextState) opts.contextState.todos = toolCtx.todos.map((todo) => ({ ...todo }));
-		// Force-mark unsettled bg subagents ONLY when the user cancelled (abort).
-		// When run finishes normally, let subagents continue — their results
-		// will be delivered via emit and the model can process them on next run.
-		if (signal.aborted) {
-			for (let i = bgReported; i < bgSubagents.length; i++) {
-				if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
-			}
-			bgReported = bgSubagents.length;
-		}
+		// The run owns its children, including error exits.
+		background.cancelAll();
+		const cancelled = background.drain();
+		if (cancelled.length) pushSystemNote(cancelled.map(v => `Task ${v.id} (${v.title}): ${v.text}`).join("\n"));
 		// Guarantee a terminal status even if the loop exited without one.
 		if (!settledEmitted) emitSettled(signal.aborted ? "cancelled" : "finished");
 		// Tear down this run's persistent shell session.

@@ -7,7 +7,7 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
-import { Step, WireContentPart, WireMessage, CacheControl } from "./types";
+import { Step, WireContentPart, WireMessage, CacheControl, UserContextSnapshot } from "./types";
 import { economizeHistoryHard, lastRealUserIndex, stepTokens, stepsTokens } from "./contextEconomy";
 
 export { stepTokens, stepsTokens };
@@ -25,6 +25,38 @@ const EPHEMERAL: CacheControl = { type: "ephemeral" };
  * "guaranteed fit" pass overshoot the real window by the schema block (10k+).
  */
 export function fitStepsToBudget(steps: Step[], overheadTokens: number, budgetTokens: number): Step[] {
+  let work = materializeMissingContext(steps);
+  const budget = Math.floor(budgetTokens - overheadTokens);
+  // Selecting a smaller history may drop the turn that supplied an omitted
+  // context block. Restore that block on model copies and account for it before
+  // returning. Each retry either removes content or restores an omission flag.
+  for (let attempt = 0; attempt <= steps.length; attempt++) {
+    const fitted = fitStepGroups(work, overheadTokens, budgetTokens);
+    const restored = materializeMissingContext(fitted);
+    if (stepsTokens(restored) <= budget || !restored.length) return restored;
+    work = restored;
+  }
+  // Defensive bound: fully materialized context has no hidden dependencies.
+  return fitStepGroups(work.map((step) => step.kind === "user" && step.context
+    ? { ...step, context: { ...step.context, omitUserInfo: false, omitOpenFiles: false } }
+    : step), overheadTokens, budgetTokens);
+}
+
+/** Restore blocks whose earlier rendered source was dropped by compaction. */
+function materializeMissingContext(steps: Step[]): Step[] {
+  const rendered: { userInfo?: string; openFiles?: string } = {};
+  return steps.map((step) => {
+    if (step.kind !== "user" || step.synthetic || !step.context) return step;
+    let context = step.context;
+    for (const [field, flag] of [["userInfo", "omitUserInfo"], ["openFiles", "omitOpenFiles"]] as const) {
+      if (context[flag] && rendered[field] !== context[field]) context = { ...context, [flag]: false };
+      if (!context[flag]) rendered[field] = context[field];
+    }
+    return context === step.context ? step : { ...step, context };
+  });
+}
+
+function fitStepGroups(steps: Step[], overheadTokens: number, budgetTokens: number): Step[] {
   const budget = Math.floor(budgetTokens - overheadTokens);
   if (budget <= 0) return [];
 
@@ -141,7 +173,13 @@ function shrinkGroup(group: Step[], budget: number): Step[] | undefined {
         }
         return [a.kind === "image" ? a : { ...a, data: clipToBudget(a.data, cap) }];
       });
-      return { ...s, text: clipToBudget(text, cap), attachments };
+      const context = s.context ? {
+        ...s.context,
+        userInfo: s.context.omitUserInfo ? s.context.userInfo : clipToBudget(s.context.userInfo, cap),
+        openFiles: s.context.omitOpenFiles ? s.context.openFiles : clipToBudget(s.context.openFiles, cap),
+        reminder: s.context.reminder ? clipToBudget(s.context.reminder, cap) : undefined,
+      } : undefined;
+      return { ...s, text: clipToBudget(text, cap), attachments, ...(context ? { context } : {}) };
     }
     if (s.kind === "assistant") {
       return {
@@ -215,12 +253,13 @@ export function splitForCompaction(steps: Step[], keepTokens: number): { prefix:
   }
   const prefix = groups.slice(0, cut).flat();
   const tail = [...prefix.filter((s) => anchors.has(s)), ...groups.slice(cut).flat()];
-  return { prefix, tail };
+  return { prefix, tail: materializeMissingContext(tail) };
 }
 
 /** Serialize steps to plain text for the summarizer (dump bodies truncated; todos/edits kept). */
 export function stepsToTranscript(steps: Step[]): string {
   const out: string[] = [];
+  const previousInstructions: { userInfo?: string; reminder?: string } = {};
   const keepFull = new Set([
     "TodoWrite", "TodoRead", "Task", "AskQuestion", "SwitchMode", "WritePlan",
     "StrReplace", "Write", "Delete", "EditNotebook",
@@ -228,6 +267,17 @@ export function stepsToTranscript(steps: Step[]): string {
   for (const s of steps) {
     if (s.kind === "user") {
       out.push(`## ${s.synthetic ? "System note" : "User"}\n${s.text}`);
+      // A later turn may update rules without repeating them in the query.
+      // Summaries must see these restrictions before dropping that turn.
+      if (!s.synthetic && s.context) {
+        const instructions = (["userInfo", "reminder"] as const).flatMap((key) => {
+          const value = s.context![key];
+          const unchanged = previousInstructions[key] === value;
+          previousInstructions[key] = value;
+          return value && !unchanged ? [value] : [];
+        }).join("\n\n");
+        if (instructions) out.push(`## Context supplied with this user turn\n${instructions}`);
+      }
     } else if (s.kind === "assistant") {
       // Prefer generated output text over thinking (thinking is UI-only anyway).
       if (s.text) out.push(`## Assistant\n${s.text}`);
@@ -270,12 +320,25 @@ export interface CursorContextBlocks {
   timestamp?: string;
 }
 
+/** Copy only durable context fields; task state is a separate appended note. */
+export function snapshotUserContext(ctx: CursorContextBlocks, previous?: Pick<UserContextSnapshot, "userInfo" | "openFiles">): UserContextSnapshot {
+  return Object.freeze({
+    version: 1,
+    userInfo: ctx.userInfo,
+    openFiles: ctx.openFiles,
+    timestamp: ctx.timestamp ?? new Date().toISOString(),
+    ...(ctx.reminder ? { reminder: ctx.reminder } : {}),
+    ...(previous?.userInfo === ctx.userInfo ? { omitUserInfo: true } : {}),
+    ...(previous?.openFiles === ctx.openFiles ? { omitOpenFiles: true } : {}),
+  });
+}
+
 /**
  * Build provider messages with stable cacheable context blocks:
  * - system as a single cached text block
- * - the CURRENT (last) user turn is split into the cached context blocks
- *   (userInfo, openFiles) followed by a cached <timestamp>+<user_query> block,
- *   so unchanged context can be reused across model calls.
+ * - each user turn keeps its original context blocks and timestamp after it
+ *   stops being the latest turn, including after save/resume
+ * - cache markers belong to messages, never to their changing history index
  */
 export function buildMessages(system: string, steps: Step[], ctx?: CursorContextBlocks): WireMessage[] {
   const out: WireMessage[] = [
@@ -286,13 +349,6 @@ export function buildMessages(system: string, steps: Step[], ctx?: CursorContext
   // loop-injected system note, which would hide the request from <user_query>
   // and move the cached blocks on every nudge.
   const lastUserIdx = steps.length ? lastRealUserIndex(steps) : -1;
-  // Cache breakpoint for the stable history prefix: the last user-role message
-  // before the live turn (a compaction summary or system note). Assistant/tool
-  // messages can't carry one through the Anthropic converter.
-  let prefixAnchorIdx = -1;
-  for (let i = lastUserIdx - 1; i >= 0; i--) {
-    if (steps[i].kind === "user") { prefixAnchorIdx = i; break; }
-  }
 
   for (let i = 0; i < steps.length; i++) {
     const s = steps[i];
@@ -309,19 +365,23 @@ export function buildMessages(system: string, steps: Step[], ctx?: CursorContext
         textContent = `<system_reminder>\n${textContent}\n</system_reminder>`;
       }
 
-      const isLive = i === lastUserIdx && !!ctx;
+      // The fallback supports legacy callers. Production records a snapshot
+      // before the first request; saved turns always win over mutable context.
+      const turnContext = !s.synthetic
+        ? s.context ?? (i === lastUserIdx && ctx ? snapshotUserContext(ctx) : undefined)
+        : undefined;
       const parts: WireContentPart[] = [];
 
-      if (isLive) {
-        if (ctx!.userInfo) {
-          parts.push({ type: "text", text: ctx!.userInfo, cache_control: EPHEMERAL });
+      if (turnContext) {
+        if (turnContext.userInfo && !turnContext.omitUserInfo) {
+          parts.push({ type: "text", text: turnContext.userInfo, cache_control: EPHEMERAL });
         }
-        if (ctx!.openFiles) {
-          parts.push({ type: "text", text: ctx!.openFiles, cache_control: EPHEMERAL });
+        if (turnContext.openFiles && !turnContext.omitOpenFiles) {
+          parts.push({ type: "text", text: turnContext.openFiles, cache_control: EPHEMERAL });
         }
         parts.push({
           type: "text",
-          text: `<timestamp>\n${ctx!.timestamp || new Date().toLocaleString()}\n</timestamp>\n<user_query>\n${textContent}\n</user_query>${ctx!.reminder ? `\n${ctx!.reminder}` : ""}`,
+          text: `<timestamp>\n${turnContext.timestamp}\n</timestamp>\n<user_query>\n${textContent}\n</user_query>${turnContext.reminder ? `\n${turnContext.reminder}` : ""}`,
           cache_control: EPHEMERAL,
         });
         for (const img of images) {
@@ -329,15 +389,13 @@ export function buildMessages(system: string, steps: Step[], ctx?: CursorContext
         }
         out.push({ role: "user", content: parts });
       } else if (images.length) {
-        parts.push({ type: "text", text: textContent || "(see attached images)" });
+        parts.push({ type: "text", text: textContent || "(see attached images)", cache_control: EPHEMERAL });
         for (const img of images) {
           parts.push({ type: "image_url", image_url: { url: img.data } });
         }
         out.push({ role: "user", content: parts });
-      } else if (i === prefixAnchorIdx) {
-        out.push({ role: "user", content: [{ type: "text", text: textContent, cache_control: EPHEMERAL }] });
       } else {
-        out.push({ role: "user", content: textContent });
+        out.push({ role: "user", content: [{ type: "text", text: textContent, cache_control: EPHEMERAL }] });
       }
     } else if (s.kind === "assistant") {
       const msg: WireMessage = { role: "assistant", content: s.text || null };

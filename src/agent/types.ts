@@ -7,6 +7,8 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
+import type { ToolOutcome } from "./toolOutcome";
+
 export type Mode = "agent" | "ask" | "plan" | "multitask" | "project" | "debug";
 
 export interface ToolCall {
@@ -47,13 +49,25 @@ export interface ResponsesReasoning {
   }>;
 }
 
+/** Context captured once when a user turn is created; never refreshed in place. */
+export interface UserContextSnapshot {
+  readonly version: 1;
+  readonly userInfo: string;
+  readonly openFiles: string;
+  readonly timestamp: string;
+  readonly reminder?: string;
+  /** Full values remain saved for recovery; unchanged blocks need not repeat. */
+  readonly omitUserInfo?: boolean;
+  readonly omitOpenFiles?: boolean;
+}
+
 export type Step =
   /** `synthetic` marks loop-injected system messages (nudges, subagent reports,
    *  compaction summaries) — they are not the user's request and must never be
    *  treated as one when placing context blocks or bounding the live turn. */
-  | { kind: "user"; text: string; attachments?: Attachment[]; synthetic?: boolean }
+  | { kind: "user"; text: string; attachments?: Attachment[]; synthetic?: boolean; context?: UserContextSnapshot }
   | { kind: "assistant"; text: string; thinking?: string; calls: ToolCall[]; responsesReasoning?: ResponsesReasoning }
-  | { kind: "tool-result"; callId: string; name: string; output: string; status: "completed" | "error"; image?: ToolImage };
+  | { kind: "tool-result"; callId: string; name: string; output: string; status: "completed" | "error"; image?: ToolImage; outcome?: ToolOutcome };
 
 export interface ToolSchema {
   type: "function";
@@ -102,6 +116,8 @@ export type ProviderEvent =
     /** Cache counters are billing deltas; cached reads are included in promptTokens. */
     cachedReadTokens?: number;
     cachedWriteTokens?: number;
+    /** Newly classified input whose cached-read count was actually reported. */
+    cacheReadInputTokens?: number;
     /** One identity per HTTP attempt, including attempts that later fail. */
     requestId?: string;
     model?: string;
@@ -116,9 +132,9 @@ export type AgentEvent =
   | { type: "tool-call-args"; callId: string; argsText: string }
   // Partial output of a still-running tool (live shell output).
   | { type: "tool-call-progress"; callId: string; text: string }
-  | { type: "tool-call-completed"; callId: string; name: string; status: "completed" | "error"; result: string; diff?: string; startLine?: number; endLine?: number }
+  | { type: "tool-call-completed"; callId: string; name: string; status: "completed" | "error"; result: string; diff?: string; startLine?: number; endLine?: number; outcome?: ToolOutcome }
   | { type: "run-status"; status: "running" | "finished" | "error" | "cancelled" }
-  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number; model?: string; requestId?: string; source?: "parent" | "summary" | "subagent"; cachedReadTokens?: number; cachedWriteTokens?: number }
+  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number; model?: string; requestId?: string; source?: "parent" | "summary" | "subagent"; cachedReadTokens?: number; cachedWriteTokens?: number; cacheReadInputTokens?: number }
   | { type: "run-result"; text: string; durationMs: number }
   | { type: "subagent-event"; callId: string; event: AgentEvent }
   | { type: "mode-changed"; mode: Mode }

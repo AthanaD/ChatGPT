@@ -127,7 +127,7 @@ describe("OpenAI Responses decoding", () => {
     ));
     expect(events.filter((event) => event.type === "tool-call")).toEqual([{ type: "tool-call", call: { id: "call_one", name: "Read", arguments: '{"path":"file.ts"}' } }]);
     expect(events.filter((event) => event.type === "usage")).toEqual([
-      { type: "usage", promptTokens: 100, completionTokens: 5, promptTokensTotal: 100, completionTokensTotal: 5, cachedReadTokens: 40, cachedWriteTokens: 60 },
+      { type: "usage", promptTokens: 100, completionTokens: 5, promptTokensTotal: 100, completionTokensTotal: 5, cacheReadInputTokens: 100, cachedReadTokens: 40, cachedWriteTokens: 60 },
       { type: "usage", promptTokens: 0, completionTokens: 3, promptTokensTotal: 100, completionTokensTotal: 8 },
     ]);
   });

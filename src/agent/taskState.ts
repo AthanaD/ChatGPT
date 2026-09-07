@@ -7,6 +7,7 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
+import type { ToolOutcome } from "./toolOutcome";
 import type { TodoItem } from "./tools";
 
 /**
@@ -22,6 +23,7 @@ interface Entry {
 	name: string;
 	target: string;
 	ok: boolean;
+	state?: ToolOutcome["status"];
 	note: string;
 }
 
@@ -114,11 +116,11 @@ export class ActivityLedger {
 	private plan = "";
 
 	/** Record a settled tool call. Consecutive identical actions collapse. */
-	record(name: string, input: unknown, status: "completed" | "error", output: string): void {
+	record(name: string, input: unknown, status: "completed" | "error", output: string, outcome?: ToolOutcome): void {
 		if (SKIP.has(name)) return;
-		const ok = status === "completed";
+		const ok = status === "completed" && (!outcome || outcome.status === "completed");
 		const target = targetOf(input, Infinity);
-		const entry: Entry = { name, target, ok, note: noteFor(name, input, ok, output || "") };
+		const entry: Entry = { name, target, ok, state: outcome?.status, note: outcome ? `${outcome.status}${outcome.processStatus && outcome.processStatus !== outcome.status ? ` (process ${outcome.processStatus})` : ""}${outcome.exitCode !== undefined ? ` (exit ${outcome.exitCode})` : ""}${outcome.outputRef ? `; ReadContext ${outcome.outputRef.id}` : ""}` : noteFor(name, input, ok, output || "") };
 		const last = this.entries[this.entries.length - 1];
 		if (!last || last.name !== entry.name || last.target !== entry.target || last.note !== entry.note || last.ok !== entry.ok) {
 			this.entries.push(entry);
@@ -201,7 +203,7 @@ export class ActivityLedger {
 		if (this.entries.length) {
 			const shown = maxActions ? this.entries.slice(-maxActions) : [];
 			const hidden = this.entries.length - shown.length;
-			const lines = shown.map((e) => `  ${e.ok ? "✓" : "✗"} ${concise(e.name, 32)}${e.target ? ` ${concisePath(e.target, 72)}` : ""} — ${concise(e.note, 80)}`);
+			const lines = shown.map((e) => `  ${e.state === "running" ? "…" : e.ok ? "✓" : "✗"} ${concise(e.name, 32)}${e.target ? ` ${concisePath(e.target, 72)}` : ""} — ${concise(e.note, 80)}`);
 			parts.push(
 				`Actions so far (${this.entries.length} total${hidden ? `, ${hidden} older omitted` : ""}):\n${lines.join("\n")}`,
 			);

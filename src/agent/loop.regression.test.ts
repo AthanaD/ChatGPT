@@ -14,7 +14,7 @@ import type { AgentEvent, ProviderEvent, ResponsesReasoning, Step, ToolCall, Wir
 import type { Tool } from "./tools/types";
 import type { ToolSpec } from "./tools/schemas";
 
-type ScriptedTurn = ProviderEvent[] | ((request: StreamChatOpts) => ProviderEvent[]);
+type ScriptedTurn = ProviderEvent[] | ((request: StreamChatOpts) => ProviderEvent[] | Promise<ProviderEvent[]>);
 
 // Keep the production loop, mode registry, todo handlers, ledger, message builder,
 // and budget fitting. Replace only the provider and tools with external effects.
@@ -43,7 +43,7 @@ vi.mock("./provider", () => ({
 		const turn = fixture.turns[fixture.requests.length];
 		fixture.requests.push(options);
 		if (!turn) throw new Error("Unexpected model continuation after the scripted final answer");
-		for (const event of typeof turn === "function" ? turn(options) : turn) yield event;
+		for (const event of typeof turn === "function" ? await turn(options) : turn) yield event;
 	},
 }));
 vi.mock("./tools/files", async () => {
@@ -91,7 +91,7 @@ vi.mock("../context/cursorContext", () => ({
 vi.mock("./approvalPolicy", () => ({
 	actionTypeForCall: (name: string) => ["Write", "Shell", "WritePlan"].includes(name) ? "edits" : undefined,
 }));
-vi.mock("./prompt", () => ({ systemPrompt: () => "You are a coding assistant." }));
+vi.mock("./prompt", () => ({ systemPrompt: (mode: string) => `You are a coding assistant in ${mode} mode.` }));
 vi.mock("../integrations/mcpClient", () => ({
 	mcpManager: {
 		listTools: () => [{ qualifiedName: "mcp__test__write", server: "test", tool: { name: "write", inputSchema: {} } }],
@@ -697,4 +697,178 @@ it("passes the child cancellation signal into its blocking hook", async () => {
   expect(childSignal?.aborted).toBe(true);
   expect(parent.signal.aborted).toBe(false);
   expect(fixture.executions).toEqual([]);
+});
+
+
+describe("cache-safe loop and background scheduling", () => {
+  it("keeps earlier serialized requests byte-for-byte across followups and changed editors", async () => {
+    vi.spyOn(cursorContext, "buildUserInfoBlock").mockResolvedValue("Workspace rules: stay on main.");
+    const editors = vi.spyOn(cursorContext, "buildOpenFilesBlock").mockResolvedValue("Open files: a.ts");
+    const first = await run([toolTurn(call("Read", { path: "a.ts" }, "read")), answer("First answer")], { enableWorkspaceContext: true, promptCacheKey: "conversation" });
+    const previous = JSON.parse(JSON.stringify(fixture.requests[1].messages)) as WireMessage[];
+    const restored = JSON.parse(JSON.stringify(first.history)) as Step[];
+    fixture.requests.length = 0; fixture.turns.length = 0;
+    editors.mockResolvedValue("Open files: b.ts");
+    const second = await run([answer("Second answer")], { history: restored, prompt: "Continue without testing", enableWorkspaceContext: true, promptCacheKey: "conversation" });
+    expect(fixture.requests[0].messages.slice(0, previous.length)).toEqual(previous);
+    expect(JSON.stringify(fixture.requests[0].messages)).toContain("Open files: b.ts");
+    expect(JSON.stringify(fixture.requests[0].messages).match(/Workspace rules: stay on main/g)).toHaveLength(1);
+    expectFinished(second.events, "Second answer", 1);
+  });
+
+  it("appends mid-run editor updates while leaving every earlier request intact", async () => {
+    vi.spyOn(cursorContext, "buildOpenFilesBlock").mockResolvedValueOnce("Open files: original.ts").mockResolvedValue("Open files: changed.ts");
+    const script = Array.from({ length: 7 }, (_, i) => toolTurn(call("Read", { path: `file-${i}` }, `read-${i}`)));
+    const { events } = await run([...script, answer("Done")], { enableWorkspaceContext: true });
+    for (let i = 1; i < fixture.requests.length; i++) {
+      const previous = fixture.requests[i - 1].messages;
+      expect(fixture.requests[i].messages.slice(0, previous.length)).toEqual(previous);
+    }
+    expect(JSON.stringify(fixture.requests[6].messages)).toContain("Editor context updated");
+    expect(JSON.stringify(fixture.requests[6].messages)).not.toContain("<task_state>");
+    expectFinished(events, "Done", 8);
+  });
+
+  it("continues useful parent work while a child runs and deduplicates its relaunch", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let childDone = false;
+    const task = { prompt: "Inspect worker.ts", description: "Worker review", run_in_background: true };
+    const { events, history } = await run([
+      toolTurn(call("Task", task, "worker")),
+      async request => {
+        expect(request.promptCacheKey).toBe("conv/task/worker");
+        await gate; childDone = true; return answer("Worker found no issue");
+      },
+      () => { expect(childDone).toBe(false); return toolTurn(call("Read", { path: "parent.ts" }, "parent-read")); },
+      () => { expect(childDone).toBe(false); return toolTurn(call("Task", task, "duplicate")); },
+      request => {
+        expect(JSON.stringify(request.messages)).toContain("already running");
+        release(); return answer("Waiting for review");
+      },
+      request => { expect(JSON.stringify(request.messages)).toContain("Worker found no issue"); return answer("Review integrated"); },
+    ], { promptCacheKey: "conv" });
+    expect(history).toContainEqual(expect.objectContaining({ kind: "tool-result", callId: "parent-read" }));
+    expect(fixture.requests.filter(r => r.promptCacheKey?.includes("/task/"))).toHaveLength(1);
+    expectFinished(events, "Review integrated", 6);
+  });
+
+  it("resolves child model options and preserves parent restrictions in delegation", async () => {
+    const resolveModelOptions = vi.fn(() => ({ contextTokens: 32_000, modelParams: { reasoningEffort: "low" } }));
+    const { events } = await run([
+      toolTurn(call("Task", { prompt: "Inspect only", model: "small-model", readonly: true }, "child")),
+      request => {
+        expect(request.model).toBe("small-model");
+        expect(request.modelParams).toEqual({ reasoningEffort: "low" });
+        expect(request.maxTokens).toBeUndefined();
+        expect(JSON.stringify(request.messages)).toContain("Do not run tests.");
+        return answer("Inspected");
+      },
+      answer("Done"),
+    ], { prompt: "Do not run tests.", modelParams: { reasoningEffort: "xhigh" }, maxTokens: 8192, availableModels: ["test-model", "small-model"], resolveModelOptions });
+    expect(resolveModelOptions).toHaveBeenCalledWith("small-model");
+    expectFinished(events, "Done", 3);
+  });
+
+  it("updates the system instructions when narrowing mode and blocks unavailable MCP calls", async () => {
+    const { events } = await run([
+      toolTurn(call("SwitchMode", { target_mode_id: "plan" }, "switch")),
+      request => {
+        expect(JSON.stringify(request.messages[0])).toContain("plan mode");
+        return toolTurn(call("mcp__browser__open", {}, "missing"));
+      },
+      toolTurn(call("WritePlan", { title: "Plan", content: "Read the code" }, "plan")),
+      answer("Plan saved"),
+    ]);
+    expect(fixture.callMcp).not.toHaveBeenCalled();
+    expectFinished(events, "Plan saved", 4);
+  });
+
+  it("does not execute or request approval for absent MCP namespaces", async () => {
+    const { history, events } = await run([
+      toolTurn(call("mcp__browser__open", {}, "missing"), call("mcp__browser__navigate", {}, "missing-alias")),
+      toolTurn(call("ReadContext", { id: "capabilities" }, "inventory")),
+      answer("Browser unavailable"),
+    ]);
+    expect(fixture.callMcp).not.toHaveBeenCalled();
+    expect(history).toContainEqual(expect.objectContaining({ callId: "missing-alias", output: expect.stringContaining("namespace browser remains unavailable") }));
+    expect(fixture.approve).not.toHaveBeenCalled();
+    expect(history).toContainEqual(expect.objectContaining({ callId: "missing", output: expect.stringContaining("unavailable in the current tool registry") }));
+    expect(history).toContainEqual(expect.objectContaining({ callId: "inventory", output: expect.stringContaining("Connected MCP namespaces: test") }));
+    expectFinished(events, "Browser unavailable", 3);
+  });
+});
+
+
+describe("background task lifecycle and registry changes", () => {
+  it("reports a child's internal provider failure to its parent", async () => {
+    const { history, events } = await run([
+      toolTurn(call("Task", { prompt: "Review the change", description: "Review" }, "failed-review")),
+      () => { throw new Error("Review provider unavailable"); },
+      request => {
+        expect(JSON.stringify(request.messages)).toContain("subagent failed: Review provider unavailable");
+        return answer("Review remains blocked");
+      },
+    ]);
+    expect(history).toContainEqual(expect.objectContaining({ callId: "failed-review", output: expect.stringContaining("subagent failed") }));
+    expectFinished(events, "Review remains blocked", 3);
+  });
+
+  it("cancels owned background children before returning a cancelled parent", async () => {
+    const controller = new AbortController();
+    let childSignal: AbortSignal | undefined;
+    const { history, events } = await run([
+      toolTurn(call("Task", { prompt: "Review", run_in_background: true }, "worker")),
+      async request => {
+        childSignal = request.signal;
+        await new Promise<void>(resolve => request.signal.addEventListener("abort", () => resolve(), { once: true }));
+        return answer("Cancelled child");
+      },
+      () => { controller.abort(); return answer("Stopping"); },
+    ], { signal: controller.signal });
+    expect(childSignal?.aborted).toBe(true);
+    expect(events).toContainEqual({ type: "run-status", status: "cancelled" });
+    expect(events.some(e => e.type === "run-result")).toBe(false);
+    expect(history).toContainEqual(expect.objectContaining({ synthetic: true, text: expect.stringContaining("cancelled") }));
+  });
+
+  it("bounds active background launches without preventing useful parent work", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    const child = async () => { await gate; return answer("Child result"); };
+    const { history, events } = await run([
+      toolTurn(...Array.from({ length: 5 }, (_, i) => call("Task", { prompt: `Review part ${i}`, run_in_background: true }, `child-${i}`))),
+      child, child, child, child,
+      request => {
+        expect(JSON.stringify(request.messages)).toContain("4 background tasks are already running");
+        release(); return toolTurn(call("Read", { path: "integration.ts" }, "parent-read"));
+      },
+      ...Array.from({ length: 5 }, () => answer("All results integrated")),
+    ]);
+    expect(fixture.requests.filter(r => r.promptCacheKey?.includes("/task/"))).toHaveLength(4);
+    expect(history).toContainEqual(expect.objectContaining({ callId: "parent-read", status: "completed" }));
+    expect(events.filter(e => e.type === "error")).toEqual([]);
+    expect(events).toContainEqual(expect.objectContaining({ type: "run-result", text: "All results integrated" }));
+  });
+
+  it("refreshes a previously absent namespace after the connection registry changes", async () => {
+    const list = vi.spyOn(mcpManager, "listTools").mockReturnValue([]);
+    const { history, events } = await run([
+      toolTurn(call("mcp__browser__open", {}, "missing")),
+      () => {
+        list.mockReturnValue([{ qualifiedName: "mcp__browser__open", server: "browser", tool: { name: "open", inputSchema: {} } }] as ReturnType<typeof mcpManager.listTools>);
+        return toolTurn(call("ReadContext", { id: "capabilities" }, "refresh"));
+      },
+      request => {
+        expect(request.tools?.some(t => t.function.name === "mcp__browser__open")).toBe(true);
+        expect(JSON.stringify(request.messages)).toContain("Connected MCP namespaces: browser");
+        return toolTurn(call("mcp__browser__open", {}, "available"));
+      },
+      answer("Browser tool completed"),
+    ]);
+    expect(fixture.callMcp).toHaveBeenCalledOnce();
+    expect(history).toContainEqual(expect.objectContaining({ callId: "missing", status: "error" }));
+    expect(history).toContainEqual(expect.objectContaining({ callId: "available", status: "completed" }));
+    expectFinished(events, "Browser tool completed", 4);
+  });
 });

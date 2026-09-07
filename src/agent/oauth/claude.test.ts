@@ -101,7 +101,7 @@ describe("Claude OAuth request protocol", () => {
     const prefix = "You are Claude Code, Anthropic's official CLI for Claude.";
     const messages: WireMessage[] = [{ role: "system", content: prefix }, { role: "user", content: "hello" }];
     const body = JSON.parse(String(makeRequest({ messages }).init.body));
-    expect(body.system).toEqual([{ type: "text", text: prefix }]);
+    expect(body.system).toEqual([{ type: "text", text: prefix, cache_control: { type: "ephemeral" } }]);
   });
 
   it("keeps actual tool declarations, IDs and image results paired without decoy tools", () => {
@@ -120,6 +120,7 @@ describe("Claude OAuth request protocol", () => {
     expect(body.messages[1].content).toEqual(["one", "two"].map((id) => ({ type: "tool_use", id, name: "Read", input: { path: `${id}.png` } })));
     expect(body.messages[2].content).toEqual(["one", "two"].map((id) => ({
       type: "tool_result", tool_use_id: id,
+      ...(id === "two" ? { cache_control: { type: "ephemeral" } } : {}),
       content: [{ type: "text", text: `${id}.png` }, { type: "image", source: { type: "base64", media_type: "image/png", data: `IMAGE_${id}` } }],
     })));
   });

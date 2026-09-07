@@ -239,7 +239,7 @@ describe("Codex Responses stream contract", () => {
     ]);
     expect(events.filter((event) => event.type === "tool-call-start")).toHaveLength(2);
     expect(events.filter((event) => event.type === "usage")).toEqual([
-      { type: "usage", promptTokens: 100, completionTokens: 5, promptTokensTotal: 100, completionTokensTotal: 5, cachedReadTokens: 80 },
+      { type: "usage", promptTokens: 100, completionTokens: 5, promptTokensTotal: 100, completionTokensTotal: 5, cacheReadInputTokens: 100, cachedReadTokens: 80 },
       { type: "usage", promptTokens: 0, completionTokens: 4, promptTokensTotal: 100, completionTokensTotal: 9 },
     ]);
     expect(events.at(-1)).toEqual({ type: "done", finishReason: "tool_calls" });
@@ -284,7 +284,7 @@ describe("Codex Responses stream contract", () => {
     const events = await collect(parseCodexStream(body.getReader()));
     expect(events).toEqual([
       { type: "text-delta", text: "Hello 🌍" },
-      { type: "usage", promptTokens: 40, completionTokens: 4, promptTokensTotal: 40, completionTokensTotal: 4, cachedReadTokens: 20 },
+      { type: "usage", promptTokens: 40, completionTokens: 4, promptTokensTotal: 40, completionTokensTotal: 4, cacheReadInputTokens: 40, cachedReadTokens: 20 },
       { type: "done", finishReason: "stop" },
     ]);
   });

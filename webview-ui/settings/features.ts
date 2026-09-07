@@ -316,6 +316,8 @@ export const DEFAULT_APPROVAL: ApprovalPolicy = {
 export interface ModelUsage {
   cachedReadTokens?: number;
   cachedWriteTokens?: number;
+  cacheReadInputTokens?: number;
+  cacheWriteReported?: boolean;
   promptTokens: number;
   completionTokens: number;
   requests: number;

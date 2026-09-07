@@ -253,7 +253,7 @@ describe("Antigravity SSE contracts", () => {
       usageMetadata: { promptTokenCount: 100, candidatesTokenCount: 5, thoughtsTokenCount: 3, cachedContentTokenCount: 60 },
     }]));
     expect(events).toEqual([
-      { type: "usage", promptTokens: 100, completionTokens: 8, promptTokensTotal: 100, completionTokensTotal: 8, cachedReadTokens: 60 },
+      { type: "usage", promptTokens: 100, completionTokens: 8, promptTokensTotal: 100, completionTokensTotal: 8, cacheReadInputTokens: 100, cachedReadTokens: 60 },
       { type: "done", finishReason: "stop" },
     ]);
   });
@@ -266,7 +266,7 @@ describe("Antigravity SSE contracts", () => {
     let caught: unknown;
     try { for await (const event of parseAntigravityStream(stream([frame]))) events.push(event); } catch (error) { caught = error; }
     expect(caught).toMatchObject({ status: 429, message: expect.stringContaining("Fixture quota exhausted") });
-    expect(events).toEqual([{ type: "usage", promptTokens: 100, completionTokens: 5, promptTokensTotal: 100, completionTokensTotal: 5, cachedReadTokens: 40 }]);
+    expect(events).toEqual([{ type: "usage", promptTokens: 100, completionTokens: 5, promptTokensTotal: 100, completionTokensTotal: 5, cacheReadInputTokens: 100, cachedReadTokens: 40 }]);
   });
 
   it.each(["STOP", "MAX_TOKENS"])("finishes and cancels an open SSE connection on %s", async (finishReason) => {

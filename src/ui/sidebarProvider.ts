@@ -1670,6 +1670,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         activeTeamIds: features.activeTeamIds,
         subagentModel: features.subagentModel,
         availableModels: this._modelsForProvider(prov.providerId, prov.oauthKind),
+        resolveModelOptions: (childModel) => {
+          const kind = prov.oauthKind ?? features.providers.find((p) => p.id === prov.providerId)?.kind;
+          return {
+            contextTokens: this._contextTokensFor(childModel, kind),
+            modelParams: optionsToParams(this.featureStore.optionsFor(childModel, kind)),
+            maxTokens: settings.maxResponseLength > 0 ? settings.maxResponseLength : undefined,
+          };
+        },
         registerSubagentAbort: (callId, abort) => {
           // Chain aborts (tool kill + nested Task child) so timeout fires both.
           const prev = session.subagentAborts.get(callId);

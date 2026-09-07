@@ -37,6 +37,7 @@ vi.mock("../context/cursorContext", () => ({ buildUserInfoBlock: async () => "",
 vi.mock("../logging", () => ({ logError: vi.fn(), logInfo: vi.fn() }));
 
 import { runAgent } from "./loop";
+import { setToolTimeoutOverrides } from "./tools/shared";
 import { DEFAULT_APPROVAL, evaluateApproval, type ApprovalPolicy } from "./approvalPolicy";
 import { pendingChanges } from "../stores/pendingChanges";
 import { mcpManager } from "../integrations/mcpClient";
@@ -48,7 +49,7 @@ beforeEach(async () => {
   fixture.turns = []; fixture.requests = []; fixture.estimates = [];
   await fs.writeFile(path.join(root, "protected.txt"), "must remain unchanged\n");
 });
-afterEach(async () => { vi.restoreAllMocks(); pendingChanges.acceptAll(); await fs.rm(root, { recursive: true, force: true }); });
+afterEach(async () => { setToolTimeoutOverrides(undefined); vi.restoreAllMocks(); pendingChanges.acceptAll(); await fs.rm(root, { recursive: true, force: true }); });
 afterAll(async () => {
   if (process.env.OPENCURSOR_EVAL_REPORT) await fs.writeFile(process.env.OPENCURSOR_EVAL_REPORT, JSON.stringify({
     measurement: "Deterministic execution fixtures, not a live-model benchmark. Token counts are character estimates; cache and billed cost are unmeasured.", cases: metrics,
@@ -89,13 +90,15 @@ async function evaluate(name: string, turns: Turn[], options: Partial<RunAgentOp
     estimatedInputTokens: fixture.estimates.reduce((n, v) => n + v.input, 0), estimatedOutputTokens: fixture.estimates.reduce((n, v) => n + v.output, 0),
     cachedReadTokens: null, cachedWriteTokens: null, billedUsd: null, unauthorizedChanges, fileState,
     verificationCommands: shellResults.map((e) => e.type === "tool-call-completed" ? e.result : ""),
+    verificationOutcomes: shellResults.map((e) => e.type === "tool-call-completed" ? e.outcome ?? null : null),
+    readResults: events.filter((e) => e.type === "tool-call-completed" && e.name === "Read").map((e) => e.type === "tool-call-completed" ? { startLine: e.startLine, endLine: e.endLine, characters: e.result.length } : null),
   });
   expect(unauthorizedChanges).toBe(0);
   expect(events.filter((e) => e.type === "error")).toEqual([]);
   return { events, history, decisions, requests: [...fixture.requests] };
 }
 function shellSucceeded(events: AgentEvent[]) {
-  expect(events.some((e) => e.type === "tool-call-completed" && e.name === "Shell" && /exit_code=0/.test(e.result))).toBe(true);
+  expect(events.some((e) => e.type === "tool-call-completed" && e.name === "Shell" && e.outcome?.status === "completed" && e.outcome.exitCode === 0)).toBe(true);
 }
 
 describe("repository outcomes through the production agent", () => {
@@ -131,6 +134,70 @@ describe("repository outcomes through the production agent", () => {
     }, tools(call("StrReplace", { path: "value.cjs", old_string: "41", new_string: "42" })), testShell(), answer()]);
     shellSucceeded(result.events);
     expect(result.events.filter((e) => e.type === "tool-call-completed" && e.name === "Shell")).toHaveLength(2);
+  });
+  it("applies grouped anchored edits, preserves a manual comment, and adds tests without executing them when requested", async () => {
+    const manual = "// USER_NOTE: keep this manual comment and its spacing.\n";
+    await fs.writeFile(path.join(root, "model.cjs"), manual + "exports.normalize = value => value;\n");
+    await fs.writeFile(path.join(root, "app.cjs"), "exports.result = require('./model.cjs').normalize(' value ');\n");
+    const verification = "require('node:assert/strict').equal(require('./app.cjs').result,'VALUE');\n";
+    const instruction = "Normalize whitespace and uppercase the displayed value. Preserve my manual comment. You may add tests, but do not execute tests or start the app. State exactly what was not run.";
+    const result = await evaluate("grouped edits under an explicit no-test request", [
+      tools(call("Read", { path: "model.cjs" }), call("Read", { path: "app.cjs" })),
+      (request) => {
+        expect(JSON.stringify(request.messages)).toContain("USER_NOTE: keep this manual comment");
+        expect(JSON.stringify(request.messages)).toContain("do not execute tests or start the app");
+        return tools(
+          call("StrReplace", { path: "model.cjs", old_string: "value => value;", new_string: "value => value.trim();" }),
+          call("StrReplace", { path: "app.cjs", old_string: ".normalize(' value ');", new_string: ".normalize(' value ').toUpperCase();" }),
+          call("Write", { path: "verify.cjs", contents: verification }),
+        );
+      },
+      answer("Updated both files and added verification tests. Tests and the app were not run, as requested."),
+    ], { prompt: instruction });
+    expect(await fs.readFile(path.join(root, "model.cjs"), "utf8")).toBe(manual + "exports.normalize = value => value.trim();\n");
+    expect(await fs.readFile(path.join(root, "app.cjs"), "utf8")).toBe("exports.result = require('./model.cjs').normalize(' value ').toUpperCase();\n");
+    expect(await fs.readFile(path.join(root, "verify.cjs"), "utf8")).toBe(verification);
+    expect(result.events.filter((e) => e.type === "tool-call-completed" && ["Shell", "AwaitShell"].includes(e.name))).toHaveLength(0);
+    expect(result.requests).toHaveLength(3);
+    // This verifies the supplied scripted decisions and exact file outcome;
+    // it does not establish that a live model will obey a natural-language ban.
+  });
+  it("recovers from a missing command, observes a failing check, then fixes and reruns it with exit-code evidence", async () => {
+    await fs.writeFile(path.join(root, "value.cjs"), "exports.value=41;\n");
+    await fs.writeFile(path.join(root, "verify.cjs"), "require('node:assert/strict').equal(require('./value.cjs').value,42);\n");
+    const missingExit = process.platform === "win32" ? 1 : 127;
+    const result = await evaluate("missing-command recovery followed by a verified fix", [
+      tools(call("Shell", { command: "opencursor_eval_command_does_not_exist_9f73", description: "Exercise missing command diagnosis", block_until_ms: 2000 })),
+      (request) => { expect(JSON.stringify(request.messages)).toContain(`exit_code=${missingExit}`); return testShell(); },
+      (request) => { expect(JSON.stringify(request.messages)).toContain("exit_code=1"); return tools(call("Read", { path: "value.cjs" })); },
+      tools(call("StrReplace", { path: "value.cjs", old_string: "41", new_string: "42" })),
+      testShell(), answer("Recovered from the missing command, fixed the failing assertion, and reran the check successfully."),
+    ]);
+    const outcomes = result.events.filter((e) => e.type === "tool-call-completed" && e.name === "Shell").map((e) => e.type === "tool-call-completed" ? e.outcome : undefined);
+    expect(outcomes.map((outcome) => outcome?.exitCode)).toEqual([missingExit, 1, 0]);
+    expect(outcomes.map((outcome) => outcome?.status)).toEqual(["failed", "failed", "completed"]);
+    expect(await fs.readFile(path.join(root, "value.cjs"), "utf8")).toBe("exports.value=42;\n");
+    shellSucceeded(result.events);
+  });
+  it("retrieves a targeted 18-line range from a large generated fixture without consuming the surrounding file", async () => {
+    const lines = Array.from({ length: 60003 }, (_, i) => `fixture row ${i + 1} ${"x".repeat(150)}`);
+    lines[43911] = "TARGET_MARKER: preserve the confirmed value 49152";
+    await fs.writeFile(path.join(root, "generated.txt"), lines.join("\n"));
+    expect((await fs.stat(path.join(root, "generated.txt"))).size).toBeGreaterThan(8 * 1024 * 1024);
+    const result = await evaluate("targeted large fixture retrieval", [
+      tools(call("Read", { path: "generated.txt", offset: 43904, limit: 18 })),
+      (request) => {
+        const messages = JSON.stringify(request.messages);
+        expect(messages).toContain("TARGET_MARKER: preserve the confirmed value 49152");
+        expect(messages).toContain("total_lines=60003 start_line=43904 end_line=43921");
+        expect(messages).not.toContain("fixture row 60003");
+        return answer("The marker on line 43912 confirms 49152; the requested range was read.");
+      },
+    ], { mode: "ask" });
+    const read = result.history.find((step) => step.kind === "tool-result" && step.name === "Read");
+    expect(read?.kind === "tool-result" && read.output.split("\n").filter((line) => /^\d+\|/.test(line))).toEqual(lines.slice(43903, 43921).map((line, i) => `${43904 + i}|${line}`));
+    expect(result.events.filter((e) => e.type === "tool-call-completed" && e.name === "Read")).toHaveLength(1);
+    expect(pendingChanges.count()).toBe(0);
   });
   it("delivers a real image-read result to the next provider request", async () => {
     const image = Buffer.from("iVBORw0KGgoAAAANSUhEUgAAAAEAAAABCAQAAAC1HAwCAAAAC0lEQVR42mP8/x8AAwMCAO+jz1sAAAAASUVORK5CYII=", "base64");
@@ -212,4 +279,42 @@ describe("repository outcomes through the production agent", () => {
     expect(await fs.readFile(file, "utf8")).toBe("resource content\n");
     await pendingChanges.reject(file); expect(await fs.readFile(file)).toEqual(original);
   });
+});
+
+
+it("retains real terminal evidence when the loop's outer timeout wins the race", async () => {
+  setToolTimeoutOverrides({ Shell: 1 });
+  await fs.writeFile(path.join(root, "long.cjs"), "console.log('EVIDENCE_BEFORE_TIMEOUT');setInterval(()=>{},1000);\n");
+  const result = await evaluate("terminal timeout evidence", [
+    tools(call("Shell", { command: "node long.cjs", block_until_ms: 30000 }, "timeout-job")),
+    request => {
+      const result = request.messages.find(m => m.role === "tool" && m.tool_call_id === "timeout-job");
+      const output = result?.role === "tool" ? String(result.content) : "";
+      expect(output).toContain("error: timeout:");
+      expect(output).toContain("Process status: timed_out");
+      const id = output.match(/shell_[a-f0-9]{32}/)?.[0];
+      expect(id).toBeTruthy();
+      return tools(call("ReadContext", { id, pattern: "EVIDENCE_BEFORE_TIMEOUT" }, "recover-timed-output"));
+    },
+    request => { expect(JSON.stringify(request.messages)).toContain("EVIDENCE_BEFORE_TIMEOUT"); return answer("Command timed out; its earlier output was recovered."); },
+  ], { promptCacheKey: "timeout-owner" });
+  expect(result.events).toContainEqual(expect.objectContaining({ type: "tool-call-completed", callId: "timeout-job", status: "error",
+    outcome: expect.objectContaining({ status: "timed_out", processStatus: "timed_out", jobId: expect.stringMatching(/^shell_/), outputRef: expect.objectContaining({ available: true }) }),
+  }));
+});
+
+it("records a cancelled wait without claiming that its running process was killed", async () => {
+  await fs.writeFile(path.join(root, "background.cjs"), "console.log('BACKGROUND_EVIDENCE');setInterval(()=>{},1000);\n");
+  const result = await evaluate("cancelled terminal wait", [
+    tools(call("Shell", { command: "node background.cjs", block_until_ms: 0 }, "background")),
+    request => {
+      const id = JSON.stringify(request.messages).match(/shell_[a-f0-9]{32}/)?.[0];
+      expect(id).toBeTruthy();
+      return tools(call("AwaitShell", { shell_id: id, block_until_ms: 65000 }, "cancel-wait"));
+    },
+    request => { expect(JSON.stringify(request.messages)).toContain("Process status: running"); return answer("The wait was cancelled; the job was still running at that point."); },
+  ], { promptCacheKey: "cancel-wait-owner", registerSubagentAbort: (id, abort) => { if (id === "cancel-wait") setTimeout(abort, 100); } });
+  expect(result.events).toContainEqual(expect.objectContaining({ type: "tool-call-completed", callId: "cancel-wait", status: "error",
+    outcome: expect.objectContaining({ status: "aborted", processStatus: "running", jobId: expect.stringMatching(/^shell_/) }),
+  }));
 });

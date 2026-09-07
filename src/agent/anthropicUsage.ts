@@ -19,6 +19,7 @@ export interface AnthropicUsageDelta {
   completionTokensTotal?: number;
   cachedReadTokens?: number;
   cachedWriteTokens?: number;
+  cacheReadInputTokens?: number;
 }
 
 /**
@@ -30,6 +31,7 @@ export class AnthropicUsageTracker {
   private readonly input: Partial<Record<typeof INPUT_FIELDS[number], number>> = {};
   private promptTotal: number | undefined;
   private completionTotal: number | undefined;
+  private classifiedInput = 0;
 
   update(value: unknown): AnthropicUsageDelta | undefined {
     if (!value || typeof value !== "object") return undefined;
@@ -37,6 +39,8 @@ export class AnthropicUsageTracker {
     const valid = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
     const previousRead = this.input.cache_read_input_tokens ?? 0;
     const previousWrite = this.input.cache_creation_input_tokens ?? 0;
+    const firstRead = this.input.cache_read_input_tokens === undefined && valid(usage.cache_read_input_tokens);
+    const firstWrite = this.input.cache_creation_input_tokens === undefined && valid(usage.cache_creation_input_tokens);
     let hasInput = false;
     for (const key of INPUT_FIELDS) {
       const count = usage[key];
@@ -47,8 +51,8 @@ export class AnthropicUsageTracker {
     const event: AnthropicUsageDelta = { type: "usage" };
     const reads = (this.input.cache_read_input_tokens ?? 0) - previousRead;
     const writes = (this.input.cache_creation_input_tokens ?? 0) - previousWrite;
-    if (reads > 0) event.cachedReadTokens = reads;
-    if (writes > 0) event.cachedWriteTokens = writes;
+    if (reads > 0 || firstRead) event.cachedReadTokens = reads;
+    if (writes > 0 || firstWrite) event.cachedWriteTokens = writes;
     if (hasInput) {
       const total = Math.max(this.promptTotal ?? 0, INPUT_FIELDS.reduce((sum, key) => sum + (this.input[key] ?? 0), 0));
       if (this.promptTotal === undefined || total !== this.promptTotal) event.promptTokens = total - (this.promptTotal ?? 0);
@@ -59,7 +63,10 @@ export class AnthropicUsageTracker {
       if (this.completionTotal === undefined || total !== this.completionTotal) event.completionTokens = total - (this.completionTotal ?? 0);
       this.completionTotal = total;
     }
-    if (event.promptTokens === undefined && event.completionTokens === undefined) return undefined;
+    const classifiedInput = this.input.cache_read_input_tokens !== undefined ? this.promptTotal ?? 0 : 0;
+    if (classifiedInput > this.classifiedInput || firstRead) event.cacheReadInputTokens = classifiedInput - this.classifiedInput;
+    this.classifiedInput = classifiedInput;
+    if (event.promptTokens === undefined && event.completionTokens === undefined && !firstRead && !firstWrite) return undefined;
     if (this.promptTotal !== undefined) event.promptTokensTotal = this.promptTotal;
     if (this.completionTotal !== undefined) event.completionTokensTotal = this.completionTotal;
     return event;

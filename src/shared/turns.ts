@@ -11,6 +11,8 @@
 // host (authoritative state, runs in the background) and the webview (pure
 // renderer). Keep this DOM/React-free so it can run in the host.
 
+import type { ToolOutcome } from "../agent/toolOutcome";
+
 export type Mode = "agent" | "ask" | "plan" | "multitask" | "project" | "debug";
 
 export type AgentEvent =
@@ -28,9 +30,10 @@ export type AgentEvent =
       diff?: string;
       startLine?: number;
       endLine?: number;
+      outcome?: ToolOutcome;
     }
   | { type: "run-status"; status: "running" | "finished" | "error" | "cancelled" }
-  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number; model?: string; requestId?: string; source?: "parent" | "summary" | "subagent"; cachedReadTokens?: number; cachedWriteTokens?: number }
+  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number; model?: string; requestId?: string; source?: "parent" | "summary" | "subagent"; cachedReadTokens?: number; cachedWriteTokens?: number; cacheReadInputTokens?: number }
   | { type: "run-result"; text: string; durationMs: number }
   | { type: "subagent-event"; callId: string; event: AgentEvent }
   | { type: "mode-changed"; mode: Mode }
@@ -56,6 +59,7 @@ export interface ToolBlock {
   input: any;
   status: "running" | "completed" | "error";
   result?: string;
+  outcome?: ToolOutcome;
   /** Submitted question answers, persisted by the host. */
   answers?: Record<string, string[]>;
   diff?: string;
@@ -264,7 +268,7 @@ export function applyToBlocks(blocksIn: AssistantBlock[], ev: AgentEvent): Assis
     const i = findToolIndex(blocks, ev.callId);
     if (i < 0) return blocksIn;
     const b = blocks[i] as ToolBlock;
-    blocks[i] = { ...b, status: ev.status, result: ev.result, diff: ev.diff, startLine: ev.startLine, endLine: ev.endLine };
+    blocks[i] = { ...b, status: ev.status, result: ev.result, diff: ev.diff, startLine: ev.startLine, endLine: ev.endLine, outcome: ev.outcome ?? b.outcome };
     return blocks;
   } else if (ev.type === "retry") {
     const note: ErrorBlock = { kind: "error", message: ev.error, retrying: { attempt: ev.attempt, max: ev.max } };
@@ -416,6 +420,7 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
             diff: ev.diff ?? b.diff,
             startLine: ev.startLine ?? b.startLine,
             endLine: ev.endLine ?? b.endLine,
+            outcome: ev.outcome ?? b.outcome,
           }
         : {
             ...b,
@@ -424,6 +429,7 @@ export function applyEvent(turns: Turn[], ev: AgentEvent): Turn[] {
             diff: ev.diff,
             startLine: ev.startLine,
             endLine: ev.endLine,
+            outcome: ev.outcome ?? b.outcome,
           };
     return list;
   }

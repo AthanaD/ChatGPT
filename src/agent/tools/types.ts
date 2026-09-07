@@ -8,10 +8,12 @@
  */
 
 import type { ToolSchema, Mode } from "../types";
+import type { ToolOutcome } from "../toolOutcome";
 import { TOOL_SPECS } from "./schemas";
 
 export interface ToolResult {
   output: string;
+  outcome?: ToolOutcome;
   diff?: string;
   startLine?: number;
   endLine?: number;
@@ -42,10 +44,14 @@ export interface ToolContext {
   getMode?: () => Mode;
   /** Key identifying this run's shell session (standalone cd persists within this run). */
   shellSessionKey?: string;
+  /** Stable conversation owner; completed jobs remain readable across runs by this owner only. */
+  shellOwnerKey?: string;
   /** Emit a notify_on_output match to the UI (set by the loop). */
   emitShellNotify?: (text: string) => void;
   /** Stream partial output for a running tool call (live terminal output). */
   emitToolProgress?: (callId: string, text: string) => void;
+  /** Preserve the latest job metadata even if an outer timeout settles before execute returns. */
+  recordToolOutcome?: (callId: string, outcome: ToolOutcome) => void;
 }
 
 export interface Tool {

@@ -8,14 +8,14 @@
  */
 
 import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
-import type { ProviderEvent, WireMessage } from "./types";
+import type { ProviderEvent, Step, WireMessage } from "./types";
 import type { StreamChatOpts } from "./provider/types";
 
 vi.mock("vscode", () => ({ EventEmitter: class { event = () => ({ dispose() {} }); fire() {} } }));
 vi.mock("../stores/featureStore", () => ({ MODEL_CATALOG: [] }));
 import { generateTitle, pickModel, streamChat } from "./provider";
 import { initOAuth, isConnected } from "./oauth";
-import { buildMessages } from "./messages";
+import { buildMessages, snapshotUserContext } from "./messages";
 
 const sse = (...frames: unknown[]) => new Response(frames.map((frame) => `data: ${typeof frame === "string" ? frame : JSON.stringify(frame)}\n\n`).join(""), { status: 200 });
 const success = () => sse({ choices: [{ delta: { content: "Done" }, finish_reason: "stop" }] }, "[DONE]");
@@ -52,6 +52,41 @@ it("does not send Google replay signatures to an OpenAI-compatible endpoint", as
 });
 
 describe("complete provider request contracts", () => {
+  it.each([undefined, "claude-code"] as const)("caches successive completed tool batches through %s without changing source messages", async (oauthKind) => {
+    const history: Step[] = [{ kind: "user", text: "Inspect project", context: snapshotUserContext({ userInfo: "Keep public APIs", openFiles: "app.ts", timestamp: "fixed" }) }];
+    for (let turn = 1; turn <= 3; turn++) {
+      const ids = Array.from({ length: turn === 3 ? 25 : 1 }, (_, i) => `read-${turn}-${i}`);
+      history.push({ kind: "assistant", text: "", calls: ids.map(id => ({ id, name: "Read", arguments: '{"path":"app.ts"}' })) },
+        ...ids.map(id => ({ kind: "tool-result" as const, callId: id, name: "Read", output: `Result ${id}`, status: "completed" as const })));
+      const messages = buildMessages("OpenCursor", history);
+      const source = JSON.stringify(messages);
+      await collect({ messages, anthropic: true, oauthKind, model: "claude-sonnet-4-6" });
+      const body = requests[requests.length - 1].body;
+      const cached = body.messages.flatMap((message: any) => Array.isArray(message.content)
+        ? message.content.filter((block: any) => block.type === "tool_result" && block.cache_control).map((block: any) => block.tool_use_id) : []);
+      expect(cached).toEqual(turn === 1 ? [ids[0]] : [`read-${turn - 1}-0`, ids[ids.length - 1]]);
+      expect(JSON.stringify(body).match(/cache_control/g)).toHaveLength(4);
+      expect(JSON.stringify(messages)).toBe(source);
+    }
+  });
+
+  it.each([undefined, "claude-code", "codex"] as const)("preserves serialized prior content across saved user turns through %s", async (oauthKind) => {
+    const context = snapshotUserContext({ userInfo: "Workspace rules", openFiles: "app.ts", timestamp: "first" });
+    const history: Step[] = [{ kind: "user", text: "First request", context }, { kind: "assistant", text: "First answer", calls: [] }];
+    const options = { oauthKind, ...(oauthKind === "claude-code" ? { model: "claude-sonnet-4-6", anthropic: true } : {}) };
+    await collect({ ...options, messages: buildMessages("OpenCursor", history) });
+    const restored: Step[] = JSON.parse(JSON.stringify(history));
+    restored.push({ kind: "user", text: "Follow-up", context: snapshotUserContext({ ...context, timestamp: "second" }, context) });
+    await collect({ ...options, messages: buildMessages("OpenCursor", restored) });
+    // Anthropic's four supported cache markers roll forward independently of
+    // content. Their positions are provider metadata, not instruction changes.
+    const contentOnly = (value: unknown) => JSON.parse(JSON.stringify(value, (key, item) => key === "cache_control" ? undefined : item));
+    const first = requests[0].body.input ?? requests[0].body.messages;
+    const second = requests[1].body.input ?? requests[1].body.messages;
+    expect(contentOnly(second.slice(0, first.length))).toEqual(contentOnly(first));
+    expect(JSON.stringify(second).match(/Workspace rules/g)).toHaveLength(1);
+  });
+
   it.each([undefined, "claude-code"] as const)("honors Sonnet 5 disabled thinking through %s", async (oauthKind) => {
     await collect({ anthropic: true, oauthKind, model: "claude-sonnet-5", modelParams: { thinking: "disabled", reasoningEffort: "max" } });
     expect(requests[0].body.thinking).toEqual({ type: "disabled" });

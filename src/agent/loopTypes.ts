@@ -29,6 +29,8 @@ export interface RunAgentOptions {
 	changeOwner?: import("../stores/pendingChanges").ChangeOwner;
 	/** Stable conversation key for transports that support prompt cache routing. */
 	promptCacheKey?: string;
+	/** Conversation owner for retained terminal evidence, shared by parent and children. */
+	shellOwnerKey?: string;
 	maxTokens?: number;
 	/** Max loop steps before pausing (0/undefined = default 200). */
 	maxSteps?: number;
@@ -50,6 +52,8 @@ export interface RunAgentOptions {
 	enableWebFetch?: boolean;
 	approve?: (toolName: string, input: any, callId?: string) => Promise<boolean | { approved: false; blockedSubject: string }>;
 	isSubagent?: boolean;
+	/** Read-only parent brief and original user requests for a delegated run. */
+	inheritedContext?: { instructions: string; userRequests: string; summary?: string };
 	customSubagents?: SubagentDef[];
 	/** All configured subagent teams. */
 	teams?: TeamDef[];
@@ -59,6 +63,8 @@ export interface RunAgentOptions {
 	subagentModel?: string;
 	/** Model ids selectable for this run's provider; a Task model outside this list is ignored. */
 	availableModels?: string[];
+	/** Resolve options for a different child/summary model; never inherit incompatible reasoning controls. */
+	resolveModelOptions?: (model: string) => Pick<RunAgentOptions, "contextTokens" | "maxTokens" | "modelParams" | "sampling">;
 	/** Called when a subagent starts, so the UI can offer a per-subagent stop. */
 	registerSubagentAbort?: (callId: string, abort: () => void) => void;
 	/** Ask the user clarifying questions via the chat UI (ask_question tool). */

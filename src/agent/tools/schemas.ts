@@ -25,11 +25,11 @@ function def(spec: ToolSpec) {
 
 def({
   name: "ReadContext",
-  description: "Read or search archived context by id, or use id history for the full conversation. Returns a bounded excerpt; use next_line/next_column to continue. Load only the details needed for the current task.",
+  description: "Read or search archived context by id, history for the full conversation, capabilities for current availability, mcp for its tool catalog, or a shell_ job id for retained terminal output. Returns a bounded excerpt; use next_line/next_column to continue. Load only the details needed for the current task.",
   parameters: {
     type: "object",
     properties: {
-      id: { type: "string", description: "Archive id from a previous result, or history for the full conversation transcript" },
+      id: { type: "string", description: "Archive or shell_ job id from a previous result, history, capabilities, or mcp" },
       start_line: { type: "integer", minimum: 1, description: "First line, 1-based" },
       end_line: { type: "integer", minimum: 1, description: "Last line, inclusive" },
       start_column: { type: "integer", minimum: 1, description: "Resume a long line from next_column" },
@@ -41,7 +41,7 @@ def({
 
 def({
   name: "Shell",
-  description: "Execute a command in the workspace shell. Each command starts a fresh shell; a successful standalone cd carries its directory to the next call in this run. Environment changes do not persist. Use working_directory to select a directory and quote paths. Use specialized tools for reading, searching and editing files. Dependent commands can use &&. Commands run serially until their foreground wait ends. block_until_ms defaults to 30000 and is capped at 30000; 0 returns immediately. A command still running becomes a background shell; use AwaitShell with its shell_id to read output and status. Output is bounded in memory, so request focused command output. Background shells live only for this agent run and have a 10-minute limit. notify_on_output emits selective output-match notifications while the run is active, with debounce_ms at least 5000. Stop terminates owned processes. Commit, push, change branches, or run destructive commands only when authorized by the user.",
+  description: "Execute a command in the workspace shell. Each command starts a fresh shell; a successful standalone cd carries its directory to the next call in this run. Environment changes do not persist. Use working_directory to select a directory and quote paths. Use specialized tools for reading, searching and editing files. Dependent commands can use &&. Commands run serially until their foreground wait ends. block_until_ms defaults to 30000 and is capped at 30000; 0 returns immediately. A command still running becomes a background job; use AwaitShell with its shell_id for status. The result includes explicit running/completed/failed/aborted/timed_out status and real exit code when available. Output cards contain a bounded preview; use the opaque ReadContext transcript reference to retrieve exact retained output. Each transcript retains up to 8 MiB; output beyond that cap is explicitly marked incomplete. Up to 32 jobs are retained per extension host, for at most 24 hours; capacity may evict finished jobs earlier. Finished transcripts remain available in later turns of this conversation until expiry or extension restart. Active processes live only for this agent run, have a 10-minute lifetime, and are killed on Stop or run completion. notify_on_output emits selective matches while the process is active, with debounce_ms at least 5000. Commit, push, change branches, or run destructive commands only when authorized by the user.",
   parameters: {
     type: "object",
     properties: {
@@ -68,11 +68,11 @@ def({
 
 def({
   name: "Glob",
-  description: "\nTool to search for files matching a glob pattern\n\n- Works fast with codebases of any size\n- Returns matching file paths sorted by modification time\n- Use this tool when you need to find files by name patterns\n- You have the capability to call multiple tools in a single response. It is always better to speculatively perform multiple searches that are potentially useful as a batch.\n",
+  description: "Find files by name pattern; scope target_directory and glob_pattern to the task before widening the search. Results are bounded. Batch independent searches when useful.",
   parameters: {
     type: "object",
     properties: {
-      target_directory: { type: "string", description: "Absolute path to directory to search for files in. If not provided, defaults to Cursor workspace root." },
+      target_directory: { type: "string", description: "Directory to search for files in. Defaults to the workspace root; scope to a known task directory when possible." },
       glob_pattern: { type: "string", description: "The glob pattern to match files against.\nPatterns not starting with \"**/\" are automatically prepended with \"**/\" to enable recursive searching.\n\nExamples:\n\t- \"*.js\" (becomes \"**/*.js\") - find all .js files\n\t- \"**/node_modules/**\" - find all node_modules directories\n\t- \"**/test/**/test_*.ts\" - find all test_*.ts files in any test directory" },
     },
     required: ["glob_pattern"],
@@ -81,21 +81,21 @@ def({
 
 def({
   name: "Grep",
-  description: "A powerful search tool built on ripgrep\nUsage:\n- Prefer using Grep for search tasks when you know the exact symbols or strings to search for. Whenever possible, use this tool instead of invoking grep or rg as a terminal command. The Grep tool has been optimized for speed and file restrictions inside Cursor.\n- Supports full regex syntax (e.g., \"log.*Error\", \"function\\s+\\w+\")\n- Filter files with glob parameter (e.g., \".js\", \"**/.tsx\") or type parameter (e.g., \"js\", \"py\", \"rust\")\n- Output modes: \"content\" shows matching lines (default), \"files_with_matches\" shows only file paths, \"count\" shows match counts\n- Pattern syntax: Uses ripgrep (not grep) - literal braces need escaping (use interface\\{\\} to find interface{} in Go code)\n- Multiline matching: By default patterns match within single lines only. For cross-line patterns like struct \\{[\\s\\S]*?field, use multiline: true\n- Results are capped to several thousand output lines for responsiveness; when truncation occurs, the results report \"at least\" counts, but are otherwise accurate.\n- Content output formatting closely follows ripgrep output format: '-' for context lines, ':' for match lines, and all context/match lines below each file group.",
+  description: "Search file contents with a regex, scoped by path/glob/type; batch independent searches. Results are sorted by file path from the first page. Content is grouped under each file: N: marks matching lines and N- marks context; overlapping context appears once. head_limit/offset paginate content rows (including context, excluding file headers), or files in files_with_matches/count mode. Follow next_offset when present; narrow the query when scan limits are reported. Long lines are clipped; use Read for exact text. Multiline enables cross-line patterns.",
   parameters: {
     type: "object",
     properties: {
       pattern: { type: "string", description: "The regular expression pattern to search for in file contents" },
-      path: { type: "string", description: "File or directory to search in (rg pattern -- PATH). Defaults to Cursor workspace root." },
+      path: { type: "string", description: "File or directory to search. Defaults to the workspace root; prefer a known task directory." },
       glob: { type: "string", description: "Glob pattern to filter files (e.g. \"*.js\", \"*.{ts,tsx}\") - maps to rg --glob" },
-      output_mode: { type: "string", enum: ["content", "files_with_matches", "count"], description: "Output mode: \"content\" shows matching lines (supports -A/-B/-C context, -n line numbers, head_limit), \"files_with_matches\" shows file paths (supports head_limit), \"count\" shows match counts (supports head_limit). Defaults to \"content\"." },
+      output_mode: { type: "string", enum: ["content", "files_with_matches", "count"], description: "Output mode: content shows matching/context rows, files_with_matches shows paths, count shows matching-line counts per file. Defaults to content." },
       "-B": { type: "number", description: "Number of lines to show before each match (rg -B). Requires output_mode: \"content\", ignored otherwise." },
       "-A": { type: "number", description: "Number of lines to show after each match (rg -A). Requires output_mode: \"content\", ignored otherwise." },
       "-C": { type: "number", description: "Number of lines to show before and after each match (rg -C). Requires output_mode: \"content\", ignored otherwise." },
       "-i": { type: "boolean", description: "Case insensitive search (rg -i) Defaults to false" },
       type: { type: "string", description: "File type to search (rg --type). Common types: js, py, rust, go, java, etc. More efficient than include for standard file types." },
-      head_limit: { type: "number", minimum: 0, description: "Limit output size. For \"content\" mode: limits total matches shown. For \"files_with_matches\" and \"count\" modes: limits number of files." },
-      offset: { type: "number", minimum: 0, description: "Skip first N entries. For \"content\" mode: skips first N matches. For \"files_with_matches\" and \"count\" modes: skips first N files. Use with head_limit for pagination." },
+      head_limit: { type: "number", minimum: 0, description: "Maximum content rows (match and context lines) or files for other modes; default 200, maximum 2000. File headers do not count." },
+      offset: { type: "number", minimum: 0, description: "Skip N content rows, including context, or N files in other modes. Keep the same query and use the returned next_offset to continue." },
       multiline: { type: "boolean", description: "Enable multiline mode where . matches newlines and patterns can span lines (rg -U --multiline-dotall). Default: false." },
     },
     required: ["pattern"],
@@ -104,26 +104,27 @@ def({
 
 def({
   name: "AwaitShell",
-  description: "Observe or wait for a background shell job. Omit shell_id to sleep for block_until_ms without a shell command. Completed unawaited jobs notify you after your turn; observe a job you believe has ended (including one you killed) to consume a stale notification.\n\nWork on independent tasks instead of polling. Await only when your next step needs this result and no other productive work remains, or close monitoring is required. Never poll a job described as \"manually backgrounded by the user\". Tests, installs, watchers and short scripts normally need only completion notifications. Training/evaluation runs, deployments, long builds, data pipelines, migrations and transfers may need monitoring for hangs or corrective action.\n\nAfter immediately backgrounding a command (block_until_ms: 0), read its output file once to confirm startup; this is a smoke check, not a polling loop.\n\nWhen actively monitoring:\n- Continue until termination, a healthy steady state for a nonterminating process, or a diagnosed hang. If hung, use the output header's pid to stop it when safe, fix the cause if possible and proceed.\n- Regex waits can detect known startup/status/error lines. Regexes match the output body, excluding headers and footers.\n- Match waits to expected runtime. For further waits use 60–270s slices or 1200s+ instead of round five-minute waits to reduce prompt-cache misses.\n- Output headers include pid and running_for_ms, refreshed every 5000ms; completion adds exit_code and elapsed_ms.",
+  description: "Observe or wait for a terminal job owned by this conversation, using the shell_id returned by Shell. Finished job metadata remains readable in later turns until its retention expires or the extension restarts. Omit shell_id to sleep for block_until_ms without a command. The default is 30000ms, the maximum is 120000ms, and 65000ms waits are supported. Set 0 with a shell_id for an immediate status check. Waits are cancellable; the outer configured tool timeout may end a wait earlier. A wait ending while the process remains active returns status running, not success. Work on independent tasks instead of repeatedly polling. Await when the next step needs this result. Output cards contain a bounded head/tail preview and an opaque ReadContext reference for exact retained transcript pages. Regex waits check the retained in-memory preview and subsequent output, not transcript headers or footers; use ReadContext with a literal pattern to search older output omitted from the preview. Active jobs end with the run; retained transcripts do not keep their processes alive.",
   parameters: {
     type: "object",
     properties: {
       shell_id: { type: "string", description: "Optional shell id to poll. If omitted, this tool sleeps for the full block_until_ms duration and then returns. Required when block_until_ms is 0." },
-      block_until_ms: { type: "number", description: "Max sleep time to block before returning (in milliseconds). Defaults to 30000ms. Set to 0 for non-blocking status check." },
-      pattern: { type: "string", description: "Block until the regex matches stdout/stderr stream (or task completes). Matches anywhere in the shell output, not just new output. Will not match terminal file headers or footers, e.g. exit_code. Accepts JavaScript regex patterns (compiled with the multiline `m` flag)." },
+      block_until_ms: { type: "number", description: "Maximum wait in milliseconds. Defaults to 30000; capped at 120000. Set to 0 for a non-blocking job status check." },
+      pattern: { type: "string", description: "Block until the regex matches the bounded output preview or the job completes. Older output omitted from the preview can be searched with ReadContext. Headers and footers are excluded. Accepts JavaScript regex patterns with the multiline m flag." },
     },
   },
 });
 
 def({
   name: "Read",
-  description: "Reads a file from the local filesystem. You can access any file directly by using this tool.\nIf the User provides a path to a file assume that path is valid. It is okay to read a file that does not exist; an error will be returned.\n\nUsage:\n- You can optionally specify a line offset and limit (especially handy for long files), but it's recommended to read the whole file by not providing these parameters\n- Lines in the output are numbered starting at 1, using following format: LINE_NUMBER|LINE_CONTENT\n- You have the capability to call multiple tools in a single response. It is always better to speculatively read multiple files as a batch that are potentially useful.\n- If you read a file that exists but has empty contents you will receive 'File is empty.'\n\nImage Support:\n- This tool can also read image files when called with the appropriate path.\n- Supported image formats: jpeg/jpg, png, gif, webp.\n\nPDF Support:\n- PDF files are converted into text content automatically (subject to the same character limits as other files).",
+  description: "Read a local file with numbered lines; default 200 lines even when offset is supplied. Prefer scoped ranges and batch independent reads. Explicit limits allow larger ranges within a 20000-character page. The header gives total_lines, start_line, end_line and next_line; follow next_column using start_column to resume a long line. Large text files are streamed. Images (jpeg/png/gif/webp) and PDFs up to 8 MiB are supported.",
   parameters: {
     type: "object",
     properties: {
       path: { type: "string", description: "The absolute path of the file to read." },
-      offset: { type: "integer", description: "The line number to start reading from. Positive values are 1-indexed from the start of the file. Negative values count backwards from the end (e.g. -1 is the last line). Only provide if the file is too large to read at once." },
-      limit: { type: "integer", description: "The number of lines to read. Only provide if the file is too large to read at once." },
+      offset: { type: "integer", description: "First line, 1-based. Negative values count from EOF (-1 is the last line). Defaults to 1." },
+      limit: { type: "integer", description: "Maximum lines to read; defaults to 200. Explicit larger values are allowed within the character page limit." },
+      start_column: { type: "integer", minimum: 1, description: "1-based UTF-16 column on the first selected line; use the returned next_column to resume a long line. Defaults to 1." },
     },
     required: ["path"],
   },

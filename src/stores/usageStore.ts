@@ -17,6 +17,10 @@ export interface ModelUsage {
 	lastUsed: number;
 	cachedReadTokens?: number;
 	cachedWriteTokens?: number;
+	/** Input with reported cache-read details; the remaining input is unknown. */
+	cacheReadInputTokens?: number;
+	/** Distinguishes a newly reported zero from zeros fabricated by old versions. */
+	cacheWriteReported?: boolean;
 }
 
 const KEY = "ocursor.usage";
@@ -34,6 +38,7 @@ export interface UsageMetadata {
 	requestId?: string;
 	cachedReadTokens?: number;
 	cachedWriteTokens?: number;
+	cacheReadInputTokens?: number;
 }
 let writes: Promise<void> = Promise.resolve();
 const seenRequests = new Set<string>();
@@ -47,11 +52,15 @@ export function recordUsage(model: string, promptTokens = 0, completionTokens = 
 		const requestKey = metadata.requestId ? `${model}/${metadata.requestId}` : undefined;
 		const newRequest = !requestKey || !seenRequests.has(requestKey);
 		const nonnegative = (n: number | undefined) => Number.isFinite(n) ? Math.max(0, n ?? 0) : 0;
+		const addReported = (before: number | undefined, delta: number | undefined) =>
+			typeof delta === "number" && Number.isFinite(delta) && delta >= 0 ? (before ?? 0) + delta : before;
 		all[model] = {
 			promptTokens: u.promptTokens + nonnegative(promptTokens),
 			completionTokens: u.completionTokens + nonnegative(completionTokens),
-			cachedReadTokens: (u.cachedReadTokens ?? 0) + nonnegative(metadata.cachedReadTokens),
-			cachedWriteTokens: (u.cachedWriteTokens ?? 0) + nonnegative(metadata.cachedWriteTokens),
+			cachedReadTokens: addReported(u.cachedReadTokens, metadata.cachedReadTokens),
+			cachedWriteTokens: addReported(u.cachedWriteTokens, metadata.cachedWriteTokens),
+			cacheReadInputTokens: addReported(u.cacheReadInputTokens, metadata.cacheReadInputTokens),
+			cacheWriteReported: u.cacheWriteReported || (typeof metadata.cachedWriteTokens === "number" && Number.isFinite(metadata.cachedWriteTokens) && metadata.cachedWriteTokens >= 0) || undefined,
 			requests: u.requests + (newRequest ? 1 : 0),
 			lastUsed: Date.now(),
 		};
