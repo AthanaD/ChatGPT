@@ -64,21 +64,20 @@ export const TOOLS: Record<string, Tool> = {
 export const MUTATING_TOOLS = new Set(["StrReplace", "Write", "Delete", "Shell", "EditNotebook"]);
 // File-editing tools (loop uses these for the auto-edit gate + afterEdit hook).
 export const EDIT_TOOLS = new Set(["StrReplace", "Write", "Delete", "EditNotebook"]);
-// WritePlan available in plan AND agent modes — models need to save plans
-// during complex tasks. Only excluded from ask mode (read-only).
-const PLAN_ONLY = new Set<string>();
+// Saving a plan is an explicit exception to Plan's read-only tool set.
+const PLAN_WRITE_MODES = new Set<Mode>(["plan", "agent", "debug"]);
 
 // Multitask is a coordinator: it delegates to subagents (Task), manages todos,
 // and may read/search — but it must never mutate files or the shell itself.
-const MULTITASK_BLOCKED = new Set(["StrReplace", "Write", "Delete", "EditNotebook", "Shell"]);
+const MULTITASK_BLOCKED = new Set(["StrReplace", "Write", "Delete", "EditNotebook", "Shell", "WritePlan"]);
 export const MULTITASK_TOOLS = new Set(
-  Object.keys(TOOLS).filter((name) => !MULTITASK_BLOCKED.has(name) && !PLAN_ONLY.has(name)),
+  Object.keys(TOOLS).filter((name) => !MULTITASK_BLOCKED.has(name)),
 );
 
 export function toolsForMode(mode: Mode): Tool[] {
   return Object.entries(TOOLS)
     .filter(([name, t]) => {
-      if (PLAN_ONLY.has(name)) return mode === "plan";
+      if (name === "WritePlan") return PLAN_WRITE_MODES.has(mode);
       // Project mode is a team lead: same coordinator restrictions as multitask.
       if (mode === "multitask" || mode === "project") return MULTITASK_TOOLS.has(name);
       // ask + plan are read-only: no mutating tools. agent/debug: everything.

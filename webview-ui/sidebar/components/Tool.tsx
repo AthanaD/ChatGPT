@@ -605,7 +605,7 @@ function QuestionCard({ block }: { block: ToolBlock }) {
 
   if (questions.length === 0) return null;
 
-const q = questions[step];
+  const q = questions[step];
   const opts = q.options || [];
   const sel = answers[String(step)] || [];
   const customText = custom[String(step)] || "";
@@ -613,10 +613,17 @@ const q = questions[step];
   const setCustomSelected = (on: boolean) => setCustomMode((c) => ({ ...c, [String(step)]: on }));
   const isChoices = !q.type || q.type === "choices";
   const structuredValue = custom[String(step)] || "";
-  // Required free-form fields block Continue/Submit until non-empty.
-  const choicesValid = !q.required || sel.length > 0 || (customSelected && customText.trim().length > 0);
-  const structuredValid = !q.required || structuredValue.trim().length > 0;
-  const isValid = isChoices ? choicesValid : structuredValid;
+  const answerFor = (index: number): string[] => {
+    const item = questions[index];
+    const key = String(index);
+    const text = (custom[key] || "").trim();
+    if (item.type && item.type !== "choices") return text ? [text] : [];
+    const selected = answers[key] || [];
+    if (!customMode[key]) return selected;
+    const choices = item.multiple ? selected : [];
+    return text ? [...new Set([...choices, text])] : choices;
+  };
+  const isValid = !q.required || answerFor(step).length > 0;
 
   const toggle = (opt: string) => {
     if (!q.multiple) setCustomSelected(false);
@@ -632,27 +639,34 @@ const q = questions[step];
     if (!q.multiple) setAnswers((a) => ({ ...a, [String(step)]: [] }));
     setCustomSelected(true);
   };
-  // Build this step's final answer list, folding in the custom text if chosen.
-  const resolveAnswers = (base: Record<string, string[]>): Record<string, string[]> => {
-    const out = { ...base };
-    const v = (custom[String(step)] || "").trim();
-    if (customSelected && v) {
-      const cur = q.multiple ? (out[String(step)] || []).filter((x) => x !== v) : [];
-      out[String(step)] = [...cur, v];
+  const submit = (skipCurrent = false) => {
+    if (sent || (skipCurrent && q.required)) return;
+    const final = Object.fromEntries(questions.map((_, i) => [String(i), skipCurrent && i === step ? [] : answerFor(i)]));
+    const missing = questions.findIndex((item, i) => item.required && final[String(i)].length === 0);
+    if (missing !== -1) {
+      setStep(missing);
+      return;
     }
-    return out;
-  };
-  const submit = () => {
-    const final = resolveAnswers(answers);
     setAnswers(final);
     setSent(true);
     post({ type: "answerQuestion", callId: block.callId, answers: final });
   };
   const advance = () => {
-    setAnswers((a) => resolveAnswers(a));
+    if (!isValid) return;
     setStep((s) => s + 1);
   };
   const last = step === questions.length - 1;
+  const skip = () => {
+    if (q.required) return;
+    if (last) {
+      submit(true);
+    } else {
+      setAnswers((a) => ({ ...a, [String(step)]: [] }));
+      setCustom((c) => ({ ...c, [String(step)]: "" }));
+      setCustomSelected(false);
+      setStep((s) => s + 1);
+    }
+  };
 
   if (answered || sent) {
     return (
@@ -738,8 +752,8 @@ const q = questions[step];
       <div className="qc-foot">
         {step > 0 && <button className="qc-nav" onClick={() => setStep((s) => s - 1)}>Back</button>}
         <span className="qc-spacer" />
-        <button className="qc-skip" onClick={() => (last ? submit() : setStep((s) => s + 1))}>Skip</button>
-        <button className="qc-next" onClick={() => (last ? submit() : advance())}>
+        {!q.required && <button className="qc-skip" onClick={skip}>Skip</button>}
+        <button className="qc-next" disabled={!isValid} onClick={() => (last ? submit() : advance())}>
           {last ? "Submit" : "Continue"}
         </button>
       </div>

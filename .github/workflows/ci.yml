@@ -26,6 +26,9 @@ jobs:
 
       - name: Install dependencies
         run: pnpm install --frozen-lockfile
+        env:
+          # Hosted runners use the bundled CPU runtime; avoid optional GPU downloads.
+          ONNXRUNTIME_NODE_INSTALL: skip
 
       - name: Type check
         run: pnpm run check-types
@@ -48,16 +51,12 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      - name: Test security scanner
+        run: node --test scripts/check-secrets.test.mjs
+
       - name: Check for leaked secrets
-        run: |
-          # Ensure no .env files committed
-          if git ls-files | grep -E '\.(env|env\..*)$'; then
-            echo "ERROR: .env files found in repo!"
-            exit 1
-          fi
-          # Check no API keys in source
-          if grep -rE '(sk-|tp-|vbk_|Bearer [A-Za-z0-9]{20,})' src/ --include='*.ts' --include='*.tsx' 2>/dev/null; then
-            echo "ERROR: Potential API keys found in source code!"
-            exit 1
-          fi
-          echo "Security scan passed."
+        run: node scripts/check-secrets.mjs

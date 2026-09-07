@@ -27,9 +27,6 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
     if (!ctx) return { output: "error: todo context unavailable" };
     if (!Array.isArray(ctx.todos)) ctx.todos = [];
 
-    // DEBUG: Log raw input to diagnose what models actually send
-    console.error("[TodoWrite] raw input:", JSON.stringify(input).slice(0, 500));
-
     // CRITICAL: Normalize incoming items. Models (Mimo, deepseek) send strings
     // instead of objects, or objects missing fields, or use wrong field names.
     // Accept 'todos', 'tasks', 'items', or any array field.
@@ -38,20 +35,25 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
       : Array.isArray(input?.items) ? input.items
       : Array.isArray(input) ? input
       : [];
-    const incoming: TodoItem[] = raw.map((t, i) => {
+    type TodoUpdate = Partial<TodoItem> & { id: string };
+    const incoming: TodoUpdate[] = raw.map((t, i): TodoUpdate | null => {
       if (typeof t === "string") {
         return { id: `auto_${i}`, content: t, status: "pending" as const };
       }
       if (t && typeof t === "object") {
+        const content = t.content ?? t.text ?? t.title ?? t.name;
         return {
-          id: t.id || `auto_${i}`,
-          content: String(t.content || t.text || t.title || t.name || "unnamed"),
-          status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status) ? t.status : "pending") as TodoItem["status"],
+          id: String(t.id || `auto_${i}`),
+          // Omitted fields must stay absent until merged with the existing item.
+          ...(content != null ? { content: String(content) } : {}),
+          ...(t.status !== undefined ? {
+            status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status) ? t.status : "pending") as TodoItem["status"],
+          } : {}),
         };
       }
       return null;
-    }).filter((t): t is TodoItem => t !== null);
-    console.error("[TodoWrite] normalized:", incoming.length, "items:", JSON.stringify(incoming).slice(0, 300));
+    }).filter((t): t is TodoUpdate => t !== null);
+    const withDefaults = (t: TodoUpdate): TodoItem => ({ content: "unnamed", status: "pending", ...t });
 
     if (incoming.length === 0 && ctx.todos.length === 0) {
       // The model called TodoWrite without arguments (common with glm/deepseek).
@@ -63,11 +65,11 @@ export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abort
       const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
       for (const t of incoming) {
         const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        byId.set(key, { ...byId.get(key), ...t, id: key });
+        byId.set(key, withDefaults({ ...byId.get(key), ...t, id: key }));
       }
       ctx.todos = [...byId.values()];
     } else if (incoming.length > 0) {
-      ctx.todos = incoming;
+      ctx.todos = incoming.map(withDefaults);
     }
 
     const render = ctx.todos
@@ -165,8 +167,8 @@ export const switchModeTool = defineTool("SwitchMode", false, async (input, _sig
   return { output: ctx.switchMode(target as Mode) };
 });
 
-// ---- WritePlan (plan mode only) ----
-export const writePlanTool = defineTool("WritePlan", false, async (input) => {
+// ---- WritePlan (allowed in plan, agent, and debug modes) ----
+export const writePlanTool = defineTool("WritePlan", true, async (input) => {
   const root = getWorkspaceRoot();
   const dir = path.join(root, ".plans");
   await fs.mkdir(dir, { recursive: true });

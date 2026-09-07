@@ -7,26 +7,6 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
-/**
- * Word-level Jaccard similarity ratio between two strings (0..1).
- * Uses word tokens instead of character positions to avoid false positives
- * when two texts share similar structure but different content (e.g., plan steps).
- */
-function similarityRatio(a: string, b: string): number {
-  if (a === b) return 1;
-  if (!a || !b) return 0;
-  const tokenize = (s: string): Set<string> =>
-    new Set(s.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
-  const wordsA = tokenize(a);
-  const wordsB = tokenize(b);
-  if (wordsA.size === 0 && wordsB.size === 0) return 1;
-  if (wordsA.size === 0 || wordsB.size === 0) return 0;
-  let intersection = 0;
-  for (const w of wordsA) { if (wordsB.has(w)) intersection++; }
-  const union = wordsA.size + wordsB.size - intersection;
-  return union > 0 ? intersection / union : 0;
-}
-
 import { streamChat, SamplingParams, ModelParams } from "./provider";
 import type { OAuthKind } from "./oauth";
 import { TOOLS, schemasForMode, toolsForMode, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
@@ -242,9 +222,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	const pushSystemNote = (text: string) => pushHistory({ kind: "user", text, synthetic: true });
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
-	// multitask/project are agentic (full tool access); treat them like agent for gating.
-	// plan mode is also agentic to enable truncation and thinking-only nudges.
+	// These modes may need continuation nudges; execution permissions are separate.
 	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug" || mode === "plan";
+	const canExecuteMcp = (m: Mode) => m === "agent" || m === "debug";
 	// Plan mode needs more output tokens to compose long plans. Boost maxTokens
 	// if the user left it at default or a low value.
 	const planModeMaxTokens = mode === "plan" && (!maxTokens || maxTokens < 16384) ? 16384 : maxTokens;
@@ -490,7 +470,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		};
 		const built = [
 			...schemasForMode(m).filter((s) => !disabledToolNames.has(s.function.name)).map(compact),
-			...mcpSchemas.map(compact),
+			...(canExecuteMcp(m) ? mcpSchemas.map(compact) : []),
 		];
 		schemaCache.set(m, built);
 		return built;
@@ -542,15 +522,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		let planWritten = false;
 		let planNudgeCount = 0;
 		const MAX_PLAN_NUDGES = 3;
-		// Anti-loop: count consecutive text-only turns (no tool calls). After
-		// CONSECUTIVE_TEXT_LIMIT in a row, the model is stuck in a resume loop —
-		// break out instead of nudging again.
+		// Bound recovery nudges when the model keeps returning without tools.
 		let consecutiveTextTurns = 0;
-		// Agentic modes (agent, plan, debug, etc.) need more text-only turns
-		// for complex tasks like plan composition or code analysis.
 		const CONSECUTIVE_TEXT_LIMIT = 6;
-		// Non-agentic modes (ask) keep a tighter limit.
-		const CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC = 2;
 		// Hard cap on total nudge injections per run to prevent infinite re-nudge.
 		let nudgeCount = 0;
 		const MAX_NUDGES = 10;
@@ -559,13 +533,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		let taskCallCount = 0;
 		let hasCalledTodoWrite = false;
 		const TASK_WITHOUT_TODO_LIMIT = 3;
-		// Anti-loop: track recent tool call signatures to detect oscillation.
-		// If the same tool+args signature appears repeatedly, the model is stuck.
-		const recentToolCalls = new Map<string, number>();
-		const TOOL_REPEAT_LIMIT = 2;
-		// Anti-loop: detect duplicate text across turns. If the model produces
-		// nearly identical text twice, it's stuck in a thought loop.
-		let lastAssistantText = "";
 
 		// Feed already-finished (but unreported) background subagent results into the
 		// conversation, so the model always knows what has completed. Returns count.
@@ -857,60 +824,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				pushHistory({ kind: "assistant", text: "", calls });
 			}
 
-		if (!calls.length) {
+			if (!calls.length) {
 				consecutiveTextTurns++;
-				// CRITICAL: Wait for bg subagents FIRST, then check incomplete todos,
-				// then check consecutive text limit. Order matters:
-				// 1. bgPending → wait (prevents subagent cancellation)
-				// 2. incomplete todos → nudge (prevents premature stop)
-				// 3. consecutiveTextTurns → break (only when truly stuck)
+				// Background work must settle before the model can give its final answer.
 				if (bgPending()) {
 					await awaitPendingBg();
 					if (signal.aborted) {
 						emitSettled("cancelled");
 						return;
 					}
+					consecutiveTextTurns = 0;
 					continue;
 				}
-				const canNudge = nudgeCount < MAX_NUDGES;
-				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
-				// ALWAYS nudge when there are incomplete todos — don't wait for
-				// consecutiveTextTurns >= 2. Mimo stops after 1 text turn.
-				if (canNudge && isAgentic() && incompleteTodos.length > 0) {
-					nudgeCount++;
-					const todoList = incompleteTodos.map((t) => `- [${t.status}] ${t.content}`).join("\n");
-					pushSystemNote(
-						`CRITICAL: You have ${incompleteTodos.length} incomplete todo(s):\n${todoList}\n\n` +
-						`You MUST continue working on these tasks NOW. Do NOT stop, do NOT produce a final answer. ` +
-						`Call the appropriate tools to work on the NEXT todo: "${incompleteTodos[0].content}"`,
-					);
-					continue;
-				}
-				// No todos created yet but model keeps producing text → force it to
-				// create a todo list and start working with tools.
-				// Skip for subagents — they don't need their own todo list.
-				if (canNudge && isAgentic() && !isSubagent && !hasCalledTodoWrite && toolCtx.todos.length === 0 && step >= 2) {
+				const canNudge = nudgeCount < MAX_NUDGES && consecutiveTextTurns < CONSECUTIVE_TEXT_LIMIT;
+				// Recover only when there is evidence the response is unfinished.
+				if (canNudge && isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
 					nudgeCount++;
 					pushSystemNote(
-						`IMPORTANT: You have not created a todo list yet. ` +
-						`Call TodoWrite to create a structured task list, then work through each item. ` +
-						`If you just ran a command, continue with the next step — do not stop.`,
-					);
-					continue;
-				}
-				// Only break on consecutive text turns when there are NO incomplete
-				// todos — meaning the model is genuinely done.
-				const effectiveLimit = isAgentic() ? CONSECUTIVE_TEXT_LIMIT : CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC;
-				if (consecutiveTextTurns >= effectiveLimit) {
-					finalText = assistantText;
-					break;
-				}
-				if (canNudge && isAgentic() && consecutiveTextTurns === 1) {
-					nudgeCount++;
-					pushSystemNote(
-						"You produced a text response without calling any tools. " +
-						"To complete this task, you MUST use tools (Read, Grep, Write, Shell, etc.). " +
-						"Do not just describe what you will do — actually do it using the available tools.",
+						"Your previous response was cut off because it hit the output-token limit. Continue exactly where you left off; re-issue any tool call that was truncated.",
 					);
 					continue;
 				}
@@ -922,17 +853,16 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					);
 					continue;
 				}
-				// Truncated response (hit max output tokens): the model didn't choose to
-				// stop — never treat this as a final answer. Ask it to continue.
-				if (canNudge && isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
+				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
+				if (canNudge && isAgentic() && incompleteTodos.length > 0) {
 					nudgeCount++;
+					const todoList = incompleteTodos.map((t) => `- [${t.status}] ${t.content}`).join("\n");
 					pushSystemNote(
-						"Your previous response was cut off because it hit the output-token limit. Continue exactly where you left off; re-issue any tool call that was truncated.",
+						`You have ${incompleteTodos.length} incomplete todo(s):\n${todoList}\n\n` +
+						"Continue any remaining work. If it is complete, update the todo list; if you are blocked, explain what is needed.",
 					);
 					continue;
 				}
-				// Thinking-only turn (reasoned but produced no answer and no tool calls):
-				// the task isn't done — nudge it to act instead of silently stopping.
 				if (canNudge && isAgentic() && !assistantText.trim() && thinking.trim()) {
 					nudgeCount++;
 					pushSystemNote(
@@ -940,47 +870,22 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					);
 					continue;
 				}
-			// Anti-loop: detect duplicate text across turns. If the model produces
-			// nearly identical text twice, it's stuck in a thought loop.
-			// NOTE: Skip this check in plan mode — the model naturally produces
-			// similar text as it iterates on the plan composition.
-			if (mode !== "plan" && assistantText && lastAssistantText && assistantText.trim().length > 20) {
-				const similarity = similarityRatio(assistantText.trim(), lastAssistantText.trim());
-				if (similarity > 0.7) {
-					finalText = assistantText;
-					break;
-				}
-			}
-			lastAssistantText = assistantText;
-				// Empty turn right after a tool result → nudge for more work.
 				const prev = history[history.length - 2];
-				if (canNudge && isAgentic() && !assistantText.trim() && !thinking.trim() && prev && prev.kind === "tool-result") {
+				if (canNudge && isAgentic() && !assistantText.trim() && !thinking.trim() && prev?.kind === "tool-result") {
 					nudgeCount++;
 					pushSystemNote(
 						"If you need to make more tool calls to complete the task, please do so now. If you are fully finished, reply normally without calling any tools.",
 					);
 					continue;
 				}
-				// DO NOT break here — let consecutiveTextTurns handle the exit.
-				// Breaking on any text > N chars stops the model mid-task when it
-				// produces a brief acknowledgment like "I'll work on that" or "OK".
-				// The consecutiveTextTurns guard (limit=2) gives the model 2 turns
-				// to produce a real final answer before the loop exits.
-		} else {
-			// Model called tools — reset text-only counter.
-			consecutiveTextTurns = 0;
-			// Track tool call signatures to detect oscillation.
-			for (const c of calls) {
-				const sig = `${c.name}:${(c.arguments || "").slice(0, 200)}`;
-				const count = (recentToolCalls.get(sig) ?? 0) + 1;
-				recentToolCalls.set(sig, count);
-				if (count >= TOOL_REPEAT_LIMIT) {
-					finalText = `The model is repeating the same tool call (${c.name}) ${count} times. This indicates a loop. Stopping.`;
-					break;
-				}
+				// A normal answer ends the run, even if the task did not need a todo list.
+				finalText = assistantText;
+				break;
+			} else {
+				consecutiveTextTurns = 0;
+				// Re-reading files, polling, and rerunning tests are legitimate repeats.
+				// The step limit and hard cap bound the run without guessing from arguments.
 			}
-			if (finalText) break;
-		}
 
 			const parsed = calls.map((call) => {
 				let input: any = {};
@@ -1062,7 +967,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// MCP tool dispatch (same hard timeout + countdown as built-ins).
 				if (resolvedName.startsWith("mcp__")) {
-					if (!isAgentic() || isCoordinator()) {
+					if (!canExecuteMcp(mode)) {
 						// MCP tools may mutate; only allow in agentic modes. Multitask is a
 						// coordinator and must delegate MCP work to subagents.
 						results[i] = { status: "error", output: `MCP tools not allowed in ${mode} mode` };
@@ -1145,7 +1050,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					};
 					return;
 				}
-				if (!isAgentic() && !allowedNamesFor().has(resolvedName)) {
+				if (!allowedNamesFor().has(resolvedName)) {
 					results[i] = { status: "error", output: `tool ${resolvedName} not allowed in ${mode} mode` };
 					return;
 				}
@@ -1344,21 +1249,22 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (resolvedName === "Task") {
 					taskCallCount++;
 				}
-				// CRITICAL: If model calls TodoRead but there are no todos,
-				// force it to call TodoWrite first.
-				if (resolvedName === "TodoRead" && toolCtx.todos.length === 0 && nudgeCount < MAX_NUDGES) {
-					nudgeCount++;
-					pushSystemNote(
-						`CRITICAL: You called TodoRead but no todo list exists. ` +
-						`You MUST call TodoWrite NOW to create a structured task list. ` +
-						`List ALL the work that needs to be done, then work through each item systematically. ` +
-						`Do NOT proceed without a todo list.`
-					);
-				}
 				// Durable ledger backs the flat-cost <task_state> block; history itself
 				// keeps full tool results until auto-summarize / budget trim.
 				ledger.record(resolvedName, parsed[i].input, r.status, r.output);
 				pushHistory({ kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, image: r.image });
+			}
+			// Keep every result adjacent to its assistant tool-call batch. A reminder
+			// inserted between them makes budget fitting discard results as orphans.
+			if (toolCtx.todos.length === 0 && nudgeCount < MAX_NUDGES &&
+				parsed.some((p, i) => p.resolvedName === "TodoRead" && results[i]?.status === "completed")) {
+				nudgeCount++;
+				pushSystemNote(
+					`CRITICAL: You called TodoRead but no todo list exists. ` +
+					`You MUST call TodoWrite NOW to create a structured task list. ` +
+					`List ALL the work that needs to be done, then work through each item systematically. ` +
+					`Do NOT proceed without a todo list.`
+				);
 			}
 			// CRITICAL: After processing tool results, check if model called Task
 			// multiple times without creating a todo list. If so, force it to plan.
