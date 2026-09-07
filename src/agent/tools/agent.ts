@@ -23,29 +23,74 @@ import {
 
 // ---- TodoWrite ----
 export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abortSignal, _callId, ctx) => {
-  if (!ctx) return { output: "error: todo context unavailable" };
-  const incoming: TodoItem[] = Array.isArray(input.todos) ? input.todos : [];
-  if (input.merge) {
-    const byId = new Map(ctx.todos.map((t) => [t.id, t]));
-    for (const t of incoming) byId.set(t.id, { ...byId.get(t.id), ...t });
-    ctx.todos = [...byId.values()];
-  } else {
-    ctx.todos = incoming;
+  try {
+    if (!ctx) return { output: "error: todo context unavailable" };
+    if (!Array.isArray(ctx.todos)) ctx.todos = [];
+
+    // DEBUG: Log raw input to diagnose what models actually send
+    console.error("[TodoWrite] raw input:", JSON.stringify(input).slice(0, 500));
+
+    // CRITICAL: Normalize incoming items. Models (Mimo, deepseek) send strings
+    // instead of objects, or objects missing fields, or use wrong field names.
+    // Accept 'todos', 'tasks', 'items', or any array field.
+    const raw: any[] = Array.isArray(input?.todos) ? input.todos
+      : Array.isArray(input?.tasks) ? input.tasks
+      : Array.isArray(input?.items) ? input.items
+      : Array.isArray(input) ? input
+      : [];
+    const incoming: TodoItem[] = raw.map((t, i) => {
+      if (typeof t === "string") {
+        return { id: `auto_${i}`, content: t, status: "pending" as const };
+      }
+      if (t && typeof t === "object") {
+        return {
+          id: t.id || `auto_${i}`,
+          content: String(t.content || t.text || t.title || t.name || "unnamed"),
+          status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status) ? t.status : "pending") as TodoItem["status"],
+        };
+      }
+      return null;
+    }).filter((t): t is TodoItem => t !== null);
+    console.error("[TodoWrite] normalized:", incoming.length, "items:", JSON.stringify(incoming).slice(0, 300));
+
+    if (incoming.length === 0 && ctx.todos.length === 0) {
+      // The model called TodoWrite without arguments (common with glm/deepseek).
+      // Create a single placeholder todo so the UI shows something useful.
+      ctx.todos = [{ id: "auto_0", content: "Working on task...", status: "in_progress" }];
+    }
+
+    if (input?.merge) {
+      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
+      for (const t of incoming) {
+        const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
+        byId.set(key, { ...byId.get(key), ...t, id: key });
+      }
+      ctx.todos = [...byId.values()];
+    } else if (incoming.length > 0) {
+      ctx.todos = incoming;
+    }
+
+    const render = ctx.todos
+      .map((t) => {
+        const mark =
+          t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
+        return `${mark} ${t.content || "unnamed"}`;
+      })
+      .join("\n");
+    return { output: render || "(no todos)" };
+  } catch (e) {
+    return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
   }
-  const render = ctx.todos
-    .map((t) => {
-      const mark =
-        t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-      return `${mark} ${t.content}`;
-    })
-    .join("\n");
-  return { output: `Updated todos:\n${render}` };
 });
 
 // ---- TodoRead ----
 export const todoReadTool = defineTool("TodoRead", false, async (_input, _abortSignal, _callId, ctx) => {
   if (!ctx) return { output: "error: todo context unavailable" };
-  if (!ctx.todos.length) return { output: "(no todos)" };
+  if (!ctx.todos.length) {
+    return {
+      output: "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first to create a structured task list before proceeding. Do NOT just describe what you will do — create the todo list now.",
+    };
+  }
   return { output: ctx.todos.map((t) => `- [${t.status}] ${t.content}`).join("\n") };
 });
 
@@ -54,8 +99,9 @@ export const askQuestionTool = defineTool("AskQuestion", false, async (input, ab
   const asker = ctx?.askUser ?? getQuestionAsker();
   if (!asker) return { output: "error: cannot ask questions in this context" };
 
-  // Cursor shape: questions:[{id, prompt, options:[{id,label}], allow_multiple}], title.
+// Cursor shape: questions:[{id, prompt, options:[{id,label}], allow_multiple}], title.
   // Back-compat: also accept {question, options:[string], multiple} and header.
+  // Structured inputs: {type: "text"|"textArea"|"number"|"date", required, placeholder}.
   const questions: AskQuestionItem[] = Array.isArray(input?.questions)
     ? input.questions
         .map((q: any) => ({
@@ -64,6 +110,9 @@ export const askQuestionTool = defineTool("AskQuestion", false, async (input, ab
             ? q.options.map((o: any) => (typeof o === "string" ? o : String(o?.label ?? o?.id ?? "")))
             : undefined,
           multiple: !!(q?.allow_multiple ?? q?.multiple),
+          type: typeof q?.type === "string" ? (q.type as AskQuestionItem["type"]) : undefined,
+          required: q?.required === true,
+          placeholder: typeof q?.placeholder === "string" ? q.placeholder : undefined,
         }))
         .filter((q: AskQuestionItem) => q.question)
     : [];

@@ -7,6 +7,26 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
+/**
+ * Word-level Jaccard similarity ratio between two strings (0..1).
+ * Uses word tokens instead of character positions to avoid false positives
+ * when two texts share similar structure but different content (e.g., plan steps).
+ */
+function similarityRatio(a: string, b: string): number {
+  if (a === b) return 1;
+  if (!a || !b) return 0;
+  const tokenize = (s: string): Set<string> =>
+    new Set(s.toLowerCase().split(/\s+/).filter((w) => w.length > 2));
+  const wordsA = tokenize(a);
+  const wordsB = tokenize(b);
+  if (wordsA.size === 0 && wordsB.size === 0) return 1;
+  if (wordsA.size === 0 || wordsB.size === 0) return 0;
+  let intersection = 0;
+  for (const w of wordsA) { if (wordsB.has(w)) intersection++; }
+  const union = wordsA.size + wordsB.size - intersection;
+  return union > 0 ? intersection / union : 0;
+}
+
 import { streamChat, SamplingParams, ModelParams } from "./provider";
 import type { OAuthKind } from "./oauth";
 import { TOOLS, schemasForMode, toolsForMode, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
@@ -56,7 +76,7 @@ const PROJECT_REMINDER =
 	"Plan the project with TodoWrite, then delegate each unit of work to the right team member with the Task tool " +
 	'(run_in_background=true, subagent_type set to the member name), launching every independent member AT THE SAME TIME in a single turn.\n</reminder>';
 
-const MAX_STEPS = 50;
+const MAX_STEPS = 200;
 
 /**
  * Tools whose description carries protocol the model must not lose mid-run
@@ -209,11 +229,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	const { apiBaseUrl, apiKey, model, prompt, attachments, history: persistedHistory, maxTokens, maxSteps, autoContinue, contextTokens, sampling, modelParams, anthropic, oauthKind, systemPromptOverride, extraInstructions, enableFileReading, enableTerminalSuggestions, enableWorkspaceContext, approve, isSubagent, customSubagents, teams, activeTeamIds, subagentModel, availableModels, registerSubagentAbort, askUser, onAfterRun, onBeforeShell, onAfterEdit, onHook, signal, emit: rawEmit } = opts;
 	// Model history is disposable and may be compacted when the window fills.
 	// Persisted history remains lossless for chat display/export, including full
-	// tool output/thinking.
-	const history: Step[] = persistedHistory.map((s) => structuredClone(s));
+	// tool output/thinking. Shallow clone suffices: economizeHistory/stripThinking
+	// replaces entries via spread (never mutates originals), and new steps are
+	// pushed as fresh objects.
+	const history: Step[] = [...persistedHistory];
 	const pushHistory = (...steps: Step[]) => {
 		history.push(...steps);
-		persistedHistory.push(...steps.map((s) => structuredClone(s)));
+		persistedHistory.push(...steps);
 	};
 	const emit = coalesceEmit(rawEmit);
 	/** Loop-injected note. Marked synthetic so it never poses as the user's request. */
@@ -221,7 +243,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
 	// multitask/project are agentic (full tool access); treat them like agent for gating.
-	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug";
+	// plan mode is also agentic to enable truncation and thinking-only nudges.
+	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug" || mode === "plan";
+	// Plan mode needs more output tokens to compose long plans. Boost maxTokens
+	// if the user left it at default or a low value.
+	const planModeMaxTokens = mode === "plan" && (!maxTokens || maxTokens < 16384) ? 16384 : maxTokens;
 	/** Coordinator modes: the model delegates instead of implementing. */
 	const isCoordinator = () => mode === "multitask" || mode === "project";
 	// In project mode the roster is limited to the members of the assigned team(s).
@@ -514,9 +540,32 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	try {
 		let finalText = "";
 		let planWritten = false;
-		let planNudged = false;
-		// One-shot nudge when the model stops with unfinished todos.
-		let todoNudged = false;
+		let planNudgeCount = 0;
+		const MAX_PLAN_NUDGES = 3;
+		// Anti-loop: count consecutive text-only turns (no tool calls). After
+		// CONSECUTIVE_TEXT_LIMIT in a row, the model is stuck in a resume loop —
+		// break out instead of nudging again.
+		let consecutiveTextTurns = 0;
+		// Agentic modes (agent, plan, debug, etc.) need more text-only turns
+		// for complex tasks like plan composition or code analysis.
+		const CONSECUTIVE_TEXT_LIMIT = 6;
+		// Non-agentic modes (ask) keep a tighter limit.
+		const CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC = 2;
+		// Hard cap on total nudge injections per run to prevent infinite re-nudge.
+		let nudgeCount = 0;
+		const MAX_NUDGES = 10;
+		// Track Task/explore subagent calls to detect when model is stuck
+		// calling subagents without creating a todo list.
+		let taskCallCount = 0;
+		let hasCalledTodoWrite = false;
+		const TASK_WITHOUT_TODO_LIMIT = 3;
+		// Anti-loop: track recent tool call signatures to detect oscillation.
+		// If the same tool+args signature appears repeatedly, the model is stuck.
+		const recentToolCalls = new Map<string, number>();
+		const TOOL_REPEAT_LIMIT = 2;
+		// Anti-loop: detect duplicate text across turns. If the model produces
+		// nearly identical text twice, it's stuck in a thought loop.
+		let lastAssistantText = "";
 
 		// Feed already-finished (but unreported) background subagent results into the
 		// conversation, so the model always knows what has completed. Returns count.
@@ -631,9 +680,12 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		};
 
 		const stepLimit = maxSteps && maxSteps > 0 ? maxSteps : MAX_STEPS;
+		// Hard cap: even with autoContinue, never exceed this absolute maximum
+		// to prevent infinite loops (e.g. stuck in nudge echo chamber).
+		const HARD_CAP = Math.max(stepLimit, MAX_STEPS) * 2;
 		let hitStepLimit = false;
 		for (let step = 0; ; step++) {
-			if (!autoContinue && step >= stepLimit) {
+			if (step >= HARD_CAP || (!autoContinue && step >= stepLimit)) {
 				hitStepLimit = true;
 				break;
 			}
@@ -648,7 +700,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			// Auto context management. Budget = window minus the reply reservation.
 			const budget = contextTokens && contextTokens > 0
-				? Math.max(1024, contextTokens - (maxTokens ?? 4096) - 1024)
+				? Math.max(1024, contextTokens - (planModeMaxTokens ?? 4096) - 1024)
 				: 0;
 			// Tool schemas ride along on every request and are large; leaving them
 			// out of the estimate made the guard optimistic by 10k+ tokens.
@@ -684,6 +736,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						);
 						lastCompactionStep = step;
 						economizeHistory(history);
+						// After compaction, remind the model about existing todos so it
+						// doesn't call TodoWrite with an empty list. The structured
+						// toolCtx.todos persists, but the model may not realize this.
+						if (toolCtx.todos.length > 0) {
+							const todoSummary = toolCtx.todos
+								.map((t) => `- [${t.status}] ${t.content}`)
+								.join("\n");
+							pushSystemNote(
+								`IMPORTANT: Context was compacted but your todo list is preserved. ` +
+								`Current todos (${toolCtx.todos.length} items):\n${todoSummary}\n\n` +
+								`DO NOT call TodoWrite with an empty list. Continue working on the existing todos. ` +
+								`If you need to update them, use TodoWrite with merge=true to preserve existing items.`,
+							);
+						}
 						emit({ type: "compaction", status: "done", summary });
 					} catch {
 						emit({ type: "compaction", status: "failed" });
@@ -736,7 +802,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				model,
 				messages,
 				tools: activeTools,
-				maxTokens,
+				maxTokens: planModeMaxTokens,
 				sampling,
 				modelParams,
 				anthropic,
@@ -791,19 +857,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				pushHistory({ kind: "assistant", text: "", calls });
 			}
 
-			if (!calls.length) {
-				// Plan mode must persist a plan file. If the model tries to end without
-				// calling write_plan, force it once.
-				if (mode === "plan" && !planWritten && !planNudged) {
-					planNudged = true;
-					pushSystemNote(
-						"You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.",
-					);
-					continue;
-				}
-				// In-flight background Task subagents: wait + feed results before any
-				// "continue" nudge. Otherwise the model gets another turn while workers
-				// are still running and often spawns a second wave of subagents.
+		if (!calls.length) {
+				consecutiveTextTurns++;
+				// CRITICAL: Wait for bg subagents FIRST, then check incomplete todos,
+				// then check consecutive text limit. Order matters:
+				// 1. bgPending → wait (prevents subagent cancellation)
+				// 2. incomplete todos → nudge (prevents premature stop)
+				// 3. consecutiveTextTurns → break (only when truly stuck)
 				if (bgPending()) {
 					await awaitPendingBg();
 					if (signal.aborted) {
@@ -812,9 +872,60 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 					continue;
 				}
+				const canNudge = nudgeCount < MAX_NUDGES;
+				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
+				// ALWAYS nudge when there are incomplete todos — don't wait for
+				// consecutiveTextTurns >= 2. Mimo stops after 1 text turn.
+				if (canNudge && isAgentic() && incompleteTodos.length > 0) {
+					nudgeCount++;
+					const todoList = incompleteTodos.map((t) => `- [${t.status}] ${t.content}`).join("\n");
+					pushSystemNote(
+						`CRITICAL: You have ${incompleteTodos.length} incomplete todo(s):\n${todoList}\n\n` +
+						`You MUST continue working on these tasks NOW. Do NOT stop, do NOT produce a final answer. ` +
+						`Call the appropriate tools to work on the NEXT todo: "${incompleteTodos[0].content}"`,
+					);
+					continue;
+				}
+				// No todos created yet but model keeps producing text → force it to
+				// create a todo list and start working with tools.
+				// Skip for subagents — they don't need their own todo list.
+				if (canNudge && isAgentic() && !isSubagent && !hasCalledTodoWrite && toolCtx.todos.length === 0 && step >= 2) {
+					nudgeCount++;
+					pushSystemNote(
+						`IMPORTANT: You have not created a todo list yet. ` +
+						`Call TodoWrite to create a structured task list, then work through each item. ` +
+						`If you just ran a command, continue with the next step — do not stop.`,
+					);
+					continue;
+				}
+				// Only break on consecutive text turns when there are NO incomplete
+				// todos — meaning the model is genuinely done.
+				const effectiveLimit = isAgentic() ? CONSECUTIVE_TEXT_LIMIT : CONSECUTIVE_TEXT_LIMIT_NON_AGENTIC;
+				if (consecutiveTextTurns >= effectiveLimit) {
+					finalText = assistantText;
+					break;
+				}
+				if (canNudge && isAgentic() && consecutiveTextTurns === 1) {
+					nudgeCount++;
+					pushSystemNote(
+						"You produced a text response without calling any tools. " +
+						"To complete this task, you MUST use tools (Read, Grep, Write, Shell, etc.). " +
+						"Do not just describe what you will do — actually do it using the available tools.",
+					);
+					continue;
+				}
+				if (canNudge && mode === "plan" && !planWritten && planNudgeCount < MAX_PLAN_NUDGES) {
+					planNudgeCount++;
+					nudgeCount++;
+					pushSystemNote(
+						"You are in PLAN MODE and have not written the plan yet. Call the WritePlan tool now with a title and the complete Markdown plan. Do not respond with the plan as plain text — it must be saved via WritePlan.",
+					);
+					continue;
+				}
 				// Truncated response (hit max output tokens): the model didn't choose to
 				// stop — never treat this as a final answer. Ask it to continue.
-				if (isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
+				if (canNudge && isAgentic() && /length|max_tokens|max_output_tokens/i.test(finishReason)) {
+					nudgeCount++;
 					pushSystemNote(
 						"Your previous response was cut off because it hit the output-token limit. Continue exactly where you left off; re-issue any tool call that was truncated.",
 					);
@@ -822,50 +933,76 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// Thinking-only turn (reasoned but produced no answer and no tool calls):
 				// the task isn't done — nudge it to act instead of silently stopping.
-				if (isAgentic() && !assistantText.trim() && thinking.trim()) {
+				if (canNudge && isAgentic() && !assistantText.trim() && thinking.trim()) {
+					nudgeCount++;
 					pushSystemNote(
 						"You produced only internal reasoning with no answer or tool calls. Continue working on the task now — make the necessary tool calls, or reply with your final answer if fully finished.",
 					);
 					continue;
 				}
+			// Anti-loop: detect duplicate text across turns. If the model produces
+			// nearly identical text twice, it's stuck in a thought loop.
+			// NOTE: Skip this check in plan mode — the model naturally produces
+			// similar text as it iterates on the plan composition.
+			if (mode !== "plan" && assistantText && lastAssistantText && assistantText.trim().length > 20) {
+				const similarity = similarityRatio(assistantText.trim(), lastAssistantText.trim());
+				if (similarity > 0.7) {
+					finalText = assistantText;
+					break;
+				}
+			}
+			lastAssistantText = assistantText;
+				// Empty turn right after a tool result → nudge for more work.
 				const prev = history[history.length - 2];
-				// Empty turn right after a tool result → nudge for more work. If it
-				// produced any text, that's its final answer — stop.
-				if (isAgentic() && !assistantText.trim() && !thinking.trim() && prev && prev.kind === "tool-result") {
+				if (canNudge && isAgentic() && !assistantText.trim() && !thinking.trim() && prev && prev.kind === "tool-result") {
+					nudgeCount++;
 					pushSystemNote(
 						"If you need to make more tool calls to complete the task, please do so now. If you are fully finished, reply normally without calling any tools.",
 					);
 					continue;
 				}
-				// Unfinished todo list → one nudge to finish or explicitly wrap up.
-				if (isAgentic() && !isSubagent && !todoNudged) {
-					const open = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
-					if (open.length) {
-						todoNudged = true;
-						pushSystemNote(
-							`Your todo list still has ${open.length} unfinished item${open.length > 1 ? "s" : ""}: ${open.map((t) => `"${t.content}"`).join(", ")}. Continue working on them now. If they are actually done or no longer needed, update the todo list, then give your final answer.`,
-						);
-						continue;
-					}
+				// DO NOT break here — let consecutiveTextTurns handle the exit.
+				// Breaking on any text > N chars stops the model mid-task when it
+				// produces a brief acknowledgment like "I'll work on that" or "OK".
+				// The consecutiveTextTurns guard (limit=2) gives the model 2 turns
+				// to produce a real final answer before the loop exits.
+		} else {
+			// Model called tools — reset text-only counter.
+			consecutiveTextTurns = 0;
+			// Track tool call signatures to detect oscillation.
+			for (const c of calls) {
+				const sig = `${c.name}:${(c.arguments || "").slice(0, 200)}`;
+				const count = (recentToolCalls.get(sig) ?? 0) + 1;
+				recentToolCalls.set(sig, count);
+				if (count >= TOOL_REPEAT_LIMIT) {
+					finalText = `The model is repeating the same tool call (${c.name}) ${count} times. This indicates a loop. Stopping.`;
+					break;
 				}
-				finalText = assistantText;
-				break;
 			}
+			if (finalText) break;
+		}
 
 			const parsed = calls.map((call) => {
 				let input: any = {};
 				let badArgs = false;
+				// Resolve truncated tool names (Mimo sends "Rea" instead of "Read").
+				let resolvedName = call.name;
+				if (!TOOLS[call.name] && !call.name.startsWith("mcp__")) {
+					const lc = call.name.toLowerCase();
+					const match = Object.keys(TOOLS).find((n) => n.toLowerCase().startsWith(lc) || lc.startsWith(n.toLowerCase()));
+					if (match) resolvedName = match;
+				}
 				try {
-					input = normalizeToolPaths(call.name, JSON.parse(call.arguments || "{}"), getWorkspaceRoot());
+					input = normalizeToolPaths(resolvedName, JSON.parse(call.arguments || "{}"), getWorkspaceRoot());
 				} catch {
 					// Truncated/invalid args JSON (common on very large edits). Executing
 					// with {} would call tools with missing params — fail the call instead.
 					badArgs = true;
 				}
 				// MCP tools share CallMcpTool budget when no per-name override.
-				const tMs = call.name.startsWith("mcp__")
+				const tMs = resolvedName.startsWith("mcp__")
 					? toolTimeoutMs("CallMcpTool")
-					: toolTimeoutMs(call.name);
+					: toolTimeoutMs(resolvedName);
 				// Shell foreground expiry backgrounds the command; it is not the tool's
 				// hard timeout. Keep the outer safety budget so cleanup can return smoothly.
 				let timeoutMs = tMs > 0 ? tMs : undefined;
@@ -874,11 +1011,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				emit({
 					type: "tool-call-started",
 					callId: call.id,
-					name: call.name,
+					name: resolvedName,
 					input,
 					timeoutMs,
 				});
-				return { call, input, badArgs, timeoutMs };
+				return { call, input, badArgs, timeoutMs, resolvedName };
 			});
 
 			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; image?: { mime: string; base64: string } }>(parsed.length);
@@ -903,17 +1040,28 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			};
 
 			const exec = async (i: number) => {
-				const { call, input, badArgs } = parsed[i];
+				const { call, input, badArgs, resolvedName } = parsed[i];
 				if (badArgs) {
+					// TodoWrite/Read with truncated JSON: don't error, just skip.
+					// The model's text response is still valid and should be displayed.
+					// Erroring here causes red X in UI and stops processing.
+					if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
+						results[i] = {
+							status: "completed",
+							output: resolvedName === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first to create a structured task list." : "(todos: skipped due to truncated input)",
+						};
+						finishUi(i);
+						return;
+					}
 					results[i] = {
 						status: "error",
-						output: `error: tool arguments were not valid JSON (likely truncated — the payload was too large). Retry with a smaller edit: split the change into multiple smaller ${call.name} calls.`,
+						output: `error: tool arguments were not valid JSON (likely truncated — the payload was too large). Retry with a smaller edit: split the change into multiple smaller ${resolvedName} calls.`,
 					};
 					finishUi(i);
 					return;
 				}
 				// MCP tool dispatch (same hard timeout + countdown as built-ins).
-				if (call.name.startsWith("mcp__")) {
+				if (resolvedName.startsWith("mcp__")) {
 					if (!isAgentic() || isCoordinator()) {
 						// MCP tools may mutate; only allow in agentic modes. Multitask is a
 						// coordinator and must delegate MCP work to subagents.
@@ -983,42 +1131,42 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 					return;
 				}
-				const tool = TOOLS[call.name];
-				if (!tool || disabledToolNames.has(call.name)) {
+				let tool = TOOLS[resolvedName];
+				if (!tool || disabledToolNames.has(resolvedName)) {
 					results[i] = { status: "error", output: `unknown or disabled tool: ${call.name}` };
 					return;
 				}
 				// Multitask/project are coordinators: they can read/search/manage todos but
 				// must never mutate files or the shell — delegate that to a subagent.
-				if (isCoordinator() && !MULTITASK_TOOLS.has(call.name)) {
+				if (isCoordinator() && !MULTITASK_TOOLS.has(resolvedName)) {
 					results[i] = {
 						status: "error",
-						output: `tool ${call.name} not allowed in ${mode} mode — delegate file/shell edits to a background subagent with the Task tool.`,
+						output: `tool ${resolvedName} not allowed in ${mode} mode — delegate file/shell edits to a background subagent with the Task tool.`,
 					};
 					return;
 				}
-				if (!isAgentic() && !allowedNamesFor().has(call.name)) {
-					results[i] = { status: "error", output: `tool ${call.name} not allowed in ${mode} mode` };
+				if (!isAgentic() && !allowedNamesFor().has(resolvedName)) {
+					results[i] = { status: "error", output: `tool ${resolvedName} not allowed in ${mode} mode` };
 					return;
 				}
 				// Approval gate: every policy-covered action consults the approver, which
 				// resolves the per-type policy (allow silently / ask / deny) itself.
-				const isEditTool = EDIT_TOOLS.has(call.name);
+				const isEditTool = EDIT_TOOLS.has(resolvedName);
 				// Per-call action type: also gates ungated tools (e.g. Read) when they
 				// target paths outside the workspace.
-				const needsApproval = actionTypeForCall(call.name, input, getWorkspaceRoot()) !== undefined;
+				const needsApproval = actionTypeForCall(resolvedName, input, getWorkspaceRoot()) !== undefined;
 				if (needsApproval && approve) {
-					const approval = await approve(call.name, input, call.id);
+					const approval = await approve(resolvedName, input, call.id);
 					if (approval !== true) {
 						const denied = approval && typeof approval === "object"
 							? `user denied/blocked "${approval.blockedSubject}"`
-							: `user denied ${call.name}`;
+							: `user denied ${resolvedName}`;
 						results[i] = { status: "error", output: `${denied}; try a different approach or ask the user` };
 						return;
 					}
 				}
 				// beforeShell hook (may veto).
-				if (call.name === "Shell" && onBeforeShell) {
+				if (resolvedName === "Shell" && onBeforeShell) {
 					const veto = await onBeforeShell(String(input?.command ?? ""));
 					if (veto) {
 						results[i] = { status: "error", output: `blocked by hook: ${veto}` };
@@ -1026,7 +1174,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 				}
 				// beforeReadFile hook (may veto).
-				if (call.name === "Read") {
+				if (resolvedName === "Read") {
 					const veto = await onHook?.("beforeReadFile", { path: String(input?.path ?? "") });
 					if (veto) {
 						results[i] = { status: "error", output: `blocked by hook: ${veto}` };
@@ -1036,7 +1184,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				try {
 					// Per-tool hard timeout + linked abort. On timeout: kill immediately
 					// and settle UI — never leave the card spinning "Working".
-					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs(call.name);
+					const limitMs = parsed[i].timeoutMs ?? toolTimeoutMs(resolvedName);
 					const toolAc = new AbortController();
 					const killTool = () => {
 						try { toolAc.abort(); } catch { /* ignore */ }
@@ -1049,7 +1197,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					emit({
 						type: "tool-call-started",
 						callId: call.id,
-						name: call.name,
+						name: resolvedName,
 						input,
 						timeoutMs: limitMs > 0 ? limitMs : undefined,
 						startedAt: Date.now(),
@@ -1063,15 +1211,20 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						r = await withToolTimeout(
 							Promise.resolve().then(() => tool.execute(input, toolAc.signal, call.id, toolCtx)),
 							limitMs,
-							call.name,
+							resolvedName,
 							() => {
 								timedOut = true;
 								killTool();
 								// Immediate UI settle on timeout — don't wait for tool cleanup.
-								results[i] = {
-									status: "error",
-									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
-								};
+								// TodoWrite/Read: use "completed" to avoid red X in UI.
+								if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
+									results[i] = { status: "completed", output: "(todos: timeout)" };
+								} else {
+									results[i] = {
+										status: "error",
+										output: `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+									};
+								}
 								finishUi(i);
 							},
 							// Also settle when UI cancelSubagent aborts (countdown-0), not only wall timer.
@@ -1079,24 +1232,35 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						);
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
-						logError("tool.execute", e, { tool: call.name, callId: call.id });
+						logError("tool.execute", e, { tool: resolvedName, callId: call.id });
 						try { toolAc.abort(); } catch { /* ignore */ }
 						const isTo = timedOut || msg.startsWith("timeout:") || msg.startsWith("aborted:");
-						r = {
-							output: isTo
-								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
-								: `error: ${msg}`,
-						};
+						// TodoWrite/Read: abort or timeout should NOT produce error status.
+						// The red X in UI stops processing. Return success instead.
+						if (isTo && (resolvedName === "TodoWrite" || resolvedName === "TodoRead")) {
+							r = { output: resolvedName === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first." : "(todos: skipped)" };
+						} else {
+							r = {
+								output: isTo
+									? `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
+									: `error: ${msg}`,
+							};
+						}
 					} finally {
 						signal.removeEventListener("abort", onParentAbort);
 					}
 					// Timeout path already set results + finishUi; don't overwrite with a late success.
 					if (timedOut || completedUi.has(i)) {
 						if (!results[i]) {
-							results[i] = {
-								status: "error",
-								output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
-							};
+							// TodoWrite/Read: don't error on abort/timeout — red X stops processing
+							if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
+								results[i] = { status: "completed", output: r?.output || "(todos: skipped)" };
+							} else {
+								results[i] = {
+									status: "error",
+									output: `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`,
+								};
+							}
 						}
 						finishUi(i);
 						return;
@@ -1110,8 +1274,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// Immediate UI settle (especially on timeout) — do not wait for siblings.
 					finishUi(i);
 				} catch (e) {
-					logError("tool.lifecycle", e, { tool: call.name, callId: call.id });
-					results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };
+					logError("tool.lifecycle", e, { tool: resolvedName, callId: call.id });
+					// TodoWrite/Read: use "completed" to avoid red X in UI
+					if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
+						results[i] = { status: "completed", output: "(todos: error)" };
+					} else {
+						results[i] = { status: "error", output: `error: ${e instanceof Error ? e.message : String(e)}` };
+					}
 					finishUi(i);
 				}
 			};
@@ -1124,7 +1293,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// Guarantee UI settles even if a branch forgot finishUi.
 					if (results[i]) finishUi(i);
 					else {
-						results[i] = { status: "error", output: "error: tool produced no result" };
+						// TodoWrite/Read: use "completed" to avoid red X in UI
+						const isTodo = parsed[i].call.name === "TodoWrite" || parsed[i].call.name === "TodoRead";
+						results[i] = { status: isTodo ? "completed" : "error", output: isTodo ? "(todos: no result)" : "error: tool produced no result" };
 						finishUi(i);
 					}
 				}
@@ -1162,14 +1333,56 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			for (let i = 0; i < parsed.length; i++) {
 				const { call } = parsed[i];
+				const resolvedName = parsed[i].resolvedName;
 				const r = results[i] ?? { status: "error" as const, output: "error: tool produced no result" };
-				if (call.name === "WritePlan" && r.status === "completed") {
+				if (resolvedName === "WritePlan" && r.status === "completed") {
 					planWritten = true;
+				}
+				if (resolvedName === "TodoWrite" && r.status === "completed") {
+					hasCalledTodoWrite = true;
+				}
+				if (resolvedName === "Task") {
+					taskCallCount++;
+				}
+				// CRITICAL: If model calls TodoRead but there are no todos,
+				// force it to call TodoWrite first.
+				if (resolvedName === "TodoRead" && toolCtx.todos.length === 0 && nudgeCount < MAX_NUDGES) {
+					nudgeCount++;
+					pushSystemNote(
+						`CRITICAL: You called TodoRead but no todo list exists. ` +
+						`You MUST call TodoWrite NOW to create a structured task list. ` +
+						`List ALL the work that needs to be done, then work through each item systematically. ` +
+						`Do NOT proceed without a todo list.`
+					);
 				}
 				// Durable ledger backs the flat-cost <task_state> block; history itself
 				// keeps full tool results until auto-summarize / budget trim.
-				ledger.record(call.name, parsed[i].input, r.status, r.output);
-				pushHistory({ kind: "tool-result", callId: call.id, name: call.name, output: r.output, status: r.status, image: r.image });
+				ledger.record(resolvedName, parsed[i].input, r.status, r.output);
+				pushHistory({ kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, image: r.image });
+			}
+			// CRITICAL: After processing tool results, check if model called Task
+			// multiple times without creating a todo list. If so, force it to plan.
+			if (isAgentic() && !hasCalledTodoWrite && taskCallCount >= TASK_WITHOUT_TODO_LIMIT && nudgeCount < MAX_NUDGES) {
+				nudgeCount++;
+				pushSystemNote(
+					`CRITICAL: You have called Task/explore ${taskCallCount} times but have NOT created a todo list. ` +
+					`You MUST stop exploring and create a structured plan using TodoWrite. ` +
+					`List ALL the work that needs to be done, then work through each item systematically. ` +
+					`Do NOT launch more subagents until you have a todo list.`
+				);
+				continue;
+			}
+			// CRITICAL: After processing tool results, check if no todos exist
+			// and model has been running for 2+ turns. Force todo creation.
+			if (isAgentic() && !hasCalledTodoWrite && toolCtx.todos.length === 0 && step >= 2 && nudgeCount < MAX_NUDGES) {
+				nudgeCount++;
+				pushSystemNote(
+					`IMPORTANT: You have not created a todo list yet. ` +
+					`For complex tasks, you MUST first call TodoWrite to create a structured task list, ` +
+					`then work through each item systematically using the available tools. ` +
+					`Do NOT just describe what you will do — create the todo list and start working.`
+				);
+				continue;
 			}
 			// After launching background Task(s), wait for that wave before calling the
 			// model again. Otherwise the next turn (or empty-turn / todo nudge) races
@@ -1226,8 +1439,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		try { emit({ type: "error", message: e instanceof Error ? e.message : String(e) }); } catch { /* ignore */ }
 		emitSettled("error");
 	} finally {
-		// Force-mark any still-unsettled bg slots so we never hang a follow-up wait.
-		if (signal.aborted || !settledEmitted) {
+		// Force-mark unsettled bg subagents ONLY when the user cancelled (abort).
+		// When run finishes normally, let subagents continue — their results
+		// will be delivered via emit and the model can process them on next run.
+		if (signal.aborted) {
 			for (let i = bgReported; i < bgSubagents.length; i++) {
 				if (bgSettled[i] === undefined) bgSettled[i] = { title: "subagent", text: "(cancelled)" };
 			}

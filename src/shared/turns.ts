@@ -493,7 +493,10 @@ export function forceSettleOpenWork(turns: Turn[], reason: "cancelled" | "error"
         let next: ToolBlock = b;
         if (b.status === "running") {
           changed = true;
-          next = { ...next, status: "error", result: b.result || msg };
+          // TodoWrite/Read: use "completed" instead of "error" to avoid red X
+          const isTodo = b.name === "TodoWrite" || b.name === "TodoRead"
+            || b.name === "todo_write" || b.name === "todo_read";
+          next = { ...next, status: isTodo ? "completed" as const : "error" as const, result: b.result || (isTodo ? "(todos: cancelled)" : msg) };
         }
         const isTask = b.name === "Task" || b.name === "task";
         if (b.subStatus === "running" || (next.status === "error" && isTask && !b.subStatus)) {

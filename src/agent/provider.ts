@@ -10,8 +10,14 @@
 import { ProviderEvent, ToolCall, ToolSchema, WireMessage, WireContentPart } from "./types";
 import { streamOAuthChat, type OAuthKind } from "./oauth";
 import type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
+import { MODEL_CATALOG } from "../stores/featureStore";
 
 export type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
+
+/** Strip trailing slashes from a base URL to avoid double-slash in constructed paths. */
+function normalizeBaseUrl(url: string): string {
+  return url.replace(/\/+$/, "");
+}
 
 function applyOpenAISampling(body: Record<string, unknown>, s?: SamplingParams) {
   if (!s) return;
@@ -136,8 +142,21 @@ export async function listModels(apiBaseUrl: string, apiKey: string, anthropic?:
     : apiKey
     ? { authorization: `Bearer ${apiKey}` }
     : {};
-  const r = await fetch(`${apiBaseUrl}/models`, { headers });
+  const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/models`, { headers });
   if (!r.ok) {
+    // Anthropic's official API does not expose a /models endpoint (404 expected).
+    // MIMO (xiaomimimo.com) may also 404 on /models depending on the plan/region.
+    // Fall back to the hardcoded catalog so these providers still work.
+    if (useAnthropic || /xiaomimimo\.com/i.test(apiBaseUrl)) {
+      const kind = useAnthropic ? "anthropic" : "mimo";
+      return MODEL_CATALOG
+        .filter((m) => {
+          const kinds = Array.isArray(m.kind) ? m.kind : [m.kind];
+          return kinds.includes(kind);
+        })
+        .map((m) => ({ id: m.id }))
+        .sort((a, b) => a.id.localeCompare(b.id));
+    }
     throw new Error(`models ${r.status}: ${await r.text()}`);
   }
   const d = (await r.json()) as { data?: { id: string }[] };
@@ -156,11 +175,11 @@ export class ChatHTTPError extends Error {
   }
 }
 
-/** Transient if: no status (network/DNS/timeout), 408/425/429, or any 5xx. */
+/** Transient if: no status (network/DNS/timeout), 408/425/429/499, or any 5xx. */
 export function isRetryableError(e: unknown): boolean {
   if (e instanceof DOMException && e.name === "AbortError") return false;
   if (e instanceof ChatHTTPError) {
-    return e.status === 408 || e.status === 425 || e.status === 429 || e.status >= 500;
+    return e.status === 408 || e.status === 425 || e.status === 429 || e.status === 499 || e.status >= 500;
   }
   // fetch network failures (TypeError "Failed to fetch", ECONNRESET, etc.) are retryable.
   return true;
@@ -184,7 +203,7 @@ async function* streamWithRetry(
   make: () => AsyncGenerator<ProviderEvent>,
   signal: AbortSignal,
   onRetry?: (attempt: number, max: number, delayMs: number, error: string) => void,
-  maxAttempts = 3,
+  maxAttempts = 5,
 ): AsyncGenerator<ProviderEvent> {
   for (let attempt = 1; ; attempt++) {
     // Stream live. Retry is only safe before the first event is emitted — once we
@@ -204,7 +223,7 @@ async function* streamWithRetry(
       if (emitted || attempt >= maxAttempts || !isRetryableError(e)) {
         throw e;
       }
-      const delay = Math.min(1000 * 2 ** (attempt - 1), 8000);
+      const delay = Math.min(1000 * 2 ** (attempt - 1), 30000);
       onRetry?.(attempt, maxAttempts, delay, e instanceof Error ? e.message : String(e));
       await sleep(delay, signal);
     }
@@ -307,7 +326,7 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
   }
   if (anthropic ?? isAnthropic(apiBaseUrl)) {
     // Force a tool call so the model returns a structured { title } object.
-    const r = await fetch(`${apiBaseUrl}/messages`, {
+    const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/messages`, {
       method: "POST",
       headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
       body: JSON.stringify({
@@ -327,7 +346,7 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
   }
   const msgs = [{ role: "system", content: sys }, { role: "user", content: prompt }];
   const call = async (body: Record<string, unknown>) => {
-    const r = await fetch(`${apiBaseUrl}/chat/completions`, {
+    const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/chat/completions`, {
       method: "POST",
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
       body: JSON.stringify({ ...body, stream: false }),
@@ -427,7 +446,7 @@ export async function pickModel(apiBaseUrl: string, apiKey: string, judge: strin
     return lines.length ? lines[lines.length - 1] : text.trim();
   }
   if (useAnthropic) {
-    const r = await fetch(`${apiBaseUrl}/messages`, {
+    const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/messages`, {
       method: "POST",
       headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
       body: JSON.stringify({ model: judge, system: sys, messages: [{ role: "user", content: prompt }], max_tokens: 24 }),
@@ -436,7 +455,7 @@ export async function pickModel(apiBaseUrl: string, apiKey: string, judge: strin
     const d: any = await r.json();
     return String(d?.content?.[0]?.text ?? "").trim();
   }
-  const r = await fetch(`${apiBaseUrl}/chat/completions`, {
+  const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/chat/completions`, {
     method: "POST",
     headers: { ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}), "content-type": "application/json" },
     body: JSON.stringify({ model: judge, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }], max_tokens: 24, temperature: 0 }),
@@ -467,7 +486,7 @@ export function streamChat(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> 
     throw new Error("API Key not set");
   }
   const make = () => (useAnthropic ? streamAnthropic(opts) : streamOpenAI(opts));
-  return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3);
+  return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 10);
 }
 
 async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
@@ -492,7 +511,7 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
     body.tool_choice = "auto";
   }
 
-  const r = await fetch(`${opts.apiBaseUrl}/chat/completions`, {
+  const r = await fetch(`${normalizeBaseUrl(opts.apiBaseUrl)}/chat/completions`, {
     method: "POST",
     headers: {
       ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
@@ -503,7 +522,12 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
   });
   if (!r.ok || !r.body) {
     const detail = await r.text().catch(() => "");
-    throw new ChatHTTPError(r.status, `chat ${r.status}: ${detail.slice(0, 500)}`);
+    // Strip HTML wrappers from providers (e.g. openresty) that embed errors in <html> tags.
+    const clean = detail.replace(/<html[\s\S]*<\/html>/gi, "").trim() || detail;
+    const hint = r.status === 404 && /xiaomimimo\.com/i.test(opts.apiBaseUrl)
+      ? " (MIMO: verify your Base URL and API Key at https://platform.xiaomimimo.com)"
+      : "";
+    throw new ChatHTTPError(r.status, `chat ${r.status}${hint}: ${clean.slice(0, 500)}`);
   }
 
   const toolAcc: Record<number, { id: string; name: string; args: string }> = {};
@@ -717,7 +741,7 @@ async function* streamAnthropic(opts: {
   if (opts.modelParams?.maxContext === "1m" && needsContext1mBeta(opts.model)) {
     betas.push("context-1m-2025-08-07");
   }
-  const r = await fetch(`${opts.apiBaseUrl}/messages`, {
+  const r = await fetch(`${normalizeBaseUrl(opts.apiBaseUrl)}/messages`, {
     method: "POST",
     headers: {
       "x-api-key": opts.apiKey,

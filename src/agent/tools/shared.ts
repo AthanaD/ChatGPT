@@ -273,7 +273,9 @@ export function slugify(s: string): string {
       .toLowerCase()
       .replace(/[^a-z0-9]+/g, "-")
       .replace(/^-+|-+$/g, "")
-      .slice(0, 60) || "plan"
+      .slice(0, 60)
+      .replace(/-+$/, "") // remove trailing dashes after truncation
+      || "plan"
   );
 }
 
