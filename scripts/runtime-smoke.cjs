@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 Pawan Osman <https://github.com/PawanOsman>
+ *
+ * This file is part of OpenCursor — AI coding agent chat inside VS Code.
+ * https://github.com/PawanOsman/OpenCursor
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
 // Run real Read(PDF) and native initialization from an isolated CJS build with
 // the production host options. No checkout node_modules are visible to it.
 const fs = require('node:fs/promises');

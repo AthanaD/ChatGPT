@@ -1,3 +1,12 @@
+/*
+ * Copyright (c) 2026 Pawan Osman <https://github.com/PawanOsman>
+ *
+ * This file is part of OpenCursor — AI coding agent chat inside VS Code.
+ * https://github.com/PawanOsman/OpenCursor
+ *
+ * Licensed under the MIT License. See LICENSE file in the project root.
+ */
+
 import type { ProviderEvent } from "../types";
 
 /** Most streaming APIs report cumulative counters; emit each billed token once. */

@@ -1,4 +1,3 @@
-import { parseTodos } from "../../../src/shared/todoPresentation";
 /*
  * Copyright (c) 2026 Pawan Osman <https://github.com/PawanOsman>
  *
@@ -8,6 +7,7 @@ import { parseTodos } from "../../../src/shared/todoPresentation";
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
+import { parseTodos } from "../../../src/shared/todoPresentation";
 import * as React from "react";
 import { Icon, IconName } from "../../shared/icons";
 import { basename, renderMarkdown } from "../../shared/markdown";
