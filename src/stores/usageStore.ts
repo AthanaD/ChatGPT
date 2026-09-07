@@ -25,6 +25,20 @@ export interface ModelUsage {
 
 const KEY = "ocursor.usage";
 let ctx: vscode.ExtensionContext | undefined;
+const listeners = new Set<(usage: Record<string, ModelUsage>) => void>();
+
+/** Push committed changes to settings panels already open. */
+export function onUsageChanged(listener: (usage: Record<string, ModelUsage>) => void): () => void {
+	listeners.add(listener);
+	return () => { listeners.delete(listener); };
+}
+
+function notifyUsageChanged(): void {
+	const usage = getUsage();
+	for (const listener of listeners) {
+		try { listener(usage); } catch { /* a disposed view must not fail persistence */ }
+	}
+}
 
 export function initUsage(context: vscode.ExtensionContext) {
 	ctx = context;
@@ -47,7 +61,7 @@ const seenRequests = new Set<string>();
 export function recordUsage(model: string, promptTokens = 0, completionTokens = 0, metadata: UsageMetadata = {}): Promise<void> {
 	const update = writes.catch(() => {}).then(async () => {
 		if (!ctx || !model) return;
-		const all = getUsage();
+		const all = { ...getUsage() };
 		const u = all[model] ?? { promptTokens: 0, completionTokens: 0, requests: 0, lastUsed: 0 };
 		const requestKey = metadata.requestId ? `${model}/${metadata.requestId}` : undefined;
 		const newRequest = !requestKey || !seenRequests.has(requestKey);
@@ -65,6 +79,7 @@ export function recordUsage(model: string, promptTokens = 0, completionTokens = 
 			lastUsed: Date.now(),
 		};
 		await ctx.globalState.update(KEY, all);
+		notifyUsageChanged();
 		if (requestKey) {
 			seenRequests.add(requestKey);
 			if (seenRequests.size > 10000) seenRequests.delete(seenRequests.values().next().value!);
@@ -76,9 +91,18 @@ export function recordUsage(model: string, promptTokens = 0, completionTokens = 
 
 export function resetUsage(): Promise<void> {
 	const reset = writes.catch(() => {}).then(async () => {
-		await ctx?.globalState.update(KEY, undefined);
+		if (!ctx) throw new Error("Usage storage is not initialized. Reload OpenCursor and try again.");
+		await ctx.globalState.update(KEY, undefined);
 		seenRequests.clear();
+		notifyUsageChanged();
 	});
 	writes = reset;
 	return reset;
+}
+
+
+/** Wait for already queued writes before reading the current persisted snapshot. */
+export async function flushUsage(): Promise<void> {
+	await writes.catch(() => {});
+	if (!ctx) throw new Error("Usage storage is not initialized. Reload OpenCursor and try again.");
 }

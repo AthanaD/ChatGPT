@@ -9,7 +9,7 @@
 
 import { beforeEach, expect, it, vi } from "vitest";
 vi.mock("vscode", () => ({}));
-import { getUsage, initUsage, recordUsage, resetUsage } from "./usageStore";
+import { getUsage, initUsage, recordUsage, resetUsage, flushUsage, onUsageChanged } from "./usageStore";
 import { UsageTracker } from "../agent/provider/usage";
 beforeEach(async () => {
   const state = new Map();
@@ -50,4 +50,46 @@ it("separates unknown inputs, late zero-cache details, and independently billed 
   expect(getUsage().model).toMatchObject({ promptTokens: 190, completionTokens: 8, requests: 3, cachedReadTokens: 30, cacheReadInputTokens: 140 });
   expect(getUsage().model.cachedWriteTokens).toBeUndefined();
   expect(getUsage().model.promptTokens - getUsage().model.cacheReadInputTokens!).toBe(50);
+});
+
+
+it("refresh waits for queued records and reset preserves only subsequent activity", async () => {
+  const previous = recordUsage("before-reset", 100, 5, { requestId: "first" });
+  await flushUsage();
+  expect(getUsage()["before-reset"].promptTokens).toBe(100);
+  await previous;
+  const clearing = resetUsage();
+  const next = recordUsage("after-reset", 10, 2, { requestId: "next" });
+  await Promise.all([clearing, next]);
+  expect(getUsage()).toEqual({ "after-reset": expect.objectContaining({ promptTokens: 10, completionTokens: 2, requests: 1 }) });
+});
+
+it("broadcasts committed records and resets, and stops after unsubscribe", async () => {
+  const listener = vi.fn();
+  const unsubscribe = onUsageChanged(listener);
+  try {
+    const writing = recordUsage("model", 25, 2);
+    expect(listener).not.toHaveBeenCalled();
+    await writing;
+    expect(listener).toHaveBeenLastCalledWith({ model: expect.objectContaining({ promptTokens: 25 }) });
+    await resetUsage();
+    expect(listener).toHaveBeenLastCalledWith({});
+    unsubscribe();
+    await recordUsage("model", 5, 1);
+    expect(listener).toHaveBeenCalledTimes(2);
+  } finally { unsubscribe(); }
+});
+
+it("does not mutate persisted usage or broadcast success when saving fails", async () => {
+  const saved = { model: { promptTokens: 100, completionTokens: 5, requests: 1, lastUsed: 1 } };
+  initUsage({ globalState: { get: () => saved, update: async () => { throw new Error("Disk unavailable"); } } } as any);
+  const listener = vi.fn();
+  const unsubscribe = onUsageChanged(listener);
+  try {
+    await expect(recordUsage("model", 5, 2)).rejects.toThrow("Disk unavailable");
+    expect(saved.model.promptTokens).toBe(100);
+    await expect(resetUsage()).rejects.toThrow("Disk unavailable");
+    expect(getUsage()).toBe(saved);
+    expect(listener).not.toHaveBeenCalled();
+  } finally { unsubscribe(); }
 });

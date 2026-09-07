@@ -703,6 +703,46 @@ function firstOfKind(kind: OAuthKind): OAuthAccount | undefined {
 
 // ---- Usage limits ----
 
+const QUOTA_TIMEOUT_MS = 20_000;
+
+/** One deadline covers credential/project waits, transport, and response-body reads. */
+async function quotaOperation<T>(label: string, parent: AbortSignal | undefined, work: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  const controller = new AbortController();
+  const cancel = () => controller.abort(new DOMException(`${label} cancelled`, "AbortError"));
+  const timer = setTimeout(() => controller.abort(new DOMException(`${label} timed out after 20 seconds`, "TimeoutError")), QUOTA_TIMEOUT_MS);
+  timer.unref?.();
+  if (parent?.aborted) cancel();
+  else parent?.addEventListener("abort", cancel, { once: true });
+  try {
+    controller.signal.throwIfAborted();
+    // Shared token refresh/project discovery has its own deadline and may still
+    // serve other callers; cancelling this view stops its wait, not that work.
+    return await waitForAccount(Promise.resolve().then(() => {
+      controller.signal.throwIfAborted();
+      return work(controller.signal);
+    }), controller.signal);
+  } finally {
+    clearTimeout(timer);
+    parent?.removeEventListener("abort", cancel);
+  }
+}
+
+async function quotaJson(response: Response, label: string, signal?: AbortSignal): Promise<any> {
+  if (!response.ok) {
+    await response.body?.cancel().catch(() => {});
+    throw new Error(`${label} HTTP ${response.status}`);
+  }
+  try {
+    const data: unknown = await waitForAccount(response.json(), signal);
+    if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Expected an object");
+    return data;
+  } catch (error) {
+    signal?.throwIfAborted();
+    if (error instanceof SyntaxError) throw new Error(`${label} returned an invalid JSON response`);
+    throw new Error(`${label} response could not be read`);
+  }
+}
+
 /** Parse a reset value (epoch s/ms or ISO string) into epoch ms. */
 function parseResetMs(v: unknown): number | undefined {
   if (v == null) return undefined;
@@ -715,20 +755,25 @@ function parseResetMs(v: unknown): number | undefined {
   return undefined;
 }
 
-export async function getAccountLimits(id: string): Promise<OAuthUsage> {
-  const acc = accounts.get(id);
-  if (!acc) return { limits: [] };
-  const fresh = await validAccount(id);
-  if (fresh.kind === "claude-code") return { limits: await getClaudeLimits(fresh) };
-  if (fresh.kind === "antigravity") return { limits: await getAntigravityLimits(fresh) };
-  return getCodexUsage(fresh);
+export async function getAccountLimits(id: string, signal?: AbortSignal): Promise<OAuthUsage> {
+  return quotaOperation("Quota refresh", signal, async deadline => {
+    const fresh = await waitForAccount(validAccount(id), deadline);
+    deadline.throwIfAborted();
+    if (!accounts.has(id)) throw new Error(`Account ${id} is no longer connected`);
+    const usage = fresh.kind === "claude-code" ? { limits: await getClaudeLimits(fresh, deadline) }
+      : fresh.kind === "antigravity" ? { limits: await getAntigravityLimits(fresh, deadline) }
+      : await getCodexUsage(fresh, deadline);
+    // A response for an account removed while the request ran must not become
+    // a fresh quota snapshot in the settings panel's cache.
+    if (!accounts.has(id)) throw new Error(`Account ${id} is no longer connected`);
+    return usage;
+  });
 }
 
 // Claude Code usage: % utilization per rolling window (5h + weekly).
-async function getClaudeLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
-  const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTHROPIC.usageUrl, init: { method: "GET", headers: claudeOAuthHeaders(fresh.accessToken) } }));
-  if (!r.ok) throw new Error(`Claude usage ${r.status}`);
-  const d: any = await r.json();
+async function getClaudeLimits(acc: OAuthAccount, signal?: AbortSignal): Promise<OAuthLimit[]> {
+  const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTHROPIC.usageUrl, init: { method: "GET", headers: claudeOAuthHeaders(fresh.accessToken) } }), signal);
+  const d = await quotaJson(r, "Claude usage", signal);
   const out: OAuthLimit[] = [];
   const win = (w: any, label: string) => {
     if (!w || typeof w.utilization !== "number") return;
@@ -743,10 +788,9 @@ async function getClaudeLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
 }
 
 // Codex usage: rate_limit primary/secondary windows + available reset credits.
-async function getCodexUsage(acc: OAuthAccount): Promise<OAuthUsage> {
-  const r = await oauthFetch(acc.id, (fresh) => ({ url: "https://chatgpt.com/backend-api/wham/usage", init: { method: "GET", headers: codexHeaders(fresh) } }));
-  if (!r.ok) throw new Error(`Codex usage ${r.status}`);
-  const d: any = await r.json();
+async function getCodexUsage(acc: OAuthAccount, signal?: AbortSignal): Promise<OAuthUsage> {
+  const r = await oauthFetch(acc.id, (fresh) => ({ url: "https://chatgpt.com/backend-api/wham/usage", init: { method: "GET", headers: codexHeaders(fresh) } }), signal);
+  const d = await quotaJson(r, "Codex usage", signal);
   const rl = d.rate_limit ?? d.rate_limits ?? d.rate_limits_by_limit_id?.codex ?? d;
   const limits: OAuthLimit[] = [];
   const win = (w: any, label: string) => {
@@ -761,31 +805,58 @@ async function getCodexUsage(acc: OAuthAccount): Promise<OAuthUsage> {
 }
 
 /** Spend one Codex rate-limit reset credit (irreversible). Returns true on success. */
-export async function consumeCodexResetCredit(id: string): Promise<{ ok: boolean; message?: string }> {
+export async function consumeCodexResetCredit(id: string, signal?: AbortSignal): Promise<{ ok: boolean; message?: string }> {
   const acc = accounts.get(id);
-  if (!acc || acc.kind !== "codex") return { ok: false, message: "Not a Codex account" };
-  const fresh = await validAccount(id);
-  const redeemId = crypto.randomUUID();
-  const r = await fetch("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume", {
-    method: "POST",
-    headers: codexHeaders(fresh),
-    body: JSON.stringify({ redeem_request_id: redeemId }),
-  });
-  const text = await r.text();
-  const d: any = text ? JSON.parse(text) : null;
-  const ok = r.ok && (d?.code === "reset" || Number(d?.windows_reset ?? 0) > 0);
-  return { ok, message: d?.message || (d?.code === "no_credit" ? "No reset credits available" : undefined) };
+  if (!acc) return { ok: false, message: "This account is no longer connected" };
+  if (acc.kind !== "codex") return { ok: false, message: "Not a Codex account" };
+  let dispatched = false;
+  try {
+    return await quotaOperation("Codex reset credit", signal, async deadline => {
+      await waitForAccount(validAccount(id), deadline);
+      deadline.throwIfAborted();
+      const fresh = accounts.get(id);
+      if (!fresh || fresh.kind !== "codex") throw new Error(`Account ${id} is no longer connected`);
+      const redeemId = crypto.randomUUID();
+      // This mutation is deliberately sent once. Never use the oauthFetch
+      // 401 replay path or retry an ambiguous network/body failure here.
+      dispatched = true;
+      const r = await fetch("https://chatgpt.com/backend-api/wham/rate-limit-reset-credits/consume", {
+        method: "POST",
+        headers: codexHeaders(fresh),
+        body: JSON.stringify({ redeem_request_id: redeemId }),
+        signal: deadline,
+      });
+      const text = await waitForAccount(r.text(), deadline);
+      let data: any;
+      try { data = text ? JSON.parse(text) : null; }
+      catch {
+        if (!r.ok) return { ok: false, message: `Codex reset credit HTTP ${r.status}` };
+        throw new Error("Codex reset credit returned an invalid JSON response");
+      }
+      const message = typeof data?.message === "string" ? data.message.slice(0, 500) : undefined;
+      if (!r.ok) return { ok: false, message: `Codex reset credit HTTP ${r.status}${message ? `: ${message}` : ""}` };
+      if (!data || typeof data !== "object" || Array.isArray(data)) throw new Error("Codex reset credit returned an empty or invalid response");
+      const windowsReset = Number(data.windows_reset ?? 0);
+      const ok = data.code === "reset" || Number.isFinite(windowsReset) && windowsReset > 0;
+      return { ok, message: message || (data.code === "no_credit" ? "No reset credits available"
+        : ok ? undefined : "The provider did not confirm a reset. Refresh usage before trying again.") };
+    });
+  } catch (error) {
+    if (!dispatched) throw error;
+    const failure = new Error(`${error instanceof Error ? error.message : "Codex reset credit failed"}. The request may have consumed a credit. Refresh usage before trying again.`);
+    failure.name = error instanceof Error ? error.name : "Error";
+    throw failure;
+  }
 }
 
 // Antigravity usage: per-model remainingFraction via fetchAvailableModels.
-async function getAntigravityLimits(acc: OAuthAccount): Promise<OAuthLimit[]> {
-  await ensureAntigravityProject(acc.id);
+async function getAntigravityLimits(acc: OAuthAccount, signal?: AbortSignal): Promise<OAuthLimit[]> {
+  await ensureAntigravityProject(acc.id, signal);
   const r = await oauthFetch(acc.id, (fresh) => ({ url: ANTIGRAVITY.quotaUrl, init: {
     method: "POST", headers: antigravityHeaders(fresh.accessToken, { purpose: "catalog" }),
     body: JSON.stringify({ project: fresh.projectId }),
-  } }));
-  if (!r.ok) throw new Error(`Antigravity usage ${r.status}`);
-  const d: any = await r.json();
+  } }), signal);
+  const d = await quotaJson(r, "Antigravity usage", signal);
   const out: OAuthLimit[] = [];
   for (const [key, info] of Object.entries<any>(d.models ?? {})) {
     if (!info?.quotaInfo || info.isInternal) continue;
