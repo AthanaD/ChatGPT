@@ -432,18 +432,23 @@ export const searchDocsTool = defineTool("SearchDocs", false, async (input) => {
   }
 
   const all: { doc: string; url: string; title: string; text: string; score: number }[] = [];
+  const failures: string[] = [];
   for (const d of targets) {
-    const hits = await searchDocs(d.id, query, k).catch(() => []);
-    for (const h of hits) all.push({ doc: d.name, ...h });
+    try {
+      const hits = await searchDocs(d.id, query, k);
+      for (const h of hits) all.push({ doc: d.name, ...h });
+    } catch (error) {
+      failures.push(`${d.name}: ${error instanceof Error ? error.message : String(error)}`);
+    }
   }
   all.sort((a, b) => b.score - a.score);
   const top = all.slice(0, k);
-  if (!top.length) return { output: "(no matching excerpts)" };
+  if (!top.length) return { output: failures.length ? `error: ${failures.join("; ")}` : "(no matching excerpts)" };
   const snip = (t: string) => (t.length > 1200 ? t.slice(0, 1200) + "\n... (trimmed)" : t);
   return {
     output: top
       .map((h) => `[${h.doc}] ${h.title} - ${h.url} (${h.score.toFixed(2)})\n${snip(h.text)}`)
-      .join("\n\n---\n\n"),
+      .join("\n\n---\n\n") + (failures.length ? `\n\nUnavailable sources: ${failures.join("; ")}` : ""),
   };
   } catch (e) {
     return { output: `error: SearchDocs failed: ${e instanceof Error ? e.message : String(e)}` };

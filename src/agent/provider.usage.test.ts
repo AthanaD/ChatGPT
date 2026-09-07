@@ -53,7 +53,7 @@ describe("Anthropic HTTP streamed usage", () => {
       { type: "message_delta", delta: { stop_reason: "end_turn" }, usage: { input_tokens: 35, output_tokens: 20 } },
     ]);
     const usage = events.filter((event) => event.type === "usage");
-    expect(usage.at(-1)).toEqual({ type: "usage", promptTokens: 25, completionTokens: 19, promptTokensTotal: 1035, completionTokensTotal: 20 });
+    expect(usage.at(-1)).toMatchObject({ type: "usage", promptTokens: 25, completionTokens: 19, promptTokensTotal: 1035, completionTokensTotal: 20, model: "claude-opus-5", requestId: expect.any(String) });
     // Reservation defaults and actual request construction share the same helper.
     const init = (fetch.mock.calls[0] as unknown as [string, RequestInit])[1];
     expect(JSON.parse(String(init.body)).max_tokens).toBe(65536);

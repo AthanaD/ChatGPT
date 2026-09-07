@@ -1,3 +1,5 @@
+import { writeTodos as todoWriteHandler } from "./todoState";
+import type { TodoItem, ToolContext } from "./types";
 /**
  * STRESS TESTS — TodoWrite must survive 5+ minutes of continuous use.
  * Simulates rapid-fire model calls, many items, truncated JSON, and
@@ -5,65 +7,11 @@
  */
 import { describe, it, expect } from "vitest";
 
-interface TodoItem { id?: string; content: string; status: "pending" | "in_progress" | "completed" | "cancelled"; }
-interface ToolContext { todos: TodoItem[]; }
-
-function todoWriteHandler(input: any, ctx: ToolContext): { output: string } {
-  try {
-    if (!ctx) return { output: "error: todo context unavailable" };
-    if (!Array.isArray(ctx.todos)) ctx.todos = [];
-    const incoming: TodoItem[] = Array.isArray(input?.todos) ? input.todos : [];
-    if (input?.merge) {
-      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
-      for (const t of incoming) {
-        if (t && typeof t === "object") {
-          const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-          byId.set(key, { ...byId.get(key), ...t, id: key });
-        }
-      }
-      ctx.todos = [...byId.values()];
-    } else if (incoming.length > 0) {
-      ctx.todos = incoming.filter((t) => t && typeof t === "object");
-    }
-    const render = ctx.todos
-      .map((t) => {
-        const mark = t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-        return `${mark} ${t.content || "unnamed"}`;
-      })
-      .join("\n");
-    return { output: render || "(no todos)" };
-  } catch (e) {
-    return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
-  }
-}
-
-function badArgsRecovery(callName: string): { status: string; output: string } {
-  if (callName === "TodoWrite" || callName === "TodoRead") {
-    return { status: "completed", output: callName === "TodoRead" ? "(no todos)" : "(todos: skipped due to truncated input)" };
-  }
-  return { status: "error", output: "error: tool arguments were not valid JSON" };
-}
-
-// ---- Loop simulation ----
-const CONSECUTIVE_TEXT_LIMIT = 2;
-interface SimState { step: number; consecutiveTextTurns: number; broke: boolean; brokeAt: string; }
-function createSimState(): SimState { return { step: 0, consecutiveTextTurns: 0, broke: false, brokeAt: "" }; }
-function simTurn(s: SimState, tools: string[]): SimState {
-  s.step++;
-  if (tools.length === 0) {
-    s.consecutiveTextTurns++;
-    if (s.consecutiveTextTurns >= CONSECUTIVE_TEXT_LIMIT) { s.broke = true; s.brokeAt = `step=${s.step}`; }
-  } else {
-    s.consecutiveTextTurns = 0;
-  }
-  return s;
-}
-
 // ==================== STRESS TESTS ====================
 
 describe("STRESS: 50-item todo lifecycle", () => {
   it("create 50 → mark all in_progress → mark all completed", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
 
     // Create 50 items (no id — Mimo style)
     const items = Array.from({ length: 50 }, (_, i) => ({
@@ -93,7 +41,7 @@ describe("STRESS: 50-item todo lifecycle", () => {
 
 describe("STRESS: 200 sequential TodoWrite calls", () => {
   it("200 rapid-fire calls without crash", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
     for (let i = 0; i < 200; i++) {
       const r = todoWriteHandler({
         todos: [{ content: `Rapid task ${i}`, status: i % 3 === 0 ? "completed" : i % 3 === 1 ? "in_progress" : "pending" }],
@@ -106,67 +54,9 @@ describe("STRESS: 200 sequential TodoWrite calls", () => {
   });
 });
 
-describe("STRESS: badArgs recovery", () => {
-  it("TodoWrite with badArgs returns completed, not error", () => {
-    const r = badArgsRecovery("TodoWrite");
-    expect(r.status).toBe("completed");
-    expect(r.output).not.toContain("error:");
-    expect(r.output).toContain("(todos: skipped");
-  });
-
-  it("TodoRead with badArgs returns completed", () => {
-    const r = badArgsRecovery("TodoRead");
-    expect(r.status).toBe("completed");
-    expect(r.output).toBe("(no todos)");
-  });
-
-  it("Write with badArgs still returns error", () => {
-    const r = badArgsRecovery("Write");
-    expect(r.status).toBe("error");
-    expect(r.output).toContain("error:");
-  });
-
-  it("100 badArgs for TodoWrite — all completed", () => {
-    for (let i = 0; i < 100; i++) {
-      const r = badArgsRecovery("TodoWrite");
-      expect(r.status).toBe("completed");
-    }
-  });
-});
-
-describe("STRESS: loop never breaks with tools", () => {
-  it("200 steps of TodoWrite+Read — never breaks", () => {
-    let s = createSimState();
-    for (let i = 0; i < 200; i++) {
-      s = simTurn(s, ["TodoWrite", "Read"]);
-      expect(s.broke).toBe(false);
-    }
-    expect(s.step).toBe(200);
-    expect(s.consecutiveTextTurns).toBe(0);
-  });
-
-  it("200 steps of TodoWrite+Read+Write — never breaks", () => {
-    let s = createSimState();
-    for (let i = 0; i < 200; i++) {
-      s = simTurn(s, ["TodoWrite", "Read", "Write"]);
-      expect(s.broke).toBe(false);
-    }
-    expect(s.step).toBe(200);
-  });
-
-  it("200 steps of TodoWrite only — never breaks", () => {
-    let s = createSimState();
-    for (let i = 0; i < 200; i++) {
-      s = simTurn(s, ["TodoWrite"]);
-      expect(s.broke).toBe(false);
-    }
-    expect(s.step).toBe(200);
-  });
-});
-
 describe("STRESS: large payloads", () => {
   it("TodoWrite with 100 items, each 500 chars", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
     const items = Array.from({ length: 100 }, (_, i) => ({
       content: `Task ${i}: ${"Lorem ipsum dolor sit amet ".repeat(20)}`,
       status: "pending" as const,
@@ -178,7 +68,7 @@ describe("STRESS: large payloads", () => {
   });
 
   it("TodoWrite with 200 items", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
     const items = Array.from({ length: 200 }, (_, i) => ({
       content: `Task ${i}`,
       status: i % 2 === 0 ? "completed" as const : "pending" as const,
@@ -189,7 +79,7 @@ describe("STRESS: large payloads", () => {
   });
 
   it("TodoWrite with unicode content", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
     const items = [
       { content: "日本語テスト 🎌", status: "pending" as const },
       { content: "한국어 테스트 🇰🇷", status: "in_progress" as const },
@@ -205,7 +95,7 @@ describe("STRESS: large payloads", () => {
   });
 
   it("TodoWrite with special chars in content", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
     const items = [
       { content: 'Quote "test"', status: "pending" as const },
       { content: "Backslash \\path\\to\\file", status: "pending" as const },
@@ -221,7 +111,7 @@ describe("STRESS: large payloads", () => {
 
 describe("STRESS: interleaved operations", () => {
   it("create → add → remove → complete → repeat 50x", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
     for (let cycle = 0; cycle < 50; cycle++) {
       // Create
       todoWriteHandler({ todos: [{ content: `Cycle ${cycle}`, status: "pending" }], merge: cycle > 0 }, ctx);
@@ -276,7 +166,7 @@ describe("STRESS: defensive — every input type", () => {
 
   for (let i = 0; i < adversarialInputs.length; i++) {
     it(`adversarial input #${i} never crashes, never returns error:`, () => {
-      const ctx: ToolContext = { todos: [{ content: "Existing", status: "pending" }] };
+      const ctx: ToolContext = { todos: [{ content: "Existing", status: "pending" }] } as unknown as ToolContext;
       const r = todoWriteHandler(adversarialInputs[i], ctx);
       expect(typeof r.output).toBe("string");
       expect(r.output.startsWith("error:")).toBe(false);

@@ -26,6 +26,7 @@ export interface RunAgentOptions {
 	history: Step[];
 	/** Mutable working-memory checkpoint; persist beside the full transcript. */
 	contextState?: ContextState;
+	changeOwner?: import("../stores/pendingChanges").ChangeOwner;
 	/** Stable conversation key for transports that support prompt cache routing. */
 	promptCacheKey?: string;
 	maxTokens?: number;
@@ -64,13 +65,13 @@ export interface RunAgentOptions {
 	askUser?: (callId: string, header: string | undefined, questions: AskQuestionItem[], signal?: AbortSignal) => Promise<Record<string, string[]>>;
 	onAfterRun?: () => void;
 	/** Blocking before-shell hook: resolves with a block reason to veto the command. */
-	onBeforeShell?: (command: string) => Promise<string | undefined> | void;
+	onBeforeShell?: (command: string, signal?: AbortSignal) => Promise<string | undefined> | void;
 	onAfterEdit?: (path: string) => void;
 	/**
 	 * Generic hook trigger for the remaining events (beforeMcp, beforeReadFile, subagentStop, preCompact).
 	 * For blocking "before" events the resolved string (if any) vetoes the action.
 	 */
-	onHook?: (event: "beforeMcp" | "beforeReadFile" | "subagentStop" | "preCompact", context: Record<string, string>, tool?: string) => Promise<string | undefined> | void;
+	onHook?: (event: "beforeMcp" | "beforeReadFile" | "beforeEdit" | "subagentStop" | "preCompact", context: Record<string, string>, tool?: string, signal?: AbortSignal) => Promise<string | undefined> | void;
 	signal: AbortSignal;
 	emit: (e: AgentEvent) => void;
 }

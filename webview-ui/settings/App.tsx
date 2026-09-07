@@ -343,6 +343,8 @@ function UsagePanel({
                     <span style={{ fontSize: 12.5, overflow: "hidden", textOverflow: "ellipsis", whiteSpace: "nowrap" }}>{model}</span>
                     <span className="row-desc" style={{ flex: "0 0 auto" }}>
                       {fmtTokens(u.promptTokens)} in · {fmtTokens(u.completionTokens)} out · {u.requests} req
+                      {!!u.cachedReadTokens && <> · {fmtTokens(u.cachedReadTokens)} cached read</>}
+                      {!!u.cachedWriteTokens && <> · {fmtTokens(u.cachedWriteTokens)} cache write</>}
                     </span>
                   </div>
                   <div className="index-bar"><div className="index-bar-fill" style={{ width: `${Math.max(2, Math.round((total / max) * 100))}%` }} /></div>

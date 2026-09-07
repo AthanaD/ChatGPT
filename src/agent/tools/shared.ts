@@ -103,81 +103,30 @@ export function setToolTimeoutOverrides(sec: Record<string, number> | undefined)
  * Late resolve/reject of `p` is ignored (no unhandled rejection).
  */
 export function withToolTimeout<T>(
-  p: Promise<T>,
-  ms: number,
-  label: string,
-  onTimeout?: () => void,
-  signal?: AbortSignal,
+  p: Promise<T>, ms: number, label: string, onTimeout?: () => void, signal?: AbortSignal,
 ): Promise<T> {
-  // ms <= 0: no outer race (AskQuestion manages its own lifetime) — still honor abort.
-  if (!ms || ms <= 0) {
-    if (!signal) {
-      return Promise.resolve(p).catch((e) => {
-        throw e instanceof Error ? e : new Error(String(e));
-      });
-    }
-    return new Promise<T>((resolve, reject) => {
-      if (signal.aborted) {
-        reject(new Error(`aborted: ${label}`));
-        return;
-      }
-      let settled = false;
-      const onAbort = () => {
-        if (settled) return;
-        settled = true;
-        signal.removeEventListener("abort", onAbort);
-        try { onTimeout?.(); } catch { /* ignore */ }
-        reject(new Error(`aborted: ${label}`));
-      };
-      signal.addEventListener("abort", onAbort, { once: true });
-      Promise.resolve(p).then(
-        (v) => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener("abort", onAbort);
-          resolve(v);
-        },
-        (e) => {
-          if (settled) return;
-          settled = true;
-          signal.removeEventListener("abort", onAbort);
-          reject(e instanceof Error ? e : new Error(String(e)));
-        },
-      );
-    });
-  }
-  const limit = ms;
   return new Promise<T>((resolve, reject) => {
-    if (signal?.aborted) {
-      try { onTimeout?.(); } catch { /* ignore */ }
-      reject(new Error(`aborted: ${label}`));
-      return;
-    }
     let settled = false;
-    const done = (fn: () => void) => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const finish = (fn: () => void) => {
       if (settled) return;
       settled = true;
-      clearTimeout(timer);
+      if (timer) clearTimeout(timer);
       signal?.removeEventListener("abort", onAbort);
       fn();
     };
-    const onAbort = () => {
-      done(() => {
-        try { onTimeout?.(); } catch { /* ignore */ }
-        reject(new Error(`aborted: ${label}`));
-      });
-    };
-    const timer = setTimeout(() => {
-      done(() => {
-        try { onTimeout?.(); } catch { /* ignore */ }
-        reject(new Error(`timeout: ${label} exceeded ${Math.round(limit / 1000)}s`));
-      });
-    }, limit);
-    signal?.addEventListener("abort", onAbort, { once: true });
+    const onAbort = () => finish(() => reject(new Error(`aborted: ${label}`)));
+    // Observe the work even when already aborted, preventing a late unhandled rejection.
     Promise.resolve(p).then(
-      (v) => done(() => resolve(v)),
-      (e) => done(() => reject(e instanceof Error ? e : new Error(String(e)))),
+      value => finish(() => resolve(value)),
+      error => finish(() => reject(error instanceof Error ? error : new Error(String(error)))),
     );
+    if (signal?.aborted) { onAbort(); return; }
+    signal?.addEventListener("abort", onAbort, { once: true });
+    if (ms > 0) timer = setTimeout(() => finish(() => {
+      try { onTimeout?.(); } catch { /* cleanup is best effort */ }
+      reject(new Error(`timeout: ${label} exceeded ${Math.round(ms / 1000)}s`));
+    }), ms);
   });
 }
 
@@ -199,61 +148,7 @@ export const STOP = new Set([
 // Diff helpers
 // ---------------------------------------------------------------------------
 
-/** Minimal LCS line diff, emitting only changed regions plus a little context. */
-export function makeDiff(_filePath: string, before: string, after: string): string {
-  const a = before.split("\n");
-  const b = after.split("\n");
-  const n = a.length;
-  const m = b.length;
-  const lcs: number[][] = Array.from({ length: n + 1 }, () => new Array(m + 1).fill(0));
-  for (let i = n - 1; i >= 0; i--) {
-    for (let j = m - 1; j >= 0; j--) {
-      lcs[i][j] = a[i] === b[j] ? lcs[i + 1][j + 1] + 1 : Math.max(lcs[i + 1][j], lcs[i][j + 1]);
-    }
-  }
-
-  type Op = { t: " " | "+" | "-"; line: string };
-  const ops: Op[] = [];
-  let i = 0;
-  let j = 0;
-  while (i < n && j < m) {
-    if (a[i] === b[j]) {
-      ops.push({ t: " ", line: a[i] });
-      i++;
-      j++;
-    } else if (lcs[i + 1][j] >= lcs[i][j + 1]) {
-      ops.push({ t: "-", line: a[i] });
-      i++;
-    } else {
-      ops.push({ t: "+", line: b[j] });
-      j++;
-    }
-  }
-  while (i < n) ops.push({ t: "-", line: a[i++] });
-  while (j < m) ops.push({ t: "+", line: b[j++] });
-
-  const CONTEXT = 3;
-  const keep = new Array(ops.length).fill(false);
-  for (let k = 0; k < ops.length; k++) {
-    if (ops[k].t !== " ") {
-      for (let x = Math.max(0, k - CONTEXT); x <= Math.min(ops.length - 1, k + CONTEXT); x++) keep[x] = true;
-    }
-  }
-
-  const out: string[] = [];
-  let prevKept = true;
-  for (let k = 0; k < ops.length; k++) {
-    if (!keep[k]) {
-      if (prevKept) out.push("…");
-      prevKept = false;
-      continue;
-    }
-    prevKept = true;
-    const o = ops[k];
-    out.push((o.t === " " ? "  " : o.t + " ") + o.line);
-  }
-  return out.join("\n");
-}
+export { makeDiff } from "../../shared/lineDiff";
 
 /** 1-based line number of the first difference between two texts. */
 export function firstDiffLine(before: string, after: string): number {
@@ -266,18 +161,7 @@ export function firstDiffLine(before: string, after: string): number {
   return Math.min(a.length, b.length) + 1;
 }
 
-/** Slugify a string for use as a filename. */
-export function slugify(s: string): string {
-  return (
-    String(s || "plan")
-      .toLowerCase()
-      .replace(/[^a-z0-9]+/g, "-")
-      .replace(/^-+|-+$/g, "")
-      .slice(0, 60)
-      .replace(/-+$/, "") // remove trailing dashes after truncation
-      || "plan"
-  );
-}
+export { slugify } from "../../shared/planPath";
 
 /**
  * Locate a usable ripgrep binary (cached).
@@ -419,7 +303,7 @@ export function pushShellOutput(sh: BgShell, chunk: string): void {
 }
 
 // ---------------------------------------------------------------------------
-// Persistent stateful shell sessions (cwd/env persist across commands per run)
+// Shell sessions (standalone cd persists across commands per run)
 // ---------------------------------------------------------------------------
 
 /**
@@ -463,6 +347,7 @@ export function spawnShellCommand(command: string, cwd: string): ChildProcess {
       )
     : spawn("bash", ["--noprofile", "--norc", "-c", command], {
         cwd,
+        detached: true,
         stdio: ["pipe", "pipe", "pipe"],
         env: { ...process.env, TERM: "dumb", PS1: "", PS2: "" },
       });
@@ -472,12 +357,13 @@ export function spawnShellCommand(command: string, cwd: string): ChildProcess {
     proc.stdin?.on("error", () => { /* ignore broken pipe */ });
     proc.stdin?.end();
   } catch { /* ignore */ }
+  if (!IS_WIN) proc.once("exit", () => killShellProcess(proc));
   return proc;
 }
 
 /** Kill a command and everything it spawned (npm/pnpm scripts spawn children). */
 export function killShellProcess(proc: ChildProcess): void {
-  if (!proc || proc.exitCode != null || proc.signalCode) return;
+  if (!proc || (IS_WIN && (proc.exitCode != null || proc.signalCode))) return;
   try {
     if (IS_WIN && proc.pid) {
       const killer = spawn("taskkill", ["/pid", String(proc.pid), "/T", "/F"], { windowsHide: true });
@@ -520,6 +406,8 @@ export function disposeShellSession(key: string): void {
 export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?: AbortSignal): Promise<void> {
   return new Promise((resolve) => {
     let settled = false;
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let interval: ReturnType<typeof setInterval> | undefined;
     const finish = () => {
       if (settled) return;
       settled = true;
@@ -547,8 +435,8 @@ export function waitForShell(sh: BgShell, ms: number, pattern?: RegExp, signal?:
       if (ms <= 0 || Date.now() >= deadline) return finish();
     };
     // Hard wall-clock: never tick forever even if setInterval stalls.
-    const timer = setTimeout(finish, Math.max(ms, 0) + 250);
-    const interval = setInterval(check, 50);
+    timer = setTimeout(finish, Math.max(ms, 0) + 250);
+    interval = setInterval(check, 50);
     check();
   });
 }

@@ -10,7 +10,7 @@ describe("Anthropic streamed usage", () => {
   it("includes all three disjoint input buckets in prompt occupancy", () => {
     const tracker = new AnthropicUsageTracker();
     expect(tracker.update({ input_tokens: 12, cache_creation_input_tokens: 5000, cache_read_input_tokens: 20000, output_tokens: 1 }))
-      .toEqual({ type: "usage", promptTokens: 25012, completionTokens: 1, promptTokensTotal: 25012, completionTokensTotal: 1 });
+      .toEqual({ type: "usage", promptTokens: 25012, completionTokens: 1, promptTokensTotal: 25012, completionTokensTotal: 1, cachedReadTokens: 20000, cachedWriteTokens: 5000 });
   });
 
   it("merges partial cumulative deltas and accounts every token once", () => {
@@ -50,6 +50,13 @@ describe("Anthropic streamed usage", () => {
     expect(tracker.update({ input_tokens: 50, output_tokens: 20 })).toBeUndefined();
     expect(tracker.update({ input_tokens: 105, output_tokens: 45 }))
       .toEqual({ type: "usage", promptTokens: 5, completionTokens: 5, promptTokensTotal: 105, completionTokensTotal: 45 });
+  });
+
+  it("does not bill cache buckets again after a stale cumulative frame", () => {
+    const tracker = new AnthropicUsageTracker();
+    tracker.update({ input_tokens: 100, cache_read_input_tokens: 500 });
+    expect(tracker.update({ cache_read_input_tokens: 250 })).toBeUndefined();
+    expect(tracker.update({ cache_read_input_tokens: 550 })).toMatchObject({ promptTokens: 50, cachedReadTokens: 50 });
   });
 
   it("starts independent accounting for every request and leaves raw usage untouched", () => {

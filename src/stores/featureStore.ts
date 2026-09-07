@@ -35,6 +35,7 @@ export type HookEvent =
 	| "beforeShell"
 	| "beforeMcp"
 	| "beforeReadFile"
+	| "beforeEdit"
 	| "afterEdit"
 	| "afterRun"
 	| "notification"

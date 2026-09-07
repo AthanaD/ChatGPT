@@ -29,6 +29,9 @@ export interface TodoItem {
 export interface ToolContext {
   /** Todo state owned by this run, never shared across conversations. */
   todos: TodoItem[];
+  changeOwner?: import("../../stores/pendingChanges").ChangeOwner;
+  /** Guard a resource download once its contents are available. */
+  beforeResourceWrite?: (path: string, content: string, signal?: AbortSignal) => Promise<string | undefined | void>;
   /** Read an archived result or transcript belonging to this conversation. */
   readContext?: (input: { id: string; start_line?: number; end_line?: number; start_column?: number; pattern?: string }) => string;
   runSubagent?: SubagentRunner;
@@ -37,7 +40,7 @@ export interface ToolContext {
   switchMode?: (mode: Mode) => string;
   /** Current active mode (mutable across the run); read by tools for gating. */
   getMode?: () => Mode;
-  /** Key identifying this run's persistent shell session (cwd/env persist). */
+  /** Key identifying this run's shell session (standalone cd persists within this run). */
   shellSessionKey?: string;
   /** Emit a notify_on_output match to the UI (set by the loop). */
   emitShellNotify?: (text: string) => void;
@@ -61,9 +64,9 @@ export interface SubagentOptions {
   description?: string;
   /** File paths (images/videos) to attach to the subagent's context. */
   fileAttachments?: string[];
-  /** Resume an existing agent by id (or "self" to fork the parent). */
+  /** Legacy input retained so unsupported resume requests receive a clear error. */
   resume?: string;
-  /** Interrupt a running resumed agent. */
+  /** Legacy input; the current runner does not support resuming/interruption. */
   interrupt?: boolean;
 }
 

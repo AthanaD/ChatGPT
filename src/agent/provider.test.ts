@@ -3,34 +3,26 @@
  * Runs via vitest in CI (no VS Code dependency).
  * Sensitive data (API keys, tokens) must NEVER appear here.
  */
-import { describe, it, expect } from "vitest";
+import { afterEach, describe, it, expect, vi } from "vitest";
+vi.mock("vscode", () => ({ workspace: {}, Uri: {}, EventEmitter: class { event = () => ({ dispose() {} }); fire() {} } }));
+vi.mock("./oauth", () => ({ streamOAuthChat: vi.fn() }));
+import { listModels } from "./provider";
+import { kindMatches, PROVIDER_PRESETS } from "../stores/featureStore";
 
-function normalizeBaseUrl(url: string): string {
-  return url.replace(/\/+$/, "");
-}
+afterEach(() => vi.unstubAllGlobals());
 
-function kindMatches(kind: string | string[], k: string): boolean {
-  return Array.isArray(kind) ? kind.includes(k) : kind === k;
-}
-
-// --- normalizeBaseUrl ---
-
-describe("normalizeBaseUrl", () => {
-  it("strips trailing slashes", () => {
-    expect(normalizeBaseUrl("https://api.example.com/v1/")).toBe("https://api.example.com/v1");
-    expect(normalizeBaseUrl("https://api.example.com/v1///")).toBe("https://api.example.com/v1");
-  });
-
-  it("leaves clean URLs untouched", () => {
-    expect(normalizeBaseUrl("https://api.example.com/v1")).toBe("https://api.example.com/v1");
-  });
-
-  it("handles root URLs", () => {
-    expect(normalizeBaseUrl("https://api.example.com/")).toBe("https://api.example.com");
-  });
-
-  it("preserves internal path separators", () => {
-    expect(normalizeBaseUrl("https://a.com/b/c/")).toBe("https://a.com/b/c");
+describe("provider base URLs", () => {
+  it.each([
+    ["https://api.example.com/v1/", "https://api.example.com/v1/models"],
+    ["https://api.example.com/v1///", "https://api.example.com/v1/models"],
+    ["https://api.example.com/v1", "https://api.example.com/v1/models"],
+    ["https://api.example.com/", "https://api.example.com/models"],
+    ["https://a.com/b/c/", "https://a.com/b/c/models"],
+  ])("normalizes %s at the actual HTTP boundary", async (base, expected) => {
+    const fetch = vi.fn(async () => new Response(JSON.stringify({ data: [{ id: "fixture" }] })));
+    vi.stubGlobal("fetch", fetch);
+    expect(await listModels(base, "fixture-key", false)).toEqual([{ id: "fixture" }]);
+    expect(fetch).toHaveBeenCalledWith(expected, { headers: { authorization: "Bearer fixture-key" } });
   });
 });
 
@@ -50,21 +42,9 @@ describe("kindMatches", () => {
 
 // --- Provider presets ---
 
-const PROVIDER_PRESETS: Record<string, { label: string; baseUrl: string; needsKey: boolean }> = {
-  openai: { label: "OpenAI-compatible", baseUrl: "https://api.openai.com/v1", needsKey: true },
-  anthropic: { label: "Anthropic", baseUrl: "https://api.anthropic.com/v1", needsKey: true },
-  google: { label: "Google Gemini", baseUrl: "https://generativelanguage.googleapis.com/v1beta/openai", needsKey: true },
-  openrouter: { label: "OpenRouter", baseUrl: "https://openrouter.ai/api/v1", needsKey: true },
-  ollama: { label: "Ollama", baseUrl: "http://localhost:11434/v1", needsKey: false },
-  llamacpp: { label: "llama.cpp", baseUrl: "http://localhost:8080/v1", needsKey: false },
-  mimo: { label: "Xiaomi MIMO", baseUrl: "https://token-plan-sgp.xiaomimimo.com/v1", needsKey: true },
-  atlascloud: { label: "Atlas Cloud", baseUrl: "https://api.atlascloud.ai/v1", needsKey: true },
-  astraflow: { label: "Astraflow", baseUrl: "https://api-us-ca.umodelverse.ai/v1", needsKey: true },
-};
-
 describe("PROVIDER_PRESETS", () => {
   it("has all expected providers", () => {
-    const expected = ["openai", "anthropic", "google", "openrouter", "ollama", "llamacpp", "mimo", "atlascloud", "astraflow"];
+    const expected = ["openai", "anthropic", "google", "openrouter", "ollama", "llamacpp", "mimo", "atlascloud", "astraflow"] as const;
     for (const key of expected) {
       expect(PROVIDER_PRESETS[key]).toBeDefined();
     }

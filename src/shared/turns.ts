@@ -30,7 +30,7 @@ export type AgentEvent =
       endLine?: number;
     }
   | { type: "run-status"; status: "running" | "finished" | "error" | "cancelled" }
-  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number }
+  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number; model?: string; requestId?: string; source?: "parent" | "summary" | "subagent"; cachedReadTokens?: number; cachedWriteTokens?: number }
   | { type: "run-result"; text: string; durationMs: number }
   | { type: "subagent-event"; callId: string; event: AgentEvent }
   | { type: "mode-changed"; mode: Mode }
@@ -56,6 +56,8 @@ export interface ToolBlock {
   input: any;
   status: "running" | "completed" | "error";
   result?: string;
+  /** Submitted question answers, persisted by the host. */
+  answers?: Record<string, string[]>;
   diff?: string;
   startLine?: number;
   endLine?: number;
@@ -533,4 +535,32 @@ export function closeTrailingThinking(turns: Turn[]): Turn[] {
     }
   }
   return turns;
+}
+
+/** Persist question answers in the same host-owned tree as the question card. */
+export function setQuestionAnswers(turns: Turn[], callId: string, answers: Record<string, string[]>): Turn[] {
+  const update = (blocks: AssistantBlock[]): AssistantBlock[] => blocks.map((block) => {
+    if (block.kind !== "tool") return block;
+    if (block.callId === callId) return { ...block, answers: Object.fromEntries(Object.entries(answers).map(([id, values]) => [id, [...values]])) };
+    return block.subBlocks ? { ...block, subBlocks: update(block.subBlocks) } : block;
+  });
+  return turns.map((turn) => turn.role === "assistant" ? { ...turn, blocks: update(turn.blocks) } : turn);
+}
+
+/** A bounded readable transcript for explicitly attached conversations. */
+export function turnsToTranscript(turns: Turn[], maxChars = 6000): string {
+  const blockText = (block: AssistantBlock): string => {
+    if (block.kind === "text") return block.text;
+    if (block.kind === "tool") return [
+      `${block.name}: ${block.result ?? ""}`,
+      block.answers ? `Answers: ${JSON.stringify(block.answers)}` : "",
+      ...(block.subBlocks?.map(blockText) ?? []),
+    ].filter(Boolean).join("\n");
+    return "";
+  };
+  const text = turns.map((turn) => turn.role === "user" ? `User: ${turn.text}` : `Assistant: ${turn.blocks.map(blockText).filter(Boolean).join("\n")}`).join("\n\n");
+  if (text.length <= maxChars) return text;
+  const marker = "\n[Earlier chat content omitted]\n";
+  const head = Math.max(0, Math.floor((maxChars - marker.length) / 3));
+  return text.slice(0, head) + marker + text.slice(-(maxChars - marker.length - head));
 }

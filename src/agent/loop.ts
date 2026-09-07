@@ -43,6 +43,7 @@ import {
 	SUBAGENT_INTERVAL_MS,
 } from "../shared/streamPolicy";
 import { logError } from "../logging";
+import { planRelativePath } from "../shared/planPath";
 
 // Appended after every live user query in multitask mode so the model never
 // forgets it is a COORDINATOR: edit tools are disabled and all work must be
@@ -244,9 +245,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	const pushSystemNote = (text: string) => pushHistory({ kind: "user", text, synthetic: true });
 	// Mutable so the SwitchMode tool can change it mid-run.
 	let mode = opts.mode;
+	const initialToolNames = new Set(toolsForMode(opts.mode).map(t => t.schema.function.name));
+	const inheritedReadOnly = opts.mode === "ask" || opts.mode === "plan";
+	const webSearchEnabled = opts.enableWebSearch;
+	const webFetchEnabled = opts.enableWebFetch;
+	const changeOwner = opts.changeOwner;
 	// These modes may need continuation nudges; execution permissions are separate.
 	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug" || mode === "plan";
-	const canExecuteMcp = (m: Mode) => m === "agent" || m === "debug";
+	const canExecuteMcp = (m: Mode) => (opts.mode === "agent" || opts.mode === "debug") && (m === "agent" || m === "debug");
 	/** Coordinator modes: the model delegates instead of implementing. */
 	const isCoordinator = () => mode === "multitask" || mode === "project";
 	// In project mode the roster is limited to the members of the assigned team(s).
@@ -291,12 +297,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		askUser,
 		shellSessionKey,
 		getMode: () => mode,
+		changeOwner,
+		beforeResourceWrite: async (path, content, resourceSignal) => onHook?.("beforeEdit", { path, tool_input: JSON.stringify({ file_path: path, content }) }, "Write", resourceSignal ?? signal),
 		emitShellNotify: (message) => emit({ type: "shell-notify", message }),
 		emitToolProgress: (callId, text) => emit({ type: "tool-call-progress", callId, text }),
 	};
 	toolCtx.switchMode = (next) => {
 		if (next === mode) {
 			return `Already in ${mode} mode.`;
+		}
+		if (toolsForMode(next).some(t => !initialToolNames.has(t.schema.function.name))) {
+			return `error: ${next} mode expands this run's permissions. Ask the user to select that mode in the chat controls and send a new message.`;
 		}
 		const prev = mode;
 		mode = next;
@@ -311,7 +322,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				return "error: resuming or forking subagents is not supported in this runtime; launch a fresh subagent instead.";
 			}
 			const def = subagentName ? findSubagentByName(roster, subagentName) : undefined;
-			const subReadonly = def ? def.readonly : readonly;
+			const subReadonly = inheritedReadOnly || mode === "ask" || mode === "plan" || readonly || def?.readonly === true;
 			const subSystemOverride = def ? def.prompt : systemPromptOverride;
 			// Model precedence: explicit task model → per-subagent override → global subagent model → chat model.
 			// Models the agent invents (or that belong to another provider) would fail
@@ -375,6 +386,9 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				enableFileReading,
 				enableTerminalSuggestions,
 				enableWorkspaceContext,
+				enableWebSearch: webSearchEnabled,
+				enableWebFetch: webFetchEnabled,
+				changeOwner,
 				approve,
 				isSubagent: true,
 				// Nested Task disabled; child still needs hooks for compaction etc.
@@ -384,6 +398,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				signal: childAC.signal,
 				emit: (e) => {
 					if (e.type === "run-result") finalText = e.text;
+					if (e.type === "usage") emit({ ...e, model: e.model ?? subModel, source: "subagent" });
 					// UI stream only — not parent history. Coalesced via parent emit.
 					if (callId) emit({ type: "subagent-event", callId, event: e });
 				},
@@ -537,7 +552,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		new Set(
 			toolsForMode(mode)
 				.map((t) => t.schema.function.name)
-				.filter((n) => !disabledToolNames.has(n)),
+				.filter((n) => initialToolNames.has(n) && !disabledToolNames.has(n)),
 		);
 
 	pushHistory({ kind: "user", text: prompt, attachments: attachments && attachments.length ? attachments : undefined });
@@ -676,7 +691,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (ev.type === "usage") {
 					// Compression is billed too; include it in run usage without
 					// confusing its small prompt with the active context occupancy.
-					emit({ type: "usage", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
+					emit({ ...ev, type: "usage", model: ev.model ?? summaryModel, source: "summary", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
 				}
 			}
 			if (!text.trim()) throw new Error("empty summary");
@@ -836,7 +851,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					// Live-update the ring after every step. prompt/completion carry
 					// this step's delta (usage tracking accumulates them); totalTokens
 					// is the current context occupancy.
-					emit({ type: "usage", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
+					emit({ ...ev, type: "usage", model: ev.model ?? model, source: "parent", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
 				} else if (ev.type === "done") {
 					finishReason = ev.finishReason || "";
 				}
@@ -973,6 +988,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			const exec = async (i: number) => {
 				const { call, input, badArgs, resolvedName } = parsed[i];
+				if (signal.aborted) {
+					results[i] = { status: "error", output: "error: cancelled before tool execution" };
+					return;
+				}
 				if (badArgs) {
 					// TodoWrite/Read with truncated JSON: don't error, just skip.
 					// The model's text response is still valid and should be displayed.
@@ -993,7 +1012,13 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					return;
 				}
 				// MCP tool dispatch (same hard timeout + countdown as built-ins).
-				if (resolvedName.startsWith("mcp__")) {
+				if (resolvedName.startsWith("mcp__") || resolvedName === "CallMcpTool") {
+					const mcpName = resolvedName === "CallMcpTool" ? `mcp__${String(input.server ?? "").trim()}__${String(input.toolName ?? "").trim()}` : resolvedName;
+					const mcpInput = resolvedName === "CallMcpTool" ? input.arguments ?? {} : input;
+					if (resolvedName === "CallMcpTool" && (!input.server || !input.toolName)) {
+						results[i] = { status: "error", output: "error: CallMcpTool requires server and toolName" };
+						return;
+					}
 					if (!canExecuteMcp(mode)) {
 						// MCP tools may mutate; only allow in agentic modes. Multitask is a
 						// coordinator and must delegate MCP work to subagents.
@@ -1002,14 +1027,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					}
 					// Approval policy decides silently (allow/deny) or prompts (ask/review).
 					if (approve) {
-						const approval = await approve(call.name, input, call.id);
+						const approval = await approve(mcpName, mcpInput, call.id);
 						if (approval !== true) {
 							results[i] = { status: "error", output: `user denied ${call.name}` };
 							return;
 						}
 					}
 					// beforeMCPExecution hook (may veto).
-					const mcpVeto = await onHook?.("beforeMcp", { tool: call.name }, call.name);
+					const mcpVeto = await onHook?.("beforeMcp", { tool: mcpName, tool_input: JSON.stringify(mcpInput) }, mcpName, signal);
 					if (mcpVeto) {
 						results[i] = { status: "error", output: `blocked by hook: ${mcpVeto}` };
 						return;
@@ -1031,14 +1056,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					else signal.addEventListener("abort", onParentAbort, { once: true });
 					try {
 						const out = await withToolTimeout(
-							Promise.resolve().then(() => mcpManager.callTool(call.name, input)),
+							Promise.resolve().then(() => { toolAc.signal.throwIfAborted(); return mcpManager.callTool(mcpName, mcpInput, toolAc.signal); }),
 							limitMs,
 							call.name,
 							() => {
 								killTool();
 								results[i] = {
 									status: "error",
-									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted.`,
+									output: `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. MCP cancellation was requested; the server may already have completed the action.`,
 								};
 								finishUi(i);
 							},
@@ -1053,8 +1078,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						if (completedUi.has(i)) return;
 						results[i] = {
 							status: "error",
-							output: msg.startsWith("timeout:") || msg.startsWith("aborted:")
-								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted.`
+							output: msg.startsWith("aborted:") || signal.aborted ? "error: cancelled; MCP cancellation was requested, but the server may already have completed the action." : msg.startsWith("timeout:")
+								? `error: timeout: ${call.name} exceeded ${Math.round((limitMs || 0) / 1000)}s. MCP cancellation was requested; the server may already have completed the action.`
 								: `error: ${msg}`,
 						};
 						finishUi(i);
@@ -1083,7 +1108,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// Approval gate: every policy-covered action consults the approver, which
 				// resolves the per-type policy (allow silently / ask / deny) itself.
-				const isEditTool = EDIT_TOOLS.has(resolvedName);
+				const isEditTool = resolvedName === "WritePlan" || EDIT_TOOLS.has(resolvedName) || (resolvedName === "FetchMcpResource" && !!input.downloadPath);
 				// Per-call action type: also gates ungated tools (e.g. Read) when they
 				// target paths outside the workspace.
 				const needsApproval = actionTypeForCall(resolvedName, input, getWorkspaceRoot()) !== undefined;
@@ -1097,9 +1122,28 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 						return;
 					}
 				}
+				if (signal.aborted) {
+					results[i] = { status: "error", output: "error: cancelled before tool execution" };
+					return;
+				}
+				if (resolvedName === "FetchMcpResource") {
+					const veto = await onHook?.("beforeMcp", { server: String(input.server ?? ""), uri: String(input.uri ?? ""), tool_input: JSON.stringify(input) }, resolvedName, signal);
+					if (veto) { results[i] = { status: "error", output: `blocked by hook: ${veto}` }; return; }
+				}
+				if (isEditTool && resolvedName !== "FetchMcpResource") {
+					const nativeTool = resolvedName === "StrReplace" ? "Edit" : resolvedName === "EditNotebook" ? "NotebookEdit" : resolvedName === "Delete" ? "Delete" : "Write";
+					const editPath = String(input.path ?? input.target_notebook ?? input.downloadPath ?? (resolvedName === "WritePlan" ? planRelativePath(input.title) : ""));
+					const nativeInput = { ...input, file_path: editPath,
+						...(resolvedName === "Write" ? { content: input.contents } : {}),
+						...(resolvedName === "WritePlan" ? { content: `# ${String(input.title || "Plan").trim()}\n\n${String(input.content || "").trim()}\n` } : {}),
+						...(resolvedName === "EditNotebook" ? { notebook_path: editPath, new_source: input.new_string } : {}),
+					};
+					const veto = await onHook?.("beforeEdit", { path: editPath, tool_input: JSON.stringify(nativeInput) }, nativeTool, signal);
+					if (veto) { results[i] = { status: "error", output: `blocked by hook: ${veto}` }; return; }
+				}
 				// beforeShell hook (may veto).
 				if (resolvedName === "Shell" && onBeforeShell) {
-					const veto = await onBeforeShell(String(input?.command ?? ""));
+					const veto = await onBeforeShell(String(input?.command ?? ""), signal);
 					if (veto) {
 						results[i] = { status: "error", output: `blocked by hook: ${veto}` };
 						return;
@@ -1107,7 +1151,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				}
 				// beforeReadFile hook (may veto).
 				if (resolvedName === "Read") {
-					const veto = await onHook?.("beforeReadFile", { path: String(input?.path ?? "") });
+					const veto = await onHook?.("beforeReadFile", { path: String(input?.path ?? "") }, "Read", signal);
 					if (veto) {
 						results[i] = { status: "error", output: `blocked by hook: ${veto}` };
 						return;
@@ -1141,7 +1185,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					let timedOut = false;
 					try {
 						r = await withToolTimeout(
-							Promise.resolve().then(() => tool.execute(input, toolAc.signal, call.id, toolCtx)),
+							Promise.resolve().then(() => { toolAc.signal.throwIfAborted(); return tool.execute(input, toolAc.signal, call.id, toolCtx); }),
 							limitMs,
 							resolvedName,
 							() => {
@@ -1165,15 +1209,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					} catch (e) {
 						const msg = e instanceof Error ? e.message : String(e);
 						logError("tool.execute", e, { tool: resolvedName, callId: call.id });
+						const wasAborted = toolAc.signal.aborted;
 						try { toolAc.abort(); } catch { /* ignore */ }
-						const isTo = timedOut || msg.startsWith("timeout:") || msg.startsWith("aborted:");
+						const isTo = timedOut || msg.startsWith("timeout:");
+						const cancelled = !isTo && (wasAborted || signal.aborted || msg.startsWith("aborted:"));
 						// TodoWrite/Read: abort or timeout should NOT produce error status.
 						// The red X in UI stops processing. Return success instead.
 						if (isTo && (resolvedName === "TodoWrite" || resolvedName === "TodoRead")) {
 							r = { output: resolvedName === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first." : "(todos: skipped)" };
 						} else {
 							r = {
-								output: isTo
+								output: cancelled ? "error: cancelled" : isTo
 									? `error: timeout: ${resolvedName} exceeded ${Math.round((limitMs || 0) / 1000)}s. Tool aborted - retry with a narrower scope or shorter command.`
 									: `error: ${msg}`,
 							};
@@ -1201,7 +1247,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					results[i] = { status, output: r.output, diff: r.diff, startLine: r.startLine, endLine: r.endLine, image: r.image };
 					// afterEdit hook on successful edits.
 					if (status === "completed" && isEditTool && onAfterEdit) {
-						onAfterEdit(String(input?.path ?? ""));
+						onAfterEdit(String(input?.path ?? input?.target_notebook ?? input?.downloadPath ?? (resolvedName === "WritePlan" ? planRelativePath(input.title) : "")));
 					}
 					// Immediate UI settle (especially on timeout) — do not wait for siblings.
 					finishUi(i);

@@ -7,7 +7,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 
 const scanner = fileURLToPath(new URL("./check-secrets.mjs", import.meta.url));
-function scan(files) {
+function scan(files, afterStage = () => {}) {
   const cwd = mkdtempSync(join(tmpdir(), "ocursor-security-"));
   try {
     execFileSync("git", ["init", "--quiet"], { cwd });
@@ -16,6 +16,7 @@ function scan(files) {
       writeFileSync(join(cwd, name), content);
     }
     execFileSync("git", ["add", "."], { cwd });
+    afterStage(cwd);
     return spawnSync(process.execPath, [scanner], { cwd, encoding: "utf8" });
   } finally {
     rmSync(cwd, { recursive: true, force: true });
@@ -47,3 +48,14 @@ for (const filename of [".env", ".env.local", "nested/service.env", "nested/.env
     assert.match(result.stderr, /committed environment file/);
   });
 }
+
+
+test("accepts unstaged deletions and scans new source files", () => {
+  const deleted = scan({ "src/deleted.ts": "export {};" }, cwd => rmSync(join(cwd, "src/deleted.ts")));
+  assert.equal(deleted.status, 0, deleted.stderr);
+  const token = "sk-" + "aB3dE5fG7hI9jK1lM3nO5pQ7";
+  const untracked = scan({ "src/existing.ts": "export {};" }, cwd => writeFileSync(join(cwd, "src/new.ts"), `const key = "${token}";`));
+  assert.equal(untracked.status, 1);
+  assert.match(untracked.stderr, /new\.ts:1: potential credential/);
+  assert.ok(!untracked.stderr.includes(token));
+});

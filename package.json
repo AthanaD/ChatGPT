@@ -120,7 +120,12 @@
 		"lint": "eslint src",
 		"test": "vscode-test",
 		"test:unit": "vitest run",
-		"vsix": "pnpm run package && pnpm dlx @vscode/vsce package --no-dependencies"
+		"vsix": "pnpm run package && pnpm dlx @vscode/vsce package --no-dependencies",
+		"runtime:manifest": "node scripts/generate-runtime-manifest.cjs",
+		"runtime:check": "node scripts/generate-runtime-manifest.cjs --check",
+		"test:runtime": "node scripts/runtime-smoke.cjs",
+		"test:eval": "vitest run src/agent/evaluations.test.ts",
+		"test:host": "pnpm run compile-tests && node scripts/extension-host-test.cjs"
 	},
 	"devDependencies": {
 		"@types/mocha": "^10.0.10",
@@ -133,6 +138,7 @@
 		"@vscode/test-electron": "^3.0.0",
 		"esbuild": "^0.28.1",
 		"eslint": "^10.5.0",
+		"js-yaml": "4.2.0",
 		"jsdom": "26.1.0",
 		"npm-run-all": "^4.1.5",
 		"typescript": "^6.0.3",

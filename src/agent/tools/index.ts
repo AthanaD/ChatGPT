@@ -71,7 +71,7 @@ const PLAN_WRITE_MODES = new Set<Mode>(["plan", "agent", "debug"]);
 
 // Multitask is a coordinator: it delegates to subagents (Task), manages todos,
 // and may read/search — but it must never mutate files or the shell itself.
-const MULTITASK_BLOCKED = new Set(["StrReplace", "Write", "Delete", "EditNotebook", "Shell", "WritePlan"]);
+const MULTITASK_BLOCKED = new Set(["StrReplace", "Write", "Delete", "EditNotebook", "Shell", "WritePlan", "CallMcpTool", "FetchMcpResource"]);
 export const MULTITASK_TOOLS = new Set(
   Object.keys(TOOLS).filter((name) => !MULTITASK_BLOCKED.has(name)),
 );

@@ -7,12 +7,12 @@
  * Licensed under the MIT License. See LICENSE file in the project root.
  */
 
-import * as fs from "fs/promises";
 import * as path from "path";
+import { writeTodos, readTodos } from "./todoState";
 import type { Mode } from "../types";
 import { getWorkspaceRoot } from "../../context/workspaceUtils";
-import { pendingChanges } from "../../stores/pendingChanges";
-import { defineTool, type AskQuestionItem, type TodoItem } from "./types";
+import { mutateFile } from "../../stores/fileMutations";
+import { defineTool, type AskQuestionItem } from "./types";
 import {
   getSubagentRunner,
   getQuestionAsker,
@@ -22,79 +22,10 @@ import {
 } from "./shared";
 
 // ---- TodoWrite ----
-export const todoWriteTool = defineTool("TodoWrite", false, async (input, _abortSignal, _callId, ctx) => {
-  try {
-    if (!ctx) return { output: "error: todo context unavailable" };
-    if (!Array.isArray(ctx.todos)) ctx.todos = [];
-
-    // CRITICAL: Normalize incoming items. Models (Mimo, deepseek) send strings
-    // instead of objects, or objects missing fields, or use wrong field names.
-    // Accept 'todos', 'tasks', 'items', or any array field.
-    const raw: any[] = Array.isArray(input?.todos) ? input.todos
-      : Array.isArray(input?.tasks) ? input.tasks
-      : Array.isArray(input?.items) ? input.items
-      : Array.isArray(input) ? input
-      : [];
-    type TodoUpdate = Partial<TodoItem> & { id: string };
-    const incoming: TodoUpdate[] = raw.map((t, i): TodoUpdate | null => {
-      if (typeof t === "string") {
-        return { id: `auto_${i}`, content: t, status: "pending" as const };
-      }
-      if (t && typeof t === "object") {
-        const content = t.content ?? t.text ?? t.title ?? t.name;
-        return {
-          id: String(t.id || `auto_${i}`),
-          // Omitted fields must stay absent until merged with the existing item.
-          ...(content != null ? { content: String(content) } : {}),
-          ...(t.status !== undefined ? {
-            status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status) ? t.status : "pending") as TodoItem["status"],
-          } : {}),
-        };
-      }
-      return null;
-    }).filter((t): t is TodoUpdate => t !== null);
-    const withDefaults = (t: TodoUpdate): TodoItem => ({ content: "unnamed", status: "pending", ...t });
-
-    if (incoming.length === 0 && ctx.todos.length === 0) {
-      // The model called TodoWrite without arguments (common with glm/deepseek).
-      // Create a single placeholder todo so the UI shows something useful.
-      ctx.todos = [{ id: "auto_0", content: "Working on task...", status: "in_progress" }];
-    }
-
-    if (input?.merge) {
-      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
-      for (const t of incoming) {
-        const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        byId.set(key, withDefaults({ ...byId.get(key), ...t, id: key }));
-      }
-      ctx.todos = [...byId.values()];
-    } else if (incoming.length > 0) {
-      ctx.todos = incoming.map(withDefaults);
-    }
-
-    const render = ctx.todos
-      .map((t) => {
-        const mark =
-          t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-        return `${mark} ${t.content || "unnamed"}`;
-      })
-      .join("\n");
-    return { output: render || "(no todos)" };
-  } catch (e) {
-    return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
-  }
-});
+export const todoWriteTool = defineTool("TodoWrite", false, async (input, _signal, _id, ctx) => writeTodos(input, ctx));
 
 // ---- TodoRead ----
-export const todoReadTool = defineTool("TodoRead", false, async (_input, _abortSignal, _callId, ctx) => {
-  if (!ctx) return { output: "error: todo context unavailable" };
-  if (!ctx.todos.length) {
-    return {
-      output: "(no todos)",
-    };
-  }
-  return { output: ctx.todos.map((t) => `- [${t.status}] ${t.content}`).join("\n") };
-});
+export const todoReadTool = defineTool("TodoRead", false, async (_input, _signal, _id, ctx) => readTodos(ctx));
 
 // ---- AskQuestion (interactive wizard form in the chat UI) ----
 export const askQuestionTool = defineTool("AskQuestion", false, async (input, abortSignal, callId, ctx) => {
@@ -168,25 +99,16 @@ export const switchModeTool = defineTool("SwitchMode", false, async (input, _sig
 });
 
 // ---- WritePlan (allowed in plan, agent, and debug modes) ----
-export const writePlanTool = defineTool("WritePlan", true, async (input) => {
+export const writePlanTool = defineTool("WritePlan", true, async (input, signal, _callId, ctx) => {
   const root = getWorkspaceRoot();
-  const dir = path.join(root, ".plans");
-  await fs.mkdir(dir, { recursive: true });
-  const file = `${slugify(input.title)}.md`;
-  const rel = `.plans/${file}`;
-  const p = path.join(dir, file);
+  const rel = `.plans/${slugify(input.title)}.md`;
   const body = `# ${String(input.title || "Plan").trim()}\n\n${String(input.content || "").trim()}\n`;
-  let existedBefore = false;
-  let original = "";
-  try {
-    original = await fs.readFile(p, "utf8");
-    existedBefore = true;
-  } catch {}
-  await fs.writeFile(p, body, "utf8");
-  pendingChanges.record(rel, original, body, existedBefore);
-  return {
-    output: `wrote plan to ${rel}`,
-    diff: makeDiff(rel, original, body),
-    startLine: firstDiffLine(original, body),
-  };
+  return mutateFile(path.join(root, rel), { signal, owner: ctx?.changeOwner }, ({ data }) => {
+    const original = data?.toString("utf8") ?? "";
+    return { data: Buffer.from(body), result: {
+      output: `wrote plan to ${rel}`,
+      diff: makeDiff(rel, original, body),
+      startLine: firstDiffLine(original, body),
+    } };
+  });
 });

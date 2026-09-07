@@ -42,6 +42,7 @@ export type HookEvent =
   | "beforeShell"
   | "beforeMcp"
   | "beforeReadFile"
+  | "beforeEdit"
   | "afterEdit"
   | "afterRun"
   | "notification"
@@ -59,6 +60,7 @@ export const HOOK_EVENTS: { id: HookEvent; label: string; cursor?: string; claud
   { id: "beforeShell", label: "Before shell command", cursor: "beforeShellExecution", claude: "PreToolUse", claudeMatcher: "Bash" },
   { id: "beforeMcp", label: "Before MCP tool", cursor: "beforeMCPExecution", claude: "PreToolUse" },
   { id: "beforeReadFile", label: "Before file read", cursor: "beforeReadFile", claude: "PreToolUse", claudeMatcher: "Read" },
+  { id: "beforeEdit", label: "Before file mutation", claude: "PreToolUse", claudeMatcher: "Write|Edit|NotebookEdit|Delete" },
   { id: "afterEdit", label: "After file edit", cursor: "afterFileEdit", claude: "PostToolUse", claudeMatcher: "Edit" },
   { id: "afterRun", label: "Agent finished (stop)", cursor: "stop", claude: "Stop" },
   { id: "notification", label: "Notification", claude: "Notification" },
@@ -310,6 +312,8 @@ export const DEFAULT_APPROVAL: ApprovalPolicy = {
 
 /** Cumulative token usage for one model (host: usageStore). */
 export interface ModelUsage {
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
   promptTokens: number;
   completionTokens: number;
   requests: number;

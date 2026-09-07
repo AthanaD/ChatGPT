@@ -27,6 +27,10 @@ export interface PendingApproval {
 
 /** State for one independent agent run, keyed by conversation id. */
 export interface RunSession {
+  /** Resolves only after the run and its cleanup have finished. */
+  done: Promise<void>;
+  resolveDone: () => void;
+  settled?: boolean;
   abort: AbortController;
   subagentAborts: Map<string, () => void>;
   pendingQuestions: Map<string, (answers: Record<string, string[]>) => void>;

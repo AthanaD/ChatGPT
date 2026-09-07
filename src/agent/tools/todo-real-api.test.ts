@@ -1,3 +1,6 @@
+import { parseTodos } from "../../shared/todoPresentation";
+import { writeTodos as todoWriteHandler } from "./todoState";
+import type { TodoItem, ToolContext } from "./types";
 /**
  * REAL API INTEGRATION TESTS — sends actual prompts to the Verboo proxy
  * and verifies the full pipeline: API → handler → parseTodos → UI.
@@ -102,68 +105,13 @@ async function sendTodoWritePrompt(prompt: string): Promise<{ modelOutput: strin
 }
 
 // ---- Handler (inline copy) ----
-interface TodoItem { id: string; content: string; status: "pending" | "in_progress" | "completed" | "cancelled"; }
-interface ToolContext { todos: TodoItem[]; }
 
-function todoWriteHandler(input: any, ctx: ToolContext): { output: string } {
-  try {
-    if (!ctx) return { output: "error: todo context unavailable" };
-    if (!Array.isArray(ctx.todos)) ctx.todos = [];
-    const raw: any[] = Array.isArray(input?.todos) ? input.todos
-      : Array.isArray(input?.tasks) ? input.tasks
-      : Array.isArray(input?.items) ? input.items
-      : Array.isArray(input) ? input
-      : [];
-    const incoming: TodoItem[] = raw.map((t, i) => {
-      if (typeof t === "string") return { id: `auto_${i}`, content: t, status: "pending" as const };
-      if (t && typeof t === "object") {
-        return {
-          id: t.id || `auto_${i}`,
-          content: String(t.content || t.text || t.title || t.name || "unnamed"),
-          status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status) ? t.status : "pending") as TodoItem["status"],
-        };
-      }
-      return null;
-    }).filter(Boolean) as TodoItem[];
-    if (incoming.length === 0 && ctx.todos.length === 0) {
-      return { output: "TodoWrite requires items." };
-    }
-    if (input?.merge) {
-      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
-      for (const t of incoming) {
-        const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        byId.set(key, { ...byId.get(key), ...t, id: key });
-      }
-      ctx.todos = [...byId.values()];
-    } else if (incoming.length > 0) {
-      ctx.todos = incoming;
-    }
-    const render = ctx.todos.map((t) => {
-      const mark = t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-      return `${mark} ${t.content || "unnamed"}`;
-    }).join("\n");
-    return { output: render || "(no todos)" };
-  } catch (e) {
-    return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
-  }
-}
+
+
+
 
 // ---- parseTodos (inline copy) ----
-function parseTodos(output: string): { status: string; content: string }[] {
-  const items: { status: string; content: string }[] = [];
-  for (const raw of output.split("\n")) {
-    const line = raw.trim();
-    let m = line.match(/^\[(x| |~|-)\]\s+(.*)$/);
-    if (m) {
-      const map: Record<string, string> = { x: "completed", " ": "pending", "~": "in_progress", "-": "cancelled" };
-      items.push({ status: map[m[1]] || "pending", content: m[2] });
-      continue;
-    }
-    m = line.match(/^-\s*\[(\w+)\]\s+(.*)$/);
-    if (m) items.push({ status: m[1], content: m[2] });
-  }
-  return items;
-}
+
 
 // ==================== TESTS ====================
 

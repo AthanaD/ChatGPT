@@ -13,6 +13,8 @@ export interface AnthropicUsageDelta {
   /** Cumulative request occupancy, including cached input. */
   promptTokensTotal?: number;
   completionTokensTotal?: number;
+  cachedReadTokens?: number;
+  cachedWriteTokens?: number;
 }
 
 /**
@@ -29,14 +31,20 @@ export class AnthropicUsageTracker {
     if (!value || typeof value !== "object") return undefined;
     const usage = value as Record<string, unknown>;
     const valid = (n: unknown): n is number => typeof n === "number" && Number.isFinite(n) && n >= 0;
+    const previousRead = this.input.cache_read_input_tokens ?? 0;
+    const previousWrite = this.input.cache_creation_input_tokens ?? 0;
     let hasInput = false;
     for (const key of INPUT_FIELDS) {
       const count = usage[key];
       if (!valid(count)) continue;
-      this.input[key] = count;
+      this.input[key] = Math.max(this.input[key] ?? 0, count);
       hasInput = true;
     }
     const event: AnthropicUsageDelta = { type: "usage" };
+    const reads = (this.input.cache_read_input_tokens ?? 0) - previousRead;
+    const writes = (this.input.cache_creation_input_tokens ?? 0) - previousWrite;
+    if (reads > 0) event.cachedReadTokens = reads;
+    if (writes > 0) event.cachedWriteTokens = writes;
     if (hasInput) {
       const total = Math.max(this.promptTotal ?? 0, INPUT_FIELDS.reduce((sum, key) => sum + (this.input[key] ?? 0), 0));
       if (this.promptTotal === undefined || total !== this.promptTotal) event.promptTokens = total - (this.promptTotal ?? 0);

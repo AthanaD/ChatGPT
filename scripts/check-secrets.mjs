@@ -1,11 +1,13 @@
 import { execFileSync } from "node:child_process";
-import { readFileSync } from "node:fs";
+import { readFileSync, existsSync } from "node:fs";
 
-const files = execFileSync("git", ["ls-files", "-z"], { encoding: "utf8" }).split("\0").filter(Boolean);
+const files = execFileSync("git", ["ls-files", "--cached", "--others", "--exclude-standard", "-z"], { encoding: "utf8" }).split("\0").filter(Boolean);
 // Match a credential body, not a bare prefix in documentation or a regex.
 const credential = /\b(?:sk-|tp-|vbk_)[A-Za-z0-9_-]{20,}|\bBearer\s+[A-Za-z0-9._~+/-]{20,}/;
 let failed = false;
-for (const file of files) {
+for (const file of new Set(files)) {
+  // Working-tree deletions still appear in the index until staged.
+  if (!existsSync(file)) continue;
   if (/(?:^|\/)[^/]*\.env(?:\.[^/]+)?$/.test(file) && !file.endsWith(".env.example")) {
     console.error(`${file}: committed environment file`);
     failed = true;

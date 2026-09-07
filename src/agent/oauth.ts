@@ -13,6 +13,9 @@ import * as http from "http";
 import { ProviderEvent, ToolSchema, WireMessage } from "./types";
 import { ChatHTTPError, applyAnthropicReasoning, defaultAnthropicMaxTokens, needsContext1mBeta } from "./provider";
 import { AnthropicUsageTracker } from "./anthropicUsage";
+import { toAnthropic } from "./provider/anthropicMessages";
+import { sseData } from "./provider/sse";
+import { UsageTracker } from "./provider/usage";
 
 export type {
   OAuthKind,
@@ -928,66 +931,12 @@ async function* streamCodex(id: string, opts: {
   yield* parseCodexStream(r.body.getReader());
 }
 
-// ---- Anthropic message shaping (mirrors provider.ts) ----
-
-interface AnthBlock { type: string; text?: string; id?: string; name?: string; input?: unknown; tool_use_id?: string; content?: any; source?: any; }
-
-function toAnthropic(messages: WireMessage[]): { system: AnthBlock[]; messages: { role: "user" | "assistant"; content: string | AnthBlock[] }[] } {
-  const system: AnthBlock[] = [];
-  const out: { role: "user" | "assistant"; content: string | AnthBlock[] }[] = [];
-  for (const m of messages) {
-    if (m.role === "system") {
-      const t = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      if (t) system.push({ type: "text", text: t });
-    } else if (m.role === "user") {
-      if (typeof m.content === "string") out.push({ role: "user", content: m.content });
-      else {
-        const blocks: AnthBlock[] = [];
-        for (const part of m.content) {
-          if (part.type === "text") blocks.push({ type: "text", text: part.text });
-          else if (part.type === "image_url") {
-            const mt = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
-            if (mt) blocks.push({ type: "image", source: { type: "base64", media_type: mt[1], data: mt[2] } });
-          }
-        }
-        out.push({ role: "user", content: blocks });
-      }
-    } else if (m.role === "assistant") {
-      const blocks: AnthBlock[] = [];
-      if (m.content) blocks.push({ type: "text", text: m.content });
-      for (const tc of m.tool_calls ?? []) {
-        let input: unknown = {};
-        try { input = JSON.parse(tc.function.arguments || "{}"); } catch { /* keep {} */ }
-        blocks.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
-      }
-      out.push({ role: "assistant", content: blocks.length ? blocks : "" });
-    } else if (m.role === "tool") {
-      const content = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
-      const block: AnthBlock = { type: "tool_result", tool_use_id: m.tool_call_id, content };
-      const last = out[out.length - 1];
-      if (last && last.role === "user" && Array.isArray(last.content)) last.content.push(block);
-      else out.push({ role: "user", content: [block] });
-    }
-  }
-  return { system, messages: out };
-}
-
 async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
-  const decoder = new TextDecoder();
-  let buf = "";
   let finishReason = "stop";
+  let finished = false;
   const usageTracker = new AnthropicUsageTracker();
   const toolBlocks: Record<number, { id: string; name: string; args: string }> = {};
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
+  for await (const data of sseData(reader)) {
       if (!data || data === "[DONE]") continue;
       let chunk: any;
       try { chunk = JSON.parse(data); } catch { continue; }
@@ -1011,15 +960,17 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
           if (tb) { tb.args += d.partial_json ?? ""; yield { type: "tool-call-args-delta", index: chunk.index, delta: d.partial_json ?? "" }; }
         }
       } else if (chunk.type === "message_delta") {
-        if (chunk.delta?.stop_reason) finishReason = chunk.delta.stop_reason;
+        if (chunk.delta?.stop_reason) { finishReason = chunk.delta.stop_reason; finished = true; }
         const usage = usageTracker.update(chunk.usage);
         if (usage) yield usage;
+      } else if (chunk.type === "message_stop") {
+        finished = true;
       } else if (chunk.type === "message_start" && chunk.message?.usage) {
         const usage = usageTracker.update(chunk.message.usage);
         if (usage) yield usage;
       }
-    }
   }
+  if (!finished) throw new ChatHTTPError(502, "claude-code stream ended before completion");
   for (const idx of Object.keys(toolBlocks).map(Number).sort((a, b) => a - b)) {
     const a = toolBlocks[idx];
     if (a.name) yield { type: "tool-call", call: { id: a.id || `call_${idx}`, name: a.name, arguments: a.args || "{}" } };
@@ -1035,7 +986,13 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
 function toResponsesInput(messages: WireMessage[]): { instructions: string; input: any[] } {
   const instr: string[] = [];
   const input: any[] = [];
+  let toolImages: { type: "input_image"; image_url: string }[] = [];
+  const flushImages = () => {
+    if (toolImages.length) input.push({ role: "user", content: toolImages });
+    toolImages = [];
+  };
   for (const m of messages) {
+    if (m.role !== "tool") flushImages();
     if (m.role === "system") {
       instr.push(typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n"));
     } else if (m.role === "user") {
@@ -1052,31 +1009,30 @@ function toResponsesInput(messages: WireMessage[]): { instructions: string; inpu
     } else if (m.role === "tool") {
       const out = typeof m.content === "string" ? m.content : m.content.filter((p) => p.type === "text").map((p: any) => p.text).join("\n");
       input.push({ type: "function_call_output", call_id: m.tool_call_id, output: out });
+      if (Array.isArray(m.content)) for (const part of m.content) {
+        if (part.type === "image_url") toolImages.push({ type: "input_image", image_url: part.image_url.url });
+      }
     }
   }
+  flushImages();
   return { instructions: instr.filter(Boolean).join("\n\n"), input };
 }
 
 async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
-  const decoder = new TextDecoder();
-  let buf = "";
-  let finishReason = "stop";
+  const finishReason = "stop";
+  let finished = false;
+  const usage = new UsageTracker();
   let toolIndex = 0;
   // Map internal item_id (fc_…) → tool call index/metadata.
   const items = new Map<string, { index: number; id: string; name: string; args: string }>();
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
+  for await (const data of sseData(reader)) {
       if (!data || data === "[DONE]") continue;
       let ev: any;
       try { ev = JSON.parse(data); } catch { continue; }
+      if (ev.response?.usage) {
+        const event = usage.update(ev.response.usage.input_tokens, ev.response.usage.output_tokens, ev.response.usage.input_tokens_details?.cached_tokens);
+        if (event) yield event;
+      }
       switch (ev.type) {
         case "response.output_text.delta":
           if (ev.delta) yield { type: "text-delta", text: ev.delta };
@@ -1107,13 +1063,17 @@ async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint8Array>
           break;
         }
         case "response.completed":
-          if (ev.response?.usage) yield { type: "usage", promptTokens: ev.response.usage.input_tokens, completionTokens: ev.response.usage.output_tokens };
+          finished = true;
           break;
+        case "error":
+          throw new ChatHTTPError(502, `codex stream error: ${ev.message || ev.error?.message || "unknown error"}`);
+        case "response.incomplete":
+          throw new ChatHTTPError(400, `codex response incomplete: ${ev.response?.incomplete_details?.reason || "interrupted generation"}`);
         case "response.failed":
           throw new ChatHTTPError(500, `codex: ${ev.response?.error?.message || "response failed"}`);
       }
-    }
   }
+  if (!finished) throw new ChatHTTPError(502, "codex stream ended before completion");
   for (const meta of [...items.values()].sort((a, b) => a.index - b.index)) {
     if (meta.name) yield { type: "tool-call", call: { id: meta.id, name: meta.name, arguments: meta.args || "{}" } };
   }
@@ -1172,6 +1132,11 @@ function toGemini(messages: WireMessage[]): { system?: { parts: GeminiPart[] }; 
       let response: any;
       try { response = JSON.parse(out); } catch { response = { result: out }; }
       pushUserPart({ functionResponse: { name: toolNames.get(m.tool_call_id) ?? m.tool_call_id, response } });
+      if (Array.isArray(m.content)) for (const part of m.content) {
+        if (part.type !== "image_url") continue;
+        const match = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
+        if (match) pushUserPart({ inlineData: { mimeType: match[1], data: match[2] } });
+      }
     }
   }
   return { system: sys.length ? { parts: sys } : undefined, contents };
@@ -1230,29 +1195,28 @@ async function* streamAntigravity(id: string, opts: {
 }
 
 async function* parseGeminiStream(reader: ReadableStreamDefaultReader<Uint8Array>): AsyncGenerator<ProviderEvent> {
-  const decoder = new TextDecoder();
-  let buf = "";
   let finishReason = "stop";
+  let finished = false;
+  const usage = new UsageTracker();
   let toolIndex = 0;
   const calls: { id: string; name: string; args: string }[] = [];
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
+  for await (const data of sseData(reader)) {
       if (!data || data === "[DONE]") continue;
       let chunk: any;
       try { chunk = JSON.parse(data); } catch { continue; }
       // Antigravity may wrap the Gemini payload under `response`.
       const resp = chunk.response ?? chunk;
+      if (resp.usageMetadata) {
+        const u = resp.usageMetadata;
+        const output = typeof u.candidatesTokenCount === "number" || typeof u.thoughtsTokenCount === "number"
+          ? (u.candidatesTokenCount ?? 0) + (u.thoughtsTokenCount ?? 0) : undefined;
+        const event = usage.update(u.promptTokenCount, output, u.cachedContentTokenCount);
+        if (event) yield event;
+      }
+      if (resp.error) throw new ChatHTTPError(Number(resp.error.code) || 502, `antigravity stream error: ${resp.error.message || "unknown error"}`);
+      if (resp.promptFeedback?.blockReason) throw new ChatHTTPError(400, `antigravity blocked prompt: ${resp.promptFeedback.blockReason}`);
       const cand = resp.candidates?.[0];
       if (!cand) {
-        if (resp.usageMetadata) yield { type: "usage", promptTokens: resp.usageMetadata.promptTokenCount, completionTokens: resp.usageMetadata.candidatesTokenCount };
         continue;
       }
       for (const part of cand.content?.parts ?? []) {
@@ -1268,10 +1232,13 @@ async function* parseGeminiStream(reader: ReadableStreamDefaultReader<Uint8Array
           else yield { type: "text-delta", text: part.text };
         }
       }
-      if (cand.finishReason) finishReason = String(cand.finishReason).toLowerCase();
-      if (resp.usageMetadata) yield { type: "usage", promptTokens: resp.usageMetadata.promptTokenCount, completionTokens: resp.usageMetadata.candidatesTokenCount };
-    }
+      if (cand.finishReason) {
+        finishReason = String(cand.finishReason).toLowerCase();
+        finished = true;
+        if (!["stop", "max_tokens"].includes(finishReason)) throw new ChatHTTPError(400, `antigravity ended generation: ${finishReason}`);
+      }
   }
+  if (!finished) throw new ChatHTTPError(502, "antigravity stream ended before completion");
   for (const c of calls) yield { type: "tool-call", call: { id: c.id, name: c.name, arguments: c.args || "{}" } };
-  yield { type: "done", finishReason: finishReason === "stop" ? "stop" : calls.length ? "tool_calls" : finishReason };
+  yield { type: "done", finishReason: finishReason === "stop" && calls.length ? "tool_calls" : finishReason };
 }

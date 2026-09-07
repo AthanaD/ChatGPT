@@ -102,6 +102,7 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
     }),
   ]);
 
+  if (abortSignal?.aborted) { releaseQueue(); return { output: "error: cancelled before shell execution" }; }
   let cwd = session.cwd || root;
   if (input.working_directory) {
     try {
@@ -144,6 +145,7 @@ export const runTerminalTool = defineTool("Shell", true, async (input, abortSign
   // shell dies with it, so there is nothing left to wait on once it finishes.
   let proc: ReturnType<typeof spawnShellCommand>;
   try {
+    abortSignal?.throwIfAborted();
     proc = spawnShellCommand(command, cwd);
   } catch (e) {
     releaseQueue();

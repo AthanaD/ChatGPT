@@ -77,6 +77,12 @@ export type ProviderEvent =
     /** Cumulative request totals when streamed usage fields are billing deltas. */
     promptTokensTotal?: number;
     completionTokensTotal?: number;
+    /** Cache counters are billing deltas; cached reads are included in promptTokens. */
+    cachedReadTokens?: number;
+    cachedWriteTokens?: number;
+    /** One identity per HTTP attempt, including attempts that later fail. */
+    requestId?: string;
+    model?: string;
   }
   | { type: "done"; finishReason: string };
 
@@ -90,7 +96,7 @@ export type AgentEvent =
   | { type: "tool-call-progress"; callId: string; text: string }
   | { type: "tool-call-completed"; callId: string; name: string; status: "completed" | "error"; result: string; diff?: string; startLine?: number; endLine?: number }
   | { type: "run-status"; status: "running" | "finished" | "error" | "cancelled" }
-  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number }
+  | { type: "usage"; promptTokens: number; completionTokens: number; totalTokens: number; model?: string; requestId?: string; source?: "parent" | "summary" | "subagent"; cachedReadTokens?: number; cachedWriteTokens?: number }
   | { type: "run-result"; text: string; durationMs: number }
   | { type: "subagent-event"; callId: string; event: AgentEvent }
   | { type: "mode-changed"; mode: Mode }

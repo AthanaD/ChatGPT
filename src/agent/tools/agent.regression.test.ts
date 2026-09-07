@@ -114,4 +114,11 @@ describe("TodoWrite production handler", () => {
       { id: "empty", content: "unnamed", status: "pending" },
     ]);
   });
+  it("does not overwrite an explicitly assigned id when normalizing another incoming task", async () => {
+    const ctx: ToolContext = { todos: [] };
+    await todoWriteTool.execute({ merge: true, todos: [{ id: "auto_1", content: "Explicit" }, { content: "Generated" }] }, undefined, undefined, ctx);
+    expect(ctx.todos).toHaveLength(2);
+    expect(new Set(ctx.todos.map((todo) => todo.id)).size).toBe(2);
+    expect(ctx.todos.map((todo) => todo.content)).toEqual(["Explicit", "Generated"]);
+  });
 });

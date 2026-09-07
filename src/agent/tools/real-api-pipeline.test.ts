@@ -1,3 +1,6 @@
+import { parseTodos } from "../../shared/todoPresentation";
+import { writeTodos as todoWriteHandler } from "./todoState";
+import type { TodoItem, ToolContext } from "./types";
 /**
  * REAL API PIPELINE TESTS — calls the actual Verboo API, parses the real
  * model response, feeds through handler, verifies UI render.
@@ -108,63 +111,14 @@ async function callRealAPI(prompt: string, model = "glm-4.7-flash"): Promise<{
   }
 }
 
-// ---- Handler (exact copy from agent.ts) ----
-interface TodoItem { id: string; content: string; status: "pending" | "in_progress" | "completed" | "cancelled"; }
-interface ToolContext { todos: TodoItem[]; }
+// State changes run through the production todo implementation.
 
-function todoWriteHandler(input: any, ctx: ToolContext): { output: string } {
-  try {
-    if (!ctx) return { output: "error: todo context unavailable" };
-    if (!Array.isArray(ctx.todos)) ctx.todos = [];
-    const raw: any[] = Array.isArray(input?.todos) ? input.todos
-      : Array.isArray(input?.tasks) ? input.tasks
-      : Array.isArray(input?.items) ? input.items
-      : Array.isArray(input) ? input : [];
-    const incoming: TodoItem[] = raw.map((t: any, i: number) => {
-      if (typeof t === "string") return { id: `auto_${i}`, content: t, status: "pending" as const };
-      if (t && typeof t === "object") {
-        return {
-          id: t.id || `auto_${i}`,
-          content: String(t.content || t.text || t.title || t.name || "unnamed"),
-          status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status) ? t.status : "pending") as TodoItem["status"],
-        };
-      }
-      return null;
-    }).filter(Boolean) as TodoItem[];
-    if (incoming.length === 0 && ctx.todos.length === 0) {
-      // Model called TodoWrite without arguments — create placeholder
-      ctx.todos = [{ id: "auto_0", content: "Working on task...", status: "in_progress" }];
-    }
-    if (input?.merge) {
-      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
-      for (const t of incoming) {
-        const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        byId.set(key, { ...byId.get(key), ...t, id: key });
-      }
-      ctx.todos = [...byId.values()];
-    } else if (incoming.length > 0) {
-      ctx.todos = incoming;
-    }
-    const render = ctx.todos.map((t) => {
-      const mark = t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-      return `${mark} ${t.content || "unnamed"}`;
-    }).join("\n");
-    return { output: render || "(no todos)" };
-  } catch { return { output: `(todos: ${ctx?.todos?.length || 0} items)` }; }
-}
 
-// ---- parseTodos (exact copy from Tool.tsx) ----
-function parseTodos(output: string): { status: string; content: string }[] {
-  const items: { status: string; content: string }[] = [];
-  for (const raw of output.split("\n")) {
-    const line = raw.trim();
-    let m = line.match(/^\[(x| |~|-)\]\s+(.*)$/);
-    if (m) { const map: Record<string, string> = { x: "completed", " ": "pending", "~": "in_progress", "-": "cancelled" }; items.push({ status: map[m[1]] || "pending", content: m[2] }); continue; }
-    m = line.match(/^-\s*\[(\w+)\]\s+(.*)$/);
-    if (m) items.push({ status: m[1], content: m[2] });
-  }
-  return items;
-}
+
+
+
+// State changes run through the production todo implementation.
+
 
 // ==================== TESTS ====================
 
@@ -460,15 +414,15 @@ describe("PIPELINE: simulate full model response with 50 tasks", () => {
     expect(ctx.todos.length).toBe(50);
   });
 
-  it("simulate proxy stripping args — handler creates placeholder", () => {
+  it("simulate proxy stripping args — handler does not invent tasks", () => {
     const modelResponse = {}; // Empty object (proxy stripped args)
 
     const ctx: ToolContext = { todos: [] };
     const handlerResult = todoWriteHandler(modelResponse, ctx);
 
     expect(handlerResult.output.startsWith("error:")).toBe(false);
-    // Handler creates a placeholder so the UI shows something
-    expect(ctx.todos.length).toBe(1);
-    expect(ctx.todos[0].content).toBe("Working on task...");
+    // Missing provider arguments cannot create work that was never requested.
+    expect(ctx.todos.length).toBe(0);
+    expect(handlerResult.output).toBe("(no todos)");
   });
 });

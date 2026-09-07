@@ -1,4 +1,5 @@
 const esbuild = require("esbuild");
+const { hostBuildOptions } = require("./esbuild-options.cjs");
 
 const production = process.argv.includes('--production');
 const watch = process.argv.includes('--watch');
@@ -25,17 +26,14 @@ const esbuildProblemMatcherPlugin = {
 
 async function main() {
 	const ctx = await esbuild.context({
+		...hostBuildOptions,
 		entryPoints: [
 			'src/extension.ts'
 		],
-		bundle: true,
-		format: 'cjs',
 		minify: production,
 		sourcemap: !production,
 		sourcesContent: false,
-		platform: 'node',
 		outfile: 'dist/extension.js',
-		external: ['vscode', '@huggingface/transformers', '@huggingface/hub', 'onnxruntime-node', 'sharp'],
 		logLevel: 'silent',
 		plugins: [
 			/* add to the end of plugins array */

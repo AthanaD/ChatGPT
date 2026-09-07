@@ -75,6 +75,7 @@ vi.mock("./tools/shared", () => ({
 	DEFAULT_TOOL_TIMEOUTS_SEC: {}, getSubagentRunner: vi.fn(), getQuestionAsker: vi.fn(),
 	slugify: vi.fn(), makeDiff: vi.fn(), firstDiffLine: vi.fn(),
 }));
+vi.mock("../stores/fileMutations", () => ({ mutateFile: vi.fn() }));
 vi.mock("../stores/pendingChanges", () => ({ pendingChanges: {} }));
 vi.mock("../context/workspaceUtils", () => ({
 	getWorkspaceRoot: () => "/workspace",
@@ -374,7 +375,7 @@ describe("runAgent context consumption", () => {
 			answer(final),
 		]);
 		expect(fixture.approve).toHaveBeenCalledWith(selected.qualifiedName, input, "selected-mcp");
-		if (approved) expect(fixture.callMcp).toHaveBeenCalledWith(selected.qualifiedName, input);
+		if (approved) expect(fixture.callMcp).toHaveBeenCalledWith(selected.qualifiedName, input, expect.any(AbortSignal));
 		else expect(fixture.callMcp).not.toHaveBeenCalled();
 		expect(fixture.requests[0].tools).toEqual(fixture.requests[1].tools);
 		expect(fixture.requests[2].tools).toEqual(fixture.requests[3].tools);
@@ -580,4 +581,70 @@ describe("runAgent context consumption", () => {
 		expect(second.history).toContainEqual(expect.objectContaining({ kind: "tool-result", output: expect.stringContaining("DETAIL_PRESERVED_IN_SAVED_TRANSCRIPT") }));
 		for (const request of fixture.requests) expectCompleteToolGroups(request.messages);
 	});
+});
+
+describe("immutable run permissions", () => {
+  it("refuses Ask mode escalation before a subsequent write", async () => {
+    const { history } = await run([
+      toolTurn(call("SwitchMode", { target_mode_id: "agent" }, "switch")),
+      toolTurn(call("Write", { path: "a", contents: "bad" }, "write")), answer("Cannot edit in Ask mode."),
+    ], { mode: "ask" });
+    expect(fixture.executions).toEqual([]);
+    expect(history.filter(s => s.kind === "tool-result")).toEqual(expect.arrayContaining([
+      expect.objectContaining({ callId: "switch", status: "error", output: expect.stringContaining("permissions") }),
+      expect.objectContaining({ callId: "write", status: "error" }),
+    ]));
+  });
+  it("keeps custom children read-only and inherits disabled web tools", async () => {
+    await run([
+      toolTurn(call("Task", { prompt: "edit", readonly: true, subagent_type: "custom" }, "task")),
+      toolTurn(call("Write", { path: "a", contents: "bad" }, "child-write"), call("WebFetch", { url: "https://example.com" }, "child-web")),
+      answer("Child done"), answer("Done"),
+    ], { mode: "ask", enableWebFetch: false, customSubagents: [{ name: "custom", readonly: false, prompt: "Edit", description: "edit", id: "custom" }] });
+    expect(fixture.executions).toEqual([]);
+    expect(fixture.requests[1].tools?.some(t => ["Write", "WebFetch"].includes(t.function.name))).toBe(false);
+  });
+  it("runs generic MCP calls through approval and beforeMcp hooks", async () => {
+    const hook = vi.fn(async () => "blocked fixture");
+    await run([toolTurn(call("CallMcpTool", { server: "test", toolName: "write", arguments: { value: 1 } }, "mcp")), answer("Blocked")], { onHook: hook });
+    expect(fixture.approve).toHaveBeenCalledWith("mcp__test__write", { value: 1 }, "mcp");
+    expect(hook).toHaveBeenCalledWith('beforeMcp', { tool: "mcp__test__write", tool_input: '{"value":1}' }, "mcp__test__write", expect.any(AbortSignal));
+    expect(fixture.callMcp).not.toHaveBeenCalled();
+  });
+  it("does not dispatch a tool if Stop arrives while approval resolves", async () => {
+    const abort = new AbortController();
+    const { events } = await run([toolTurn(call("Write", { path: "a", contents: "bad" }, "write"))], {
+      signal: abort.signal, approve: async () => { abort.abort(); return true; },
+    });
+    expect(fixture.executions).toEqual([]);
+    expect(events).toContainEqual(expect.objectContaining({ type: "tool-call-completed", status: "error", result: expect.stringContaining("cancelled") }));
+  });
+});
+
+describe("native file-edit hooks", () => {
+  it("vetoes a permitted Write before mutation with native input", async () => {
+    const hook = vi.fn(async (event: string) => event === "beforeEdit" ? "protected by hook" : undefined);
+    const { history } = await run([toolTurn(call("Write", { path: "a.ts", contents: "new" }, "edit")), answer("Hook blocked the edit")], { onHook: hook });
+    expect(hook).toHaveBeenCalledWith("beforeEdit", { path: "a.ts", tool_input: JSON.stringify({ path: "a.ts", contents: "new", file_path: "a.ts", content: "new" }) }, "Write", expect.any(AbortSignal));
+    expect(fixture.executions).toEqual([]);
+    expect(history).toContainEqual(expect.objectContaining({ kind: "tool-result", status: "error", output: "blocked by hook: protected by hook" }));
+  });
+});
+
+
+it("passes the child cancellation signal into its blocking hook", async () => {
+  const parent = new AbortController();
+  const aborts = new Map<string, () => void>();
+  let childSignal: AbortSignal | undefined;
+  await run([
+    toolTurn(call("Task", { prompt: "Run a check", description: "Check" }, "child")),
+    toolTurn(call("Shell", { command: "echo check" }, "shell")), answer("Child stopped."),
+  ], {
+    signal: parent.signal, registerSubagentAbort: (id, abort) => { aborts.set(id, abort); },
+    onBeforeShell: async (_command, signal) => { childSignal = signal; aborts.get("child")!(); return "cancelled"; },
+  });
+  expect(childSignal).not.toBe(parent.signal);
+  expect(childSignal?.aborted).toBe(true);
+  expect(parent.signal.aborted).toBe(false);
+  expect(fixture.executions).toEqual([]);
 });

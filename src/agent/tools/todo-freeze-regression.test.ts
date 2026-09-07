@@ -1,3 +1,6 @@
+import { parseTodos } from "../../shared/todoPresentation";
+import { writeTodos as todoWriteHandler } from "./todoState";
+import type { TodoItem, ToolContext } from "./types";
 /**
  * TODO FREEZE REGRESSION TESTS
  *
@@ -16,95 +19,17 @@ import { describe, it, expect } from "vitest";
 
 // ==================== TYPES ====================
 
-interface TodoItem {
-  id: string;
-  content: string;
-  status: "pending" | "in_progress" | "completed" | "cancelled";
-}
 
-interface ToolContext {
-  todos: TodoItem[];
-}
 
-// ==================== HANDLER (exact copy from agent.ts lines 25-86) ====================
 
-function todoWriteHandler(input: any, ctx: ToolContext): { output: string } {
-  try {
-    if (!ctx) return { output: "error: todo context unavailable" };
-    if (!Array.isArray(ctx.todos)) ctx.todos = [];
 
-    const raw: any[] = Array.isArray(input?.todos) ? input.todos
-      : Array.isArray(input?.tasks) ? input.tasks
-      : Array.isArray(input?.items) ? input.items
-      : Array.isArray(input) ? input
-      : [];
-    const incoming: TodoItem[] = raw.map((t: any, i: number) => {
-      if (typeof t === "string") {
-        return { id: `auto_${i}`, content: t, status: "pending" as const };
-      }
-      if (t && typeof t === "object") {
-        return {
-          id: t.id || `auto_${i}`,
-          content: String(t.content || t.text || t.title || t.name || "unnamed"),
-          status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status)
-            ? t.status
-            : "pending") as TodoItem["status"],
-        };
-      }
-      return null;
-    }).filter((t): t is TodoItem => t !== null);
+// State changes run through the production todo implementation.
 
-    if (incoming.length === 0 && ctx.todos.length === 0) {
-      return {
-        output: "TodoWrite requires items. Call again with: todos=[{content:'Task 1',status:'pending'}]",
-      };
-    }
 
-    if (input?.merge) {
-      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
-      for (const t of incoming) {
-        const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        byId.set(key, { ...byId.get(key), ...t, id: key });
-      }
-      ctx.todos = [...byId.values()];
-    } else if (incoming.length > 0) {
-      ctx.todos = incoming;
-    }
 
-    const render = ctx.todos
-      .map((t) => {
-        const mark =
-          t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-        return `${mark} ${t.content || "unnamed"}`;
-      })
-      .join("\n");
-    return { output: render || "(no todos)" };
-  } catch (e) {
-    return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
-  }
-}
+// State changes run through the production todo implementation.
 
-// ==================== UI PARSER (exact copy from Tool.tsx / sidebarProvider) ====================
 
-function parseTodos(output: string): { status: string; content: string }[] {
-  const items: { status: string; content: string }[] = [];
-  for (const raw of output.split("\n")) {
-    const line = raw.trim();
-    // Pattern 1: "[x] content" / "[ ] content" / "[~] content" / "[-] content"
-    const m1 = line.match(/^\[(x| |~|-)\]\s+(.*)$/);
-    if (m1) {
-      const map: Record<string, string> = { x: "completed", " ": "pending", "~": "in_progress", "-": "cancelled" };
-      items.push({ status: map[m1[1]] || "pending", content: m1[2] });
-      continue;
-    }
-    // Pattern 2: "- [status] content"
-    const m2 = line.match(/^-\s*\[(\w+)\]\s+(.*)$/);
-    if (m2) {
-      items.push({ status: m2[1], content: m2[2] });
-    }
-  }
-  return items;
-}
 
 // ==================== HELPER ====================
 
@@ -212,9 +137,9 @@ describe("FREEZE REGRESSION: 15 exact scenarios that caused the todo freeze", ()
     expect(ctx.todos.length).toBe(0);
     // The message is NOT prefixed with "error:" (avoids red X in UI)
     expect(hasErrorPrefix(handlerOutput)).toBe(false);
-    // Contains actionable guidance for the model
-    expect(handlerOutput).toContain("TodoWrite requires items");
-    // parseTodos produces empty list (guidance message has no checkboxes)
+    // Empty malformed payloads must not invent work or force another turn.
+    expect(handlerOutput).toBe("(no todos)");
+    // Empty output produces no task rows.
     const uiItems = parseTodos(handlerOutput);
     expect(uiItems.length).toBe(0);
   });
@@ -228,7 +153,7 @@ describe("FREEZE REGRESSION: 15 exact scenarios that caused the todo freeze", ()
 
     expect(ctx.todos.length).toBe(0);
     expect(hasErrorPrefix(handlerOutput)).toBe(false);
-    expect(handlerOutput).toContain("TodoWrite requires items");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
   // ------------------------------------------------------------------
@@ -241,7 +166,7 @@ describe("FREEZE REGRESSION: 15 exact scenarios that caused the todo freeze", ()
     // "single task" is not an array — falls through to empty raw[]
     expect(ctx.todos.length).toBe(0);
     expect(hasErrorPrefix(handlerOutput)).toBe(false);
-    expect(handlerOutput).toContain("TodoWrite requires items");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
   // ------------------------------------------------------------------
@@ -253,7 +178,7 @@ describe("FREEZE REGRESSION: 15 exact scenarios that caused the todo freeze", ()
 
     expect(ctx.todos.length).toBe(0);
     expect(hasErrorPrefix(handlerOutput)).toBe(false);
-    expect(handlerOutput).toContain("TodoWrite requires items");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
   // ------------------------------------------------------------------
@@ -632,21 +557,21 @@ describe("FREEZE REGRESSION: edge cases that also freeze the panel", () => {
     const { handlerOutput, ctx } = simulateFullFlow({ todos: "single task" });
     expect(ctx.todos.length).toBe(0);
     expect(hasErrorPrefix(handlerOutput)).toBe(false);
-    expect(handlerOutput).toContain("TodoWrite requires items");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
   it("null input entirely", () => {
     const { handlerOutput, ctx } = simulateFullFlow(null);
     expect(ctx.todos.length).toBe(0);
     expect(hasErrorPrefix(handlerOutput)).toBe(false);
-    expect(handlerOutput).toContain("TodoWrite requires items");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
   it("undefined input entirely", () => {
     const { handlerOutput, ctx } = simulateFullFlow(undefined);
     expect(ctx.todos.length).toBe(0);
     expect(hasErrorPrefix(handlerOutput)).toBe(false);
-    expect(handlerOutput).toContain("TodoWrite requires items");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
   it("parseTodos: handler error message produces empty UI list (not freeze)", () => {

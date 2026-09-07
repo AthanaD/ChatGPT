@@ -1,3 +1,6 @@
+import { parseTodos } from "../../shared/todoPresentation";
+import { writeTodos as todoWriteHandler } from "./todoState";
+import type { TodoItem, ToolContext } from "./types";
 /**
  * INTEGRATION TESTS — simulates the COMPLETE flow from model input to UI render.
  * Tests what deepseek-v4-flash ACTUALLY sends, not what we expect.
@@ -5,82 +8,14 @@
 import { describe, it, expect } from "vitest";
 
 // ---- Types ----
-interface TodoItem { id: string; content: string; status: "pending" | "in_progress" | "completed" | "cancelled"; }
-interface ToolContext { todos: TodoItem[]; }
 
-// ---- Handler (exact copy from agent.ts) ----
-function todoWriteHandler(input: any, ctx: ToolContext): { output: string } {
-  try {
-    if (!ctx) return { output: "error: todo context unavailable" };
-    if (!Array.isArray(ctx.todos)) ctx.todos = [];
 
-    const raw: any[] = Array.isArray(input?.todos) ? input.todos
-      : Array.isArray(input?.tasks) ? input.tasks
-      : Array.isArray(input?.items) ? input.items
-      : Array.isArray(input) ? input
-      : [];
 
-    const incoming: TodoItem[] = raw.map((t, i) => {
-      if (typeof t === "string") {
-        return { id: `auto_${i}`, content: t, status: "pending" as const };
-      }
-      if (t && typeof t === "object") {
-        return {
-          id: t.id || `auto_${i}`,
-          content: String(t.content || t.text || t.title || t.name || "unnamed"),
-          status: (["pending", "in_progress", "completed", "cancelled"].includes(t.status) ? t.status : "pending") as TodoItem["status"],
-        };
-      }
-      return null;
-    }).filter(Boolean) as TodoItem[];
+// State changes run through the production todo implementation.
 
-    if (incoming.length === 0 && ctx.todos.length === 0) {
-      return {
-        output: "ERROR: You called TodoWrite with an empty list.",
-      };
-    }
 
-    if (input?.merge) {
-      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
-      for (const t of incoming) {
-        const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-        byId.set(key, { ...byId.get(key), ...t, id: key });
-      }
-      ctx.todos = [...byId.values()];
-    } else if (incoming.length > 0) {
-      ctx.todos = incoming;
-    }
+// State changes run through the production todo implementation.
 
-    const render = ctx.todos
-      .map((t) => {
-        const mark = t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-        return `${mark} ${t.content || "unnamed"}`;
-      })
-      .join("\n");
-    return { output: render || "(no todos)" };
-  } catch (e) {
-    return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
-  }
-}
-
-// ---- UI parser (exact copy from Tool.tsx) ----
-function parseTodos(output: string): { status: string; content: string }[] {
-  const items: { status: string; content: string }[] = [];
-  for (const raw of output.split("\n")) {
-    const line = raw.trim();
-    let m = line.match(/^\[(x| |~|-)\]\s+(.*)$/);
-    if (m) {
-      const map: Record<string, string> = { x: "completed", " ": "pending", "~": "in_progress", "-": "cancelled" };
-      items.push({ status: map[m[1]] || "pending", content: m[2] });
-      continue;
-    }
-    m = line.match(/^-\s*\[(\w+)\]\s+(.*)$/);
-    if (m) {
-      items.push({ status: m[1], content: m[2] });
-    }
-  }
-  return items;
-}
 
 // ---- Full integration: handler → parseTodos → UI ----
 function simulateFullFlow(input: any): { handlerOutput: string; uiItems: { status: string; content: string }[]; ctx: ToolContext } {
@@ -93,9 +28,9 @@ function simulateFullFlow(input: any): { handlerOutput: string; uiItems: { statu
 // ==================== TESTS ====================
 
 describe("INTEGRATION: deepseek-v4-flash actual inputs", () => {
-  it("deepseek sends todos: [] (empty array) → error, not (no todos)", () => {
+  it("deepseek sends todos: [] (empty array) → no invented todos", () => {
     const { handlerOutput, uiItems } = simulateFullFlow({ todos: [], merge: false });
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
     expect(uiItems.length).toBe(0);
   });
 
@@ -139,49 +74,49 @@ describe("INTEGRATION: deepseek-v4-flash actual inputs", () => {
 });
 
 describe("INTEGRATION: malformed inputs that cause (no todos)", () => {
-  it("input is null → error", () => {
+  it("input is null → no invented todos", () => {
     const { handlerOutput } = simulateFullFlow(null);
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
-  it("input is undefined → error", () => {
+  it("input is undefined → no invented todos", () => {
     const { handlerOutput } = simulateFullFlow(undefined);
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
-  it("input is empty object → error", () => {
+  it("input is empty object → no invented todos", () => {
     const { handlerOutput } = simulateFullFlow({});
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
-  it("input.todos is null → error", () => {
+  it("input.todos is null → no invented todos", () => {
     const { handlerOutput } = simulateFullFlow({ todos: null, merge: false });
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
-  it("input.todos is string → error (not array)", () => {
+  it("input.todos is string → no invented todos (not array)", () => {
     const { handlerOutput } = simulateFullFlow({ todos: "not an array", merge: false });
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
-  it("input.todos is number → error (not array)", () => {
+  it("input.todos is number → no invented todos (not array)", () => {
     const { handlerOutput } = simulateFullFlow({ todos: 42, merge: false });
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
-  it("input.todos is boolean → error (not array)", () => {
+  it("input.todos is boolean → no invented todos (not array)", () => {
     const { handlerOutput } = simulateFullFlow({ todos: true, merge: false });
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
-  it("input.todos is object (not array) → error", () => {
+  it("input.todos is object (not array) → no invented todos", () => {
     const { handlerOutput } = simulateFullFlow({ todos: { task: "A" }, merge: false });
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 
-  it("input has no todos/tasks/items fields → error", () => {
+  it("input has no todos/tasks/items fields → no invented todos", () => {
     const { handlerOutput } = simulateFullFlow({ merge: false, other: "data" });
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 });
 
@@ -213,9 +148,9 @@ describe("INTEGRATION: mixed valid/invalid items", () => {
     expect(ctx.todos[0].status).toBe("pending");
   });
 
-  it("array with all nulls → error (nothing survives filter)", () => {
+  it("array with all nulls → no invented todos (nothing survives filter)", () => {
     const { handlerOutput } = simulateFullFlow({ todos: [null, null, null], merge: false });
-    expect(handlerOutput).toContain("ERROR");
+    expect(handlerOutput).toBe("(no todos)");
   });
 });
 

@@ -1,49 +1,17 @@
+import { writeTodos as todoWriteHandler, readTodos as todoReadHandler } from "./todoState";
+import type { TodoItem, ToolContext } from "./types";
 /**
  * PROOF tests — simulates exactly what Mimo V2.5 sends to TodoWrite.
  * Every test MUST pass or the extension is broken.
  */
 import { describe, it, expect } from "vitest";
 
-interface TodoItem {
-  id?: string;
-  content: string;
-  status: "pending" | "in_progress" | "completed" | "cancelled";
-}
 
-interface ToolContext {
-  todos: TodoItem[];
-}
 
-// Exact handler from agent.ts
-function todoWriteHandler(input: any, ctx: ToolContext): { output: string } {
-  try {
-    if (!ctx) return { output: "error: todo context unavailable" };
-    if (!Array.isArray(ctx.todos)) ctx.todos = [];
-    const incoming: TodoItem[] = Array.isArray(input?.todos) ? input.todos : [];
-    if (input?.merge) {
-      const byId = new Map(ctx.todos.map((t) => [t.id || `auto_${ctx.todos.indexOf(t)}`, t]));
-      for (const t of incoming) {
-        if (t && typeof t === "object") {
-          const key = t.id || `gen_${Date.now()}_${Math.random().toString(36).slice(2, 6)}`;
-          byId.set(key, { ...byId.get(key), ...t, id: key });
-        }
-      }
-      ctx.todos = [...byId.values()];
-    } else if (incoming.length > 0) {
-      ctx.todos = incoming.filter((t) => t && typeof t === "object");
-    }
-    const render = ctx.todos
-      .map((t) => {
-        const mark =
-          t.status === "completed" ? "[x]" : t.status === "in_progress" ? "[~]" : t.status === "cancelled" ? "[-]" : "[ ]";
-        return `${mark} ${t.content || "unnamed"}`;
-      })
-      .join("\n");
-    return { output: render || "(no todos)" };
-  } catch (e) {
-    return { output: `(todos: ${ctx?.todos?.length || 0} items)` };
-  }
-}
+
+
+// State changes run through the production todo implementation.
+
 
 // ============================================================
 // MIMO V2.5 ACTUAL PAYLOADS — these are what the model sends
@@ -51,7 +19,7 @@ function todoWriteHandler(input: any, ctx: ToolContext): { output: string } {
 
 describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
   it("Mimo call #1: create todos WITHOUT id (merge=false)", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
     // This is EXACTLY what Mimo sends — no id field
     const r = todoWriteHandler({
       todos: [
@@ -84,7 +52,7 @@ describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
         { content: "Fetch key Claude Code issues", status: "pending" },
         { content: "Propose improvements", status: "pending" },
       ],
-    };
+    } as unknown as ToolContext;
     // Mimo sends completed status WITHOUT id
     const r = todoWriteHandler({
       todos: [{ content: "Explore nuxil-chat codebase", status: "completed" }],
@@ -105,7 +73,7 @@ describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
         { content: "Task A", status: "in_progress" },
         { content: "Task B", status: "pending" },
       ],
-    };
+    } as unknown as ToolContext;
     const r = todoWriteHandler({ todos: [], merge: false }, ctx);
 
     // MUST preserve existing 2 items
@@ -117,7 +85,7 @@ describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
   it("Mimo call #4: empty todos array (merge=true) — preserves list", () => {
     const ctx: ToolContext = {
       todos: [{ content: "Task A", status: "pending" }],
-    };
+    } as unknown as ToolContext;
     const r = todoWriteHandler({ todos: [], merge: true }, ctx);
     expect(ctx.todos.length).toBe(1);
     expect(r.output.startsWith("error:")).toBe(false);
@@ -126,7 +94,7 @@ describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
   it("Mimo call #5: null/undefined input — preserves list", () => {
     const ctx: ToolContext = {
       todos: [{ content: "Task A", status: "pending" }],
-    };
+    } as unknown as ToolContext;
     const r1 = todoWriteHandler(null, ctx);
     const r2 = todoWriteHandler(undefined, ctx);
     expect(ctx.todos.length).toBe(1);
@@ -137,7 +105,7 @@ describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
   it("Mimo call #6: missing merge field — preserves list", () => {
     const ctx: ToolContext = {
       todos: [{ content: "Task A", status: "pending" }],
-    };
+    } as unknown as ToolContext;
     const r = todoWriteHandler({ todos: [] }, ctx);
     // No merge field → treated as falsy → empty array → preserved
     expect(ctx.todos.length).toBe(1);
@@ -145,7 +113,7 @@ describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
   });
 
   it("Mimo call #7: mixed items with and without id", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
     const r = todoWriteHandler({
       todos: [
         { content: "With ID", status: "pending", id: "real_id" },
@@ -164,7 +132,7 @@ describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
   });
 
   it("Mimo call #8: full lifecycle — create → mark progress → complete", () => {
-    const ctx: ToolContext = { todos: [] };
+    const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
 
     // Step 1: Create 3 todos (no id)
     todoWriteHandler({
@@ -201,7 +169,7 @@ describe("PROOF: Mimo V2.5 TodoWrite payloads", () => {
 });
 
 describe("PROOF: output never causes red X", () => {
-  const ctx: ToolContext = { todos: [] };
+  const ctx: ToolContext = { todos: [] } as unknown as ToolContext;
   const inputs = [
     null,
     undefined,
@@ -232,10 +200,7 @@ describe("PROOF: output never causes red X", () => {
 });
 
 describe("PROOF: TodoRead always works", () => {
-  function todoReadHandler(ctx: ToolContext): { output: string } {
-    if (!ctx?.todos?.length) return { output: "(no todos)" };
-    return { output: ctx.todos.map((t) => `- [${t.status}] ${t.content}`).join("\n") };
-  }
+
 
   it("returns list for items without id", () => {
     const ctx: ToolContext = {
@@ -243,13 +208,13 @@ describe("PROOF: TodoRead always works", () => {
         { content: "Task A", status: "pending" } as any,
         { content: "Task B", status: "completed" } as any,
       ],
-    };
+    } as unknown as ToolContext;
     const r = todoReadHandler(ctx);
     expect(r.output).toContain("- [pending] Task A");
     expect(r.output).toContain("- [completed] Task B");
   });
 
   it("handles null ctx", () => {
-    expect(todoReadHandler(null as any).output).toBe("(no todos)");
+    expect(todoReadHandler(null as any).output).toBe("error: todo context unavailable");
   });
 });

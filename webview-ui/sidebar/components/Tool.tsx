@@ -1,3 +1,4 @@
+import { parseTodos } from "../../../src/shared/todoPresentation";
 /*
  * Copyright (c) 2026 Pawan Osman <https://github.com/PawanOsman>
  *
@@ -155,23 +156,7 @@ function toolMeta(name: string, i: any): { icon: IconName; label: string; badge:
 }
 
 // Parse "[x] ..." style todo render output into structured items.
-function parseTodos(output: string): { status: string; content: string }[] {
-  const items: { status: string; content: string }[] = [];
-  for (const raw of output.split("\n")) {
-    const line = raw.trim();
-    let m = line.match(/^\[(x| |~|-)\]\s+(.*)$/);
-    if (m) {
-      const map: Record<string, string> = { x: "completed", " ": "pending", "~": "in_progress", "-": "cancelled" };
-      items.push({ status: map[m[1]] || "pending", content: m[2] });
-      continue;
-    }
-    m = line.match(/^-\s*\[(\w+)\]\s+(.*)$/);
-    if (m) {
-      items.push({ status: m[1], content: m[2] });
-    }
-  }
-  return items;
-}
+
 
 function TodoList({ block }: { block: ToolBlock }) {
   const items = parseTodos(block.result || "");
@@ -598,7 +583,7 @@ function QuestionCard({ block }: { block: ToolBlock }) {
   }));
   const answered = block.status !== "running";
   const [step, setStep] = React.useState(0);
-  const [answers, setAnswers] = React.useState<Record<string, string[]>>({});
+  const [answers, setAnswers] = React.useState<Record<string, string[]>>(block.answers ?? {});
   const [custom, setCustom] = React.useState<Record<string, string>>({});
   const [customMode, setCustomMode] = React.useState<Record<string, boolean>>({});
   const [sent, setSent] = React.useState(false);
@@ -673,7 +658,7 @@ function QuestionCard({ block }: { block: ToolBlock }) {
       <div className="question-card done">
         <div className="qc-head"><Icon name="chat" size={14} /> {header}</div>
         {questions.map((qq, i) => {
-          const a = answers[String(i)] || [];
+          const a = (block.answers ?? answers)[String(i)] || [];
           return (
             <div className="qc-answered" key={i}>
               <div className="qc-q">{i + 1}. {qq.question}</div>

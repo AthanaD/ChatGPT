@@ -13,6 +13,10 @@ import type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./p
 import { MODEL_CATALOG } from "../stores/featureStore";
 import { defaultAnthropicMaxTokens } from "./providerLimits";
 import { AnthropicUsageTracker } from "./anthropicUsage";
+import { toAnthropic } from "./provider/anthropicMessages";
+import { sseData } from "./provider/sse";
+import { UsageTracker } from "./provider/usage";
+import { randomUUID } from "crypto";
 
 export type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
 export { defaultAnthropicMaxTokens } from "./providerLimits";
@@ -196,16 +200,18 @@ async function* streamWithRetry(
   signal: AbortSignal,
   onRetry?: (attempt: number, max: number, delayMs: number, error: string) => void,
   maxAttempts = 5,
+  model?: string,
 ): AsyncGenerator<ProviderEvent> {
   for (let attempt = 1; ; attempt++) {
+    const requestId = randomUUID();
     // Stream live. Retry is only safe before the first event is emitted — once we
     // start yielding deltas downstream, replaying a fresh attempt would duplicate
     // output, so a mid-stream failure is surfaced instead of retried.
     let emitted = false;
     try {
       for await (const ev of make()) {
-        emitted = true;
-        yield ev;
+        if (ev.type !== "usage") emitted = true;
+        yield ev.type === "usage" ? { ...ev, requestId, model } : ev;
       }
       return;
     } catch (e) {
@@ -253,7 +259,13 @@ function openAIContent(content: string | WireContentPart[] | null | undefined): 
  */
 function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
+  let toolImages: WireContentPart[] = [];
+  const flushImages = () => {
+    if (toolImages.length) out.push({ role: "user", content: stripOpenAIParts(toolImages) });
+    toolImages = [];
+  };
   for (const m of messages) {
+    if (m.role !== "tool") flushImages();
     if (m.role === "tool") {
       if (Array.isArray(m.content)) {
         const texts = m.content.filter((p): p is Extract<WireContentPart, { type: "text" }> => p.type === "text");
@@ -264,7 +276,7 @@ function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknow
           content: texts.map((t) => t.text).join("\n") || (images.length ? "(image)" : "(empty)"),
         });
         if (images.length) {
-          out.push({ role: "user", content: stripOpenAIParts(images) });
+          toolImages.push(...images);
         }
       } else {
         out.push({ role: "tool", tool_call_id: m.tool_call_id, content: m.content || "(empty)" });
@@ -289,30 +301,54 @@ function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknow
     }
     out.push({ role: m.role, content });
   }
+  flushImages();
   return out;
 }
 
+export interface AuxiliaryRequestOptions {
+  signal?: AbortSignal;
+  onUsage?: (event: Extract<ProviderEvent, { type: "usage" }>) => void;
+}
+
+function auxiliarySignal(options?: AuxiliaryRequestOptions): AbortSignal {
+  const deadline = AbortSignal.timeout(30_000);
+  return options?.signal ? AbortSignal.any([options.signal, deadline]) : deadline;
+}
+
+/** Account a completed or rejected HTTP response before interpreting its answer. */
+async function auxiliaryResponse(r: Response, model: string, anthropic: boolean, label: string, options?: AuxiliaryRequestOptions): Promise<any> {
+  const text = await r.text();
+  let data: any;
+  try { data = parseMaybeSSE(text); } catch { /* preserve the HTTP error when the body is not JSON */ }
+  const usage = anthropic
+    ? new AnthropicUsageTracker().update(data?.usage)
+    : new UsageTracker().update(data?.usage?.prompt_tokens, data?.usage?.completion_tokens, data?.usage?.prompt_tokens_details?.cached_tokens);
+  if (usage) options?.onUsage?.({ ...usage, model, requestId: randomUUID() });
+  if (!r.ok) throw new ChatHTTPError(r.status, `${label} ${r.status}: ${text.slice(0, 200)}`);
+  if (data?.error) throw new ChatHTTPError(Number(data.error.status ?? data.error.code) || 502, `${label}: ${data.error.message || "provider returned an error"}`);
+  if (!data) throw new Error(`${label}: invalid provider response`);
+  return data;
+}
+
 /** Generate a short conversation title from the first user message using the model. */
-export async function generateTitle(apiBaseUrl: string, apiKey: string, model: string, userText: string, anthropic?: boolean, oauthKind?: OAuthKind): Promise<string> {
+export async function generateTitle(apiBaseUrl: string, apiKey: string, model: string, userText: string, anthropic?: boolean, oauthKind?: OAuthKind, options?: AuxiliaryRequestOptions): Promise<string> {
+  const signal = auxiliarySignal(options);
+  signal.throwIfAborted();
   const sys = "Generate a concise 3-6 word title for a chat that starts with the user's message. The title must summarize the topic, not repeat the message.";
   const prompt = userText.slice(0, 2000);
   if (oauthKind) {
     // OAuth providers have no raw HTTP endpoint here; stream a tiny completion.
     let text = "";
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 30_000);
-    try {
-      const gen = streamOAuthChat(oauthKind, {
-        model,
-        messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
-        maxTokens: 200,
-        signal: ctrl.signal,
-      });
-      for await (const ev of gen) {
-        if (ev.type === "text-delta") text += ev.text;
-      }
-    } finally {
-      clearTimeout(timer);
+    const gen = streamChat({
+      apiBaseUrl, apiKey, oauthKind, maxRetries: 1,
+      model,
+      messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
+      maxTokens: 200,
+      signal,
+    });
+    for await (const ev of gen) {
+      if (ev.type === "text-delta") text += ev.text;
+      if (ev.type === "usage") options?.onUsage?.(ev);
     }
     return cleanTitle(parseTitle(text) || text);
   }
@@ -320,6 +356,7 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
     // Force a tool call so the model returns a structured { title } object.
     const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/messages`, {
       method: "POST",
+      signal,
       headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
       body: JSON.stringify({
         model,
@@ -331,8 +368,7 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
         tool_choice: { type: "tool", name: "set_title" },
       }),
     });
-    if (!r.ok) throw new Error(`title ${r.status}: ${(await r.text().catch(() => "")).slice(0, 200)}`);
-    const d: any = parseMaybeSSE(await r.text());
+    const d = await auxiliaryResponse(r, model, true, "title", options);
     const use = (d?.content ?? []).find((b: any) => b?.type === "tool_use");
     return cleanTitle(use?.input?.title ?? "");
   }
@@ -340,16 +376,14 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
   const call = async (body: Record<string, unknown>) => {
     const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/chat/completions`, {
       method: "POST",
+      signal,
       headers: { authorization: `Bearer ${apiKey}`, "content-type": "application/json" },
       body: JSON.stringify({ ...body, stream: false }),
     });
-    if (!r.ok) throw new Error(`title ${r.status}: ${(await r.text().catch(() => "")).slice(0, 200)}`);
-    const raw = await r.text();
-    const d = parseMaybeSSE(raw);
+    const d = await auxiliaryResponse(r, model, false, "title", options);
     return d?.choices?.[0]?.message?.content ?? d?.choices?.[0]?.delta?.content ?? "";
   };
-  // Prefer structured output; many OpenAI-compatible/local servers reject
-  // `response_format`, so fall back to a plain text request on any failure.
+  // Retry plain output only when the optional structured format is unsupported.
   try {
     const content = await call({
       model,
@@ -363,8 +397,10 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
     });
     const t = parseTitle(content);
     if (t) return cleanTitle(t);
-  } catch {
-    // fall through to plain text
+    if (content.trim() && !/^[\[{]/.test(content.trim())) return cleanTitle(content);
+  } catch (error) {
+    signal.throwIfAborted();
+    if (!(error instanceof ChatHTTPError) || ![400, 422].includes(error.status) || !/response_format|json_schema|structured|schema/i.test(error.message)) throw error;
   }
   const content = await call({ model, messages: msgs, max_tokens: 200, temperature: 0.3 });
   return cleanTitle(parseTitle(content) || content);
@@ -379,6 +415,7 @@ function parseMaybeSSE(raw: string): any {
   // SSE: concatenate delta content from each chunk, or use the last full message.
   let content = "";
   let last: any;
+  let usage: any;
   for (const line of trimmed.split("\n")) {
     const m = line.trim();
     if (!m.startsWith("data:")) continue;
@@ -387,13 +424,15 @@ function parseMaybeSSE(raw: string): any {
     try {
       const c = JSON.parse(payload);
       last = c;
+      if (c.usage) usage = c.usage;
       const delta = c?.choices?.[0]?.delta?.content;
       if (delta) content += delta;
     } catch {
       /* skip */
     }
   }
-  if (content) return { choices: [{ message: { content } }] };
+  if (content) return { choices: [{ message: { content } }], ...(usage ? { usage } : {}), ...(last?.error ? { error: last.error } : {}) };
+  if (last && usage) last.usage = usage;
   return last ?? {};
 }
 
@@ -411,27 +450,25 @@ function parseTitle(content: string): string {
 }
 
 /** Auto mode judge: pick the best-suited model id from candidates for a task. */
-export async function pickModel(apiBaseUrl: string, apiKey: string, judge: string, candidates: string[], task: string, anthropic?: boolean, oauthKind?: OAuthKind): Promise<string> {
+export async function pickModel(apiBaseUrl: string, apiKey: string, judge: string, candidates: string[], task: string, anthropic?: boolean, oauthKind?: OAuthKind, options?: AuxiliaryRequestOptions): Promise<string> {
+  const signal = auxiliarySignal(options);
+  signal.throwIfAborted();
   const useAnthropic = anthropic ?? isAnthropic(apiBaseUrl);
   const sys = `You route a coding task to the best model. Available models: ${candidates.join(", ")}. Reply with EXACTLY one model id from the list, nothing else.`;
   const prompt = task.slice(0, 2000);
   if (oauthKind) {
     // OAuth judges (Claude Code / Codex) have no raw HTTP endpoint; stream a tiny completion.
     let text = "";
-    const ctrl = new AbortController();
-    const timer = setTimeout(() => ctrl.abort(), 30_000);
-    try {
-      const gen = streamOAuthChat(oauthKind, {
-        model: judge,
-        messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
-        maxTokens: 64,
-        signal: ctrl.signal,
-      });
-      for await (const ev of gen) {
-        if (ev.type === "text-delta") text += ev.text;
-      }
-    } finally {
-      clearTimeout(timer);
+    const gen = streamChat({
+      apiBaseUrl, apiKey, oauthKind, maxRetries: 1,
+      model: judge,
+      messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
+      maxTokens: 64,
+      signal,
+    });
+    for await (const ev of gen) {
+      if (ev.type === "text-delta") text += ev.text;
+      if (ev.type === "usage") options?.onUsage?.(ev);
     }
     // Reasoning models may emit <think> blocks; last non-empty line is the answer.
     const lines = text.replace(/<think>[\s\S]*?<\/think>/gi, "").split("\n").map((l) => l.trim()).filter(Boolean);
@@ -440,20 +477,20 @@ export async function pickModel(apiBaseUrl: string, apiKey: string, judge: strin
   if (useAnthropic) {
     const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/messages`, {
       method: "POST",
+      signal,
       headers: { "x-api-key": apiKey, "anthropic-version": "2023-06-01", "content-type": "application/json" },
       body: JSON.stringify({ model: judge, system: sys, messages: [{ role: "user", content: prompt }], max_tokens: 24 }),
     });
-    if (!r.ok) throw new Error(`judge ${r.status}`);
-    const d: any = await r.json();
+    const d = await auxiliaryResponse(r, judge, true, "judge", options);
     return String(d?.content?.[0]?.text ?? "").trim();
   }
   const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/chat/completions`, {
     method: "POST",
+    signal,
     headers: { ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}), "content-type": "application/json" },
     body: JSON.stringify({ model: judge, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }], max_tokens: 24, temperature: 0 }),
   });
-  if (!r.ok) throw new Error(`judge ${r.status}`);
-  const d: any = await r.json();
+  const d = await auxiliaryResponse(r, judge, false, "judge", options);
   return String(d?.choices?.[0]?.message?.content ?? "").trim();
 }
 
@@ -471,21 +508,25 @@ function cleanTitle(s: string): string {
 export function streamChat(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
   if (opts.oauthKind) {
     const make = () => streamOAuthChat(opts.oauthKind!, { model: opts.model, messages: opts.messages, tools: opts.tools, maxTokens: opts.maxTokens, modelParams: opts.modelParams, promptCacheKey: opts.promptCacheKey, signal: opts.signal });
-    return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3);
+    return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3, opts.model);
   }
   const useAnthropic = opts.anthropic ?? isAnthropic(opts.apiBaseUrl);
   if (useAnthropic && !opts.apiKey) {
     throw new Error("API Key not set");
   }
   const make = () => (useAnthropic ? streamAnthropic(opts) : streamOpenAI(opts));
-  return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 10);
+  return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 10, opts.model);
 }
 
+const withoutStreamUsage = new Set<string>();
+
 async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
+  const baseUrl = normalizeBaseUrl(opts.apiBaseUrl);
   const body: Record<string, unknown> = {
     model: opts.model,
     messages: normalizeOpenAIMessages(opts.messages),
     stream: true,
+    ...(!withoutStreamUsage.has(baseUrl) ? { stream_options: { include_usage: true } } : {}),
   };
   // Only send temperature when explicitly requested (title gen etc.);
   // otherwise let the provider use its own default.
@@ -503,7 +544,7 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
     body.tool_choice = "auto";
   }
 
-  const r = await fetch(`${normalizeBaseUrl(opts.apiBaseUrl)}/chat/completions`, {
+  const request = () => fetch(`${baseUrl}/chat/completions`, {
     method: "POST",
     headers: {
       ...(opts.apiKey ? { authorization: `Bearer ${opts.apiKey}` } : {}),
@@ -512,6 +553,18 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
     body: JSON.stringify(body),
     signal: opts.signal,
   });
+  let r = await request();
+  if (body.stream_options && (r.status === 400 || r.status === 422)) {
+    const detail = await r.clone().text();
+    // Retry only a provider's explicit rejection of the optional usage field.
+    // Do not replay requests rejected for model, credentials or context limits.
+    if (/stream_options|include_usage/i.test(detail) && /unsupported|unknown|unrecognized|not (?:allowed|supported|permitted)|extra|unexpected/i.test(detail)) {
+      await r.body?.cancel();
+      delete body.stream_options;
+      withoutStreamUsage.add(baseUrl);
+      r = await request();
+    }
+  }
   if (!r.ok || !r.body) {
     const detail = await r.text().catch(() => "");
     // Strip HTML wrappers from providers (e.g. openresty) that embed errors in <html> tags.
@@ -524,22 +577,13 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
 
   const toolAcc: Record<number, { id: string; name: string; args: string }> = {};
   let finishReason = "stop";
+  let finished = false;
+  const usage = new UsageTracker();
 
   const reader = r.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
-      if (data === "[DONE]") continue;
+  for await (const data of sseData(reader)) {
+      if (data === "[DONE]") { finished = true; break; }
       let chunk: any;
       try {
         chunk = JSON.parse(data);
@@ -548,8 +592,10 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
       }
 
       if (chunk.usage) {
-        yield { type: "usage", promptTokens: chunk.usage.prompt_tokens, completionTokens: chunk.usage.completion_tokens };
+        const event = usage.update(chunk.usage.prompt_tokens, chunk.usage.completion_tokens, chunk.usage.prompt_tokens_details?.cached_tokens);
+        if (event) yield event;
       }
+      if (chunk.error) throw new ChatHTTPError(Number(chunk.error.status ?? chunk.error.code) || 502, `chat stream error: ${chunk.error.message ?? JSON.stringify(chunk.error)}`);
       const choice = chunk.choices?.[0];
       if (!choice) continue;
       const delta = choice.delta ?? {};
@@ -575,10 +621,14 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
           }
         }
       }
-      if (choice.finish_reason) finishReason = choice.finish_reason;
-    }
+      if (choice.finish_reason) {
+        finishReason = choice.finish_reason;
+        finished = true;
+        if (finishReason === "error" || finishReason === "content_filter") throw new ChatHTTPError(400, `chat stream ended with ${finishReason}`);
+      }
   }
 
+  if (!finished) throw new ChatHTTPError(502, "chat stream ended before completion");
   for (const idx of Object.keys(toolAcc).map(Number).sort((a, b) => a - b)) {
     const a = toolAcc[idx];
     if (!a.name) continue;
@@ -591,104 +641,6 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
 }
 
 // ---- Anthropic Messages API ----
-
-interface AnthropicBlock {
-  type: "text" | "tool_use" | "tool_result" | "image";
-  text?: string;
-  id?: string;
-  name?: string;
-  input?: unknown;
-  tool_use_id?: string;
-  content?: string | AnthropicBlock[];
-  source?: { type: "base64"; media_type: string; data: string };
-  cache_control?: { type: "ephemeral" };
-}
-
-interface AnthropicMessage {
-  role: "user" | "assistant";
-  content: string | AnthropicBlock[];
-}
-
-function systemToBlocks(content: string | WireContentPart[]): AnthropicBlock[] {
-  if (typeof content === "string") {
-    return [{ type: "text", text: content }];
-  }
-  return content
-    .filter((p): p is Extract<typeof p, { type: "text" }> => p.type === "text")
-    .map((p) => ({ type: "text", text: p.text, ...(p.cache_control ? { cache_control: p.cache_control } : {}) }));
-}
-
-function toAnthropic(messages: WireMessage[]): { system: AnthropicBlock[]; messages: AnthropicMessage[] } {
-  const system: AnthropicBlock[] = [];
-  const out: AnthropicMessage[] = [];
-
-  for (const m of messages) {
-    if (m.role === "system") {
-      system.push(...systemToBlocks(m.content));
-    } else if (m.role === "user") {
-      if (typeof m.content === "string") {
-        out.push({ role: "user", content: m.content });
-      } else {
-        const blocks: AnthropicBlock[] = [];
-        for (const part of m.content) {
-          if (part.type === "text") {
-            blocks.push({ type: "text", text: part.text, ...(part.cache_control ? { cache_control: part.cache_control } : {}) });
-          } else if (part.type === "image_url") {
-            const url = part.image_url.url;
-            const match = url.match(/^data:([^;]+);base64,(.*)$/);
-            if (match) {
-              blocks.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
-            }
-          }
-        }
-        out.push({ role: "user", content: blocks });
-      }
-    } else if (m.role === "assistant") {
-      const blocks: AnthropicBlock[] = [];
-      if (m.content) {
-        blocks.push({ type: "text", text: m.content });
-      }
-      if (m.tool_calls) {
-        for (const tc of m.tool_calls) {
-          let input: unknown = {};
-          try {
-            input = JSON.parse(tc.function.arguments || "{}");
-          } catch {
-            // leave as empty object
-          }
-          blocks.push({ type: "tool_use", id: tc.id, name: tc.function.name, input });
-        }
-      }
-      out.push({ role: "assistant", content: blocks.length ? blocks : "" });
-    } else if (m.role === "tool") {
-      // tool result -> a user message with a tool_result block; merge consecutive.
-      // Array content (text + image) becomes a tool_result with nested blocks.
-      let content: string | AnthropicBlock[];
-      if (Array.isArray(m.content)) {
-        const nested: AnthropicBlock[] = [];
-        for (const part of m.content) {
-          if (part.type === "text") {
-            nested.push({ type: "text", text: part.text });
-          } else if (part.type === "image_url") {
-            const match = part.image_url.url.match(/^data:([^;]+);base64,(.*)$/);
-            if (match) nested.push({ type: "image", source: { type: "base64", media_type: match[1], data: match[2] } });
-          }
-        }
-        content = nested;
-      } else {
-        content = m.content;
-      }
-      const block: AnthropicBlock = { type: "tool_result", tool_use_id: m.tool_call_id, content };
-      const last = out[out.length - 1];
-      if (last && last.role === "user" && Array.isArray(last.content)) {
-        last.content.push(block);
-      } else {
-        out.push({ role: "user", content: [block] });
-      }
-    }
-  }
-  return { system, messages: out };
-}
 
 async function* streamAnthropic(opts: {
   apiBaseUrl: string;
@@ -750,23 +702,13 @@ async function* streamAnthropic(opts: {
   }
 
   const reader = r.body.getReader();
-  const decoder = new TextDecoder();
-  let buf = "";
   let finishReason = "stop";
+  let finished = false;
   const usageTracker = new AnthropicUsageTracker();
 
   const toolBlocks: Record<number, { id: string; name: string; args: string }> = {};
 
-  while (true) {
-    const { done, value } = await reader.read();
-    if (done) break;
-    buf += decoder.decode(value, { stream: true });
-    const lines = buf.split("\n");
-    buf = lines.pop() ?? "";
-    for (const line of lines) {
-      const t = line.trim();
-      if (!t.startsWith("data:")) continue;
-      const data = t.slice(5).trim();
+  for await (const data of sseData(reader)) {
       if (!data || data === "[DONE]") continue;
       let chunk: any;
       try {
@@ -801,16 +743,18 @@ async function* streamAnthropic(opts: {
           }
         }
       } else if (chunk.type === "message_delta") {
-        if (chunk.delta?.stop_reason) finishReason = chunk.delta.stop_reason;
+        if (chunk.delta?.stop_reason) { finishReason = chunk.delta.stop_reason; finished = true; }
         const usage = usageTracker.update(chunk.usage);
         if (usage) yield usage;
+      } else if (chunk.type === "message_stop") {
+        finished = true;
       } else if (chunk.type === "message_start" && chunk.message?.usage) {
         const usage = usageTracker.update(chunk.message.usage);
         if (usage) yield usage;
       }
-    }
   }
 
+  if (!finished) throw new ChatHTTPError(502, "anthropic stream ended before completion");
   for (const idx of Object.keys(toolBlocks).map(Number).sort((a, b) => a - b)) {
     const a = toolBlocks[idx];
     if (!a.name) continue;

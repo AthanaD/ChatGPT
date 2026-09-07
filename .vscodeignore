@@ -25,3 +25,7 @@ vsc-extension-quickstart.md
 **/.vscode-test.*
 media/readme/**/*.svg
 .env
+
+.github/**
+docs/**
+esbuild-options.cjs
