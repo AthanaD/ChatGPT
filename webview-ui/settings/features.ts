@@ -111,7 +111,7 @@ export const PROVIDER_PRESETS: Record<ProviderKind, { label: string; baseUrl: st
 };
 
 /** Built-in "popular" providers shown as connect-by-key cards. */
-export const POPULAR_KINDS: ProviderKind[] = ["anthropic", "openai", "google", "openrouter"];
+export const POPULAR_KINDS: ProviderKind[] = ["anthropic", "openai", "google", "openrouter", "mimo", "atlascloud", "astraflow"];
 
 export interface ModelOption {
   key: string;

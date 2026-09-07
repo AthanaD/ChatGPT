@@ -151,7 +151,7 @@ export const MODEL_CATALOG: ModelDef[] = [
 	{ id: "gpt-5.5-pro", name: "GPT-5.5 Pro", kind: "openai", options: [effort("high", ["medium", "high", "xhigh"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
 	{ id: "gpt-5.4", name: "GPT-5.4", kind: ["openai", "codex"], options: [effort("none", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k", "1.05m"], "1.05m")] },
 	{ id: "gpt-5.4-mini", name: "GPT-5.4 mini", kind: ["openai", "codex"], options: [effort("none", ["none", "low", "medium", "high", "xhigh"]), ctx(["128k", "400k"], "400k")] },
-	{ id: "gpt-5.3-codex", name: "GPT-5.3 Codex", kind: ["openai", "codex"], options: [effort("high", ["low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k"], "400k")] },
+	{ id: "gpt-5.3-codex-spark", name: "GPT-5.3 Codex Spark", kind: ["openai", "codex"], options: [effort("high", ["low", "medium", "high", "xhigh"]), ctx(["128k", "256k", "400k"], "400k")] },
 	// Anthropic: Fable always thinks. Opus 5 can disable thinking only through
 	// high effort (optionsFor applies that dependent restriction).
 	{ id: "claude-fable-5-1", name: "Claude Fable 5.1", kind: ["anthropic", "claude-code"], options: [thinking("adaptive", ["adaptive"]), effort("high", ["low", "medium", "high", "xhigh", "max"]), ctx(["300k", "1m"], "1m")] },
