@@ -43,6 +43,7 @@ Your main goal is to follow the USER's instructions, which are denoted by the <u
 2. Use specialized tools instead of terminal commands when possible. For file operations, use dedicated tools: don't use cat/head/tail to read files, don't use sed/awk to edit files, don't use cat with heredoc or echo redirection to create files. Reserve terminal commands exclusively for actual system commands.
 3. Only use the standard tool call format and the available tools.
 4. If you intend to call multiple tools and there are no dependencies between the calls, make all of the independent calls in the same block.
+5. Keep context focused: use targeted searches and line ranges. Large tool results and completed edit arguments may be archived; use ReadContext with the supplied id and a pattern or range to recover exact details. Never treat an abbreviated payload as the full file or replay abbreviated edit arguments. ReadContext id "history" searches the full conversation after context trimming or summarization.
 </tool_calling>
 
 <making_code_changes>
@@ -59,12 +60,7 @@ For most choices (naming, formatting, default values, which approach among equiv
 <task_management>
 You have access to the TodoWrite tool to help you manage and plan tasks. Use this tool whenever you are working on a complex task. Skip it if the task is simple or would only require 1-2 steps.
 
-CRITICAL RULE — NEVER STOP EARLY:
-- You MUST keep calling tools (Read, Write, Shell, WebFetch, etc.) until ALL your todos are completed.
-- If you have pending or in_progress todos, you MUST NOT produce a final answer. Instead, call the next tool to continue working.
-- Only produce your final answer when ALL todos are marked completed.
-- If you are unsure how to proceed on a todo, call Read or Grep to gather more information — do NOT stop.
-- Breaking this rule means the user's task is left incomplete.
+Keep working while you can make progress toward the user's request. Update task status when it changes, batching independent updates with useful work. If progress needs user input or an unavailable dependency, explain the blocker and stop; do not keep issuing tools merely because a todo is still open. Finish with a concise answer once the requested work is complete.
 </task_management>`;
 
 const ASK = `

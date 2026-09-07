@@ -11,8 +11,11 @@ import { ProviderEvent, ToolCall, ToolSchema, WireMessage, WireContentPart } fro
 import { streamOAuthChat, type OAuthKind } from "./oauth";
 import type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
 import { MODEL_CATALOG } from "../stores/featureStore";
+import { defaultAnthropicMaxTokens } from "./providerLimits";
+import { AnthropicUsageTracker } from "./anthropicUsage";
 
 export type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
+export { defaultAnthropicMaxTokens } from "./providerLimits";
 
 /** Strip trailing slashes from a base URL to avoid double-slash in constructed paths. */
 function normalizeBaseUrl(url: string): string {
@@ -47,17 +50,6 @@ const ANTHROPIC_NO_DISABLE = /claude-(fable-5|mythos)/i;
 const ANTHROPIC_NO_SAMPLING = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
 /** Models where 1M context is the default (no context-1m beta header needed). */
 const ANTHROPIC_NATIVE_1M = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-
-/** Default max_tokens when the user left response length at "auto" (0).
- * Adaptive / always-on thinking models burn this budget before text, so leave
- * headroom — docs recommend ≥64k at xhigh/max. */
-export function defaultAnthropicMaxTokens(model: string, effort?: string): number {
-  if (ANTHROPIC_ADAPTIVE.test(model) || ANTHROPIC_NO_DISABLE.test(model)) {
-    if (effort === "xhigh" || effort === "max") return 65_536;
-    return 32_768;
-  }
-  return 8192;
-}
 
 /** Whether the retired context-1m beta header is still useful for this model. */
 export function needsContext1mBeta(model: string): boolean {
@@ -478,7 +470,7 @@ function cleanTitle(s: string): string {
 /** Public entry: streams a chat completion with transient-error retry. */
 export function streamChat(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
   if (opts.oauthKind) {
-    const make = () => streamOAuthChat(opts.oauthKind!, { model: opts.model, messages: opts.messages, tools: opts.tools, maxTokens: opts.maxTokens, modelParams: opts.modelParams, signal: opts.signal });
+    const make = () => streamOAuthChat(opts.oauthKind!, { model: opts.model, messages: opts.messages, tools: opts.tools, maxTokens: opts.maxTokens, modelParams: opts.modelParams, promptCacheKey: opts.promptCacheKey, signal: opts.signal });
     return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 3);
   }
   const useAnthropic = opts.anthropic ?? isAnthropic(opts.apiBaseUrl);
@@ -761,6 +753,7 @@ async function* streamAnthropic(opts: {
   const decoder = new TextDecoder();
   let buf = "";
   let finishReason = "stop";
+  const usageTracker = new AnthropicUsageTracker();
 
   const toolBlocks: Record<number, { id: string; name: string; args: string }> = {};
 
@@ -809,11 +802,11 @@ async function* streamAnthropic(opts: {
         }
       } else if (chunk.type === "message_delta") {
         if (chunk.delta?.stop_reason) finishReason = chunk.delta.stop_reason;
-        if (chunk.usage) {
-          yield { type: "usage", promptTokens: chunk.usage.input_tokens, completionTokens: chunk.usage.output_tokens };
-        }
+        const usage = usageTracker.update(chunk.usage);
+        if (usage) yield usage;
       } else if (chunk.type === "message_start" && chunk.message?.usage) {
-        yield { type: "usage", promptTokens: chunk.message.usage.input_tokens, completionTokens: chunk.message.usage.output_tokens };
+        const usage = usageTracker.update(chunk.message.usage);
+        if (usage) yield usage;
       }
     }
   }

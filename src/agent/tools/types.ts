@@ -29,6 +29,8 @@ export interface TodoItem {
 export interface ToolContext {
   /** Todo state owned by this run, never shared across conversations. */
   todos: TodoItem[];
+  /** Read an archived result or transcript belonging to this conversation. */
+  readContext?: (input: { id: string; start_line?: number; end_line?: number; start_column?: number; pattern?: string }) => string;
   runSubagent?: SubagentRunner;
   askUser?: QuestionAsker;
   /** Switch the active mode mid-run (used by the SwitchMode tool). */

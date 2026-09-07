@@ -675,13 +675,14 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     let seen = 0;
     let cut = conv.steps.length;
     for (let i = 0; i < conv.steps.length; i++) {
-      if (conv.steps[i].kind === "user") {
+      const step = conv.steps[i];
+      if (step.kind === "user" && !step.synthetic) {
         if (seen === keepUserSteps) { cut = i; break; }
         seen++;
       }
     }
     const steps = conv.steps.slice(0, cut);
-    void this._store.update(convId, { turns, steps });
+    void this._store.update(convId, { turns, steps, contextState: undefined });
   }
 
   private _sendConversations() {
@@ -1367,6 +1368,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       await this._store.update(convId, { title: fallback });
     }
     const history = this._store.get(convId)?.steps ?? [];
+    const contextState = this._store.get(convId)?.contextState ?? {};
 
     // Host owns the authoritative UI turns: seed from persisted turns + this
     // user message, then accumulate streamed events below. The webview is just a
@@ -1585,6 +1587,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         prompt: mentionContext ? `${text}\n\n${mentionContext}` : text,
         attachments,
         history,
+        contextState,
+        promptCacheKey: convId,
         maxTokens: settings.maxResponseLength > 0 ? settings.maxResponseLength : undefined,
         maxSteps: features.maxAgentSteps > 0 ? features.maxAgentSteps : undefined,
         autoContinue: features.autoContinue === true,
@@ -1651,7 +1655,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
         // Only force-close still-open work; leave completed tools alone.
         session.turns = forceSettleOpenWork(closeTrailingThinking(session.turns), "cancelled");
         if (session.persistTimer) { clearTimeout(session.persistTimer); session.persistTimer = undefined; }
-        await this._store.update(convId, { turns: session.turns, steps: history });
+        await this._store.update(convId, { turns: session.turns, steps: history, contextState });
       } catch (e: unknown) {
         logError("agent.cleanup", e, { conversationId: convId });
       } finally {

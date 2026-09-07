@@ -8,6 +8,7 @@
  */
 
 import { streamChat, SamplingParams, ModelParams } from "./provider";
+import { responseTokenReservation } from "./providerLimits";
 import type { OAuthKind } from "./oauth";
 import { TOOLS, schemasForMode, toolsForMode, disposeShellSession, EDIT_TOOLS, MULTITASK_TOOLS, toolTimeoutMs, withToolTimeout, type AskQuestionItem, type ToolContext } from "./tools";
 import { actionTypeForCall } from "./approvalPolicy";
@@ -25,6 +26,9 @@ import {
 	isCompactionBoundary,
 } from "./contextEconomy";
 import { ActivityLedger } from "./taskState";
+import { ContextArchive } from "./contextArchive";
+import { DeferredToolSchemas } from "./deferredTools";
+import { restoreContext, saveContext } from "./contextState";
 import { buildUserInfoBlock, buildOpenFilesBlock } from "../context/cursorContext";
 import { mcpManager } from "../integrations/mcpClient";
 import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
@@ -57,6 +61,21 @@ const PROJECT_REMINDER =
 	'(run_in_background=true, subagent_type set to the member name), launching every independent member AT THE SAME TIME in a single turn.\n</reminder>';
 
 const MAX_STEPS = 200;
+
+/** Searchable text view of the lossless conversation; binary images stay in chat. */
+function archivedTranscript(steps: Step[]): string {
+	return steps.map((s) => {
+		if (s.kind === "user") {
+			const files = (s.attachments ?? []).filter((a) => a.kind === "text")
+				.map((a) => `\nAttached file: ${a.name}\n${a.data}`).join("\n");
+			return `## ${s.synthetic ? "System note" : "User"}\n${s.text}${files}`;
+		}
+		if (s.kind === "assistant") {
+			return `## Assistant\n${s.text}\n${s.calls.map((c) => `Tool call: ${c.name} (${c.id})\n${c.arguments}`).join("\n")}`;
+		}
+		return `## Tool result: ${s.name} (${s.callId}, ${s.status})\n${s.output}`;
+	}).join("\n\n");
+}
 
 /**
  * Tools whose description carries protocol the model must not lose mid-run
@@ -212,7 +231,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// tool output/thinking. Shallow clone suffices: economizeHistory/stripThinking
 	// replaces entries via spread (never mutates originals), and new steps are
 	// pushed as fresh objects.
-	const history: Step[] = [...persistedHistory];
+	const history: Step[] = restoreContext(persistedHistory, opts.contextState);
+	const archive = new ContextArchive();
+	archive.prepareSteps(persistedHistory);
+	let deferredTools: DeferredToolSchemas | undefined;
 	const pushHistory = (...steps: Step[]) => {
 		history.push(...steps);
 		persistedHistory.push(...steps);
@@ -225,9 +247,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// These modes may need continuation nudges; execution permissions are separate.
 	const isAgentic = () => mode === "agent" || mode === "multitask" || mode === "project" || mode === "debug" || mode === "plan";
 	const canExecuteMcp = (m: Mode) => m === "agent" || m === "debug";
-	// Plan mode needs more output tokens to compose long plans. Boost maxTokens
-	// if the user left it at default or a low value.
-	const planModeMaxTokens = mode === "plan" && (!maxTokens || maxTokens < 16384) ? 16384 : maxTokens;
 	/** Coordinator modes: the model delegates instead of implementing. */
 	const isCoordinator = () => mode === "multitask" || mode === "project";
 	// In project mode the roster is limited to the members of the assigned team(s).
@@ -252,7 +271,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// Per-run tool context (avoids module globals so chats run concurrently).
 	const shellSessionKey = `run_${started}_${Math.random().toString(36).slice(2, 8)}`;
 	const toolCtx: ToolContext = {
-		todos: [],
+		todos: opts.contextState?.todos?.map((todo) => ({ ...todo })) ?? [],
+		readContext: (input) => {
+			if (input.id === "history") {
+				// Do not retain another full transcript snapshot on each page read.
+				// The history alias stays valid as the append-only transcript grows.
+				const snapshot = new ContextArchive();
+				const id = snapshot.store(archivedTranscript(persistedHistory), "Conversation history");
+				return snapshot.read({ ...input, id }).replace(`id: ${id}`, "id: history");
+			}
+			const id = input.id === "mcp" ? deferredTools?.catalogId ?? input.id : input.id;
+			const output = archive.read({ ...input, id });
+			if (!output.startsWith("Error:") && deferredTools?.activate(id)) {
+				schemaCache.clear();
+				toolTokenCache.clear();
+			}
+			return output;
+		},
 		askUser,
 		shellSessionKey,
 		getMode: () => mode,
@@ -430,7 +465,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		},
 	}));
 
-	const system = systemPrompt(mode, systemPromptOverride);
+	const usedMcpNames = new Set(history.flatMap((s) => s.kind === "assistant" ? s.calls.map((c) => c.name) : []));
+	deferredTools = new DeferredToolSchemas(archive, mcpSchemas, usedMcpNames);
+	const system = systemPrompt(mode, systemPromptOverride) + (deferredTools.isDeferred
+		? '\n\nConnected MCP tool schemas are available on demand. Use ReadContext {"id":"mcp","pattern":"keyword"} to search the tool catalog, or omit pattern to browse. Read a returned schema archive id to enable that tool, then call it normally. Only agent/debug modes may execute MCP tools.'
+		: "");
 
 	const disabledToolNames = new Set<string>();
 	if (!enableFileReading) {
@@ -470,7 +509,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		};
 		const built = [
 			...schemasForMode(m).filter((s) => !disabledToolNames.has(s.function.name)).map(compact),
-			...(canExecuteMcp(m) ? mcpSchemas.map(compact) : []),
+			...(canExecuteMcp(m) ? deferredTools!.activeSchemas() : []),
 		];
 		schemaCache.set(m, built);
 		return built;
@@ -516,23 +555,23 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// it massively since every step resends the whole conversation).
 	let lastPrompt = 0;
 	let lastCompletion = 0;
+	// Calibrate the character estimate from actual provider usage without using
+	// stale occupancy from before compaction to trigger another summary.
+	let promptTokenRatio = 1;
+	const responseTokens = responseTokenReservation({ model, apiBaseUrl, maxTokens, anthropic, oauthKind, modelParams });
 
 	try {
 		let finalText = "";
 		let planWritten = false;
 		let planNudgeCount = 0;
-		const MAX_PLAN_NUDGES = 3;
+		const MAX_PLAN_NUDGES = 1;
 		// Bound recovery nudges when the model keeps returning without tools.
 		let consecutiveTextTurns = 0;
-		const CONSECUTIVE_TEXT_LIMIT = 6;
+		const CONSECUTIVE_TEXT_LIMIT = 3;
 		// Hard cap on total nudge injections per run to prevent infinite re-nudge.
 		let nudgeCount = 0;
-		const MAX_NUDGES = 10;
-		// Track Task/explore subagent calls to detect when model is stuck
-		// calling subagents without creating a todo list.
-		let taskCallCount = 0;
-		let hasCalledTodoWrite = false;
-		const TASK_WITHOUT_TODO_LIMIT = 3;
+		const MAX_NUDGES = 3;
+		let todoNudged = false;
 
 		// Feed already-finished (but unreported) background subagent results into the
 		// conversation, so the model always knows what has completed. Returns count.
@@ -600,26 +639,19 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			return true;
 		};
 
-		// Summarize older steps (non-streaming aggregate) so compaction keeps task
-		// intent, decisions, file paths and unfinished work. Summaries compound:
-		// each one is handed the previous summary so nothing is summarized twice.
-		let lastSummary = "";
+		// Summarize only the older working context; an earlier summary already lives
+		// there. Sending it separately as well would pay for and summarize it twice.
 		const summarizeSteps = async (steps: Step[]): Promise<string> => {
 			const sys =
-				"You compress an agent coding session transcript. Write a dense summary that preserves: " +
-				"1) the user's original request(s) and intent, verbatim where short, " +
-				"2) files created/edited/deleted with paths and short change notes (e.g. +12 -5), not full code, " +
-				"3) the latest todo list / task status if present, " +
-				"4) key assistant conclusions and decisions (not chain-of-thought), " +
-				"5) subagent/task outcomes, 6) errors hit and how they were fixed (keep exact error text where short), " +
-				"7) unfinished work / next steps, 8) constraints and preferences the user stated. " +
-				"Use short markdown sections. Do not invent details. Do not paste large file bodies. " +
-				"When an earlier summary is provided, extend it into one merged summary rather than re-summarizing it.";
-			const transcript = clip(stepsToTranscript(steps), 320_000);
-			const body = lastSummary
-				? `## Earlier summary (already compressed — carry it forward)\n${lastSummary}\n\n## New transcript to merge in\n${transcript}`
-				: transcript;
-			// A cheap model is plenty for compression; fall back to the run's model.
+				"Summarize this coding session for the next working turn. Preserve user intent, constraints, " +
+				"decisions, changed file paths, test outcomes, errors, and unfinished work. Distinguish observed " +
+				"facts from assumptions. Keep archive references when relevant. Merge any existing summary once. " +
+				"Use concise bullets; omit narration, reasoning traces, and file bodies. Do not invent details.";
+			const summaryMaxTokens = 1536;
+			const summaryBudget = contextTokens && contextTokens > 0
+				? Math.floor((contextTokens - summaryMaxTokens - 1024) / promptTokenRatio) - Math.ceil(sys.length / 4)
+				: 24000;
+			const transcript = clip(stepsToTranscript(steps), Math.max(256, Math.min(24000, summaryBudget) * 4));
 			const summaryModel =
 				subagentModel && (!availableModels?.length || availableModels.some((m) => m.toLowerCase() === subagentModel.toLowerCase()))
 					? subagentModel
@@ -631,19 +663,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				model: summaryModel,
 				messages: [
 					{ role: "system", content: sys },
-					{ role: "user", content: body },
+					{ role: "user", content: transcript },
 				],
-				maxTokens: 3072,
+				maxTokens: summaryMaxTokens,
 				anthropic,
 				oauthKind,
 				signal,
 				maxRetries: 2,
+				promptCacheKey: `${opts.promptCacheKey ?? shellSessionKey}/summary`,
 			})) {
 				if (ev.type === "text-delta") text += ev.text;
+				if (ev.type === "usage") {
+					// Compression is billed too; include it in run usage without
+					// confusing its small prompt with the active context occupancy.
+					emit({ type: "usage", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
+				}
 			}
 			if (!text.trim()) throw new Error("empty summary");
-			lastSummary = text.trim();
-			return lastSummary;
+			return text.trim();
 		};
 
 		const stepLimit = maxSteps && maxSteps > 0 ? maxSteps : MAX_STEPS;
@@ -665,83 +702,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// them now so it never reasons about "still running" work that's done.
 			flushSettledBg();
 
-			// Auto context management. Budget = window minus the reply reservation.
-			const budget = contextTokens && contextTokens > 0
-				? Math.max(1024, contextTokens - (planModeMaxTokens ?? 4096) - 1024)
-				: 0;
-			// Tool schemas ride along on every request and are large; leaving them
-			// out of the estimate made the guard optimistic by 10k+ tokens.
-			const overheadTokens = Math.ceil(system.length / 4) + toolSchemaTokens();
-			// Strip UI-only thinking; tool bodies and edit args stay verbatim.
-			economizeHistory(history);
-			// Auto-summarization only when the window is nearly full (soft/hard fills).
-			const usedEst = stepsTokens(history) + overheadTokens;
-			const fill = Math.max(usedEst, lastPrompt);
-			const cooledDown = step - lastCompactionStep >= COMPACT_COOLDOWN_STEPS;
-			const shouldCompact = budget > 0 && cooledDown && (
-				fill >= budget * COMPACT_AT_FILL ||
-				(fill >= budget * COMPACT_SOFT_FILL && isCompactionBoundary(history))
-			);
-			if (shouldCompact) {
-				const { prefix, tail } = splitForCompaction(history, Math.floor(budget * COMPACT_KEEP_FRAC));
-				// Only worth an extra model call if it frees real room.
-				const gain = stepsTokens(prefix);
-				if (prefix.length >= 2 && gain >= budget * COMPACT_MIN_GAIN_FRAC) {
-					onHook?.("preCompact", { dropped: String(prefix.length), reason: "auto-summarize" });
-					emit({ type: "compaction", status: "running" });
-					try {
-						const summary = await summarizeSteps(prefix);
-						history.length = 0;
-						history.push(
-							{
-								kind: "user",
-								synthetic: true,
-								text: `Earlier conversation was summarized to free context. This summary replaces it — treat it as fact.\n\n${summary}`,
-							},
-							{ kind: "assistant", text: "Understood. Continuing with the summarized context.", calls: [] },
-							...tail,
-						);
-						lastCompactionStep = step;
-						economizeHistory(history);
-						// After compaction, remind the model about existing todos so it
-						// doesn't call TodoWrite with an empty list. The structured
-						// toolCtx.todos persists, but the model may not realize this.
-						if (toolCtx.todos.length > 0) {
-							const todoSummary = toolCtx.todos
-								.map((t) => `- [${t.status}] ${t.content}`)
-								.join("\n");
-							pushSystemNote(
-								`IMPORTANT: Context was compacted but your todo list is preserved. ` +
-								`Current todos (${toolCtx.todos.length} items):\n${todoSummary}\n\n` +
-								`DO NOT call TodoWrite with an empty list. Continue working on the existing todos. ` +
-								`If you need to update them, use TodoWrite with merge=true to preserve existing items.`,
-							);
-						}
-						emit({ type: "compaction", status: "done", summary });
-					} catch {
-						emit({ type: "compaction", status: "failed" });
-					}
-				}
-			}
-			// 2) Trim fallback: guarantees the request fits even if summarization
-			// didn't run or wasn't enough (rare).
-			const fitted = budget > 0 ? fitStepsToBudget(history, overheadTokens, budget) : history;
-			if (fitted !== history && fitted.length < history.length) {
-				onHook?.("preCompact", { dropped: String(history.length - fitted.length) });
-			}
-			// The open-files block goes stale over a long run, but rebuilding it every
-			// step would churn the cached prefix for nothing — refresh periodically and
-			// only adopt it when it actually changed.
-			if (cursorCtx && !isSubagent && enableWorkspaceContext !== false && step > 0 && step % 6 === 0) {
+			// Refresh mutable workspace context before accounting for it in the budget.
+			if (!isSubagent && enableWorkspaceContext !== false && step > 0 && step % 6 === 0) {
 				try {
 					const fresh = await buildOpenFilesBlock();
 					if (fresh !== cursorCtx.openFiles) cursorCtx = { ...cursorCtx, openFiles: fresh };
 				} catch { /* context is best-effort */ }
 			}
-			// Durable run record: what happened and how each card ended, never file
-			// bodies. Rebuilt every step so the agent keeps a flat-cost run memory
-			// even after auto-summarization.
-			const taskState = ledger.isEmpty
+			const taskState = ledger.isEmpty && !toolCtx.todos.length
 				? undefined
 				: ledger.render({ request: currentRequestText(history), todos: toolCtx.todos });
 			const liveCtx: CursorContextBlocks = {
@@ -750,7 +718,62 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				timestamp: runTimestamp,
 				taskState,
 			};
+			const limitedContext = !!contextTokens && contextTokens > 0;
+			const budget = limitedContext
+				? Math.max(0, contextTokens! - responseTokens - 1024)
+				: 0;
+			const fittingBudget = Math.floor(budget / promptTokenRatio);
+			const contextChars = Object.values(liveCtx).reduce((n, value) => n + (value?.length ?? 0), 0);
+			const overheadTokens = Math.ceil((system.length + contextChars) / 4) + toolSchemaTokens() + 128;
+			if (limitedContext && fittingBudget <= overheadTokens + 64) {
+				throw new Error("The context window is too small for the instructions, tools, and response limit. Increase the context window or reduce the response limit or workspace instructions.");
+			}
+
+			// The UI retains original outputs and edit arguments. The model sees stable
+			// excerpts with references it can read or search only when detail is needed.
+			economizeHistory(history);
+			let modelHistory = archive.prepareSteps(history);
+			const usedEst = stepsTokens(modelHistory) + overheadTokens;
+			const cooledDown = step - lastCompactionStep >= COMPACT_COOLDOWN_STEPS;
+			const shouldCompact = limitedContext && cooledDown && (
+				usedEst >= fittingBudget * COMPACT_AT_FILL ||
+				(usedEst >= fittingBudget * COMPACT_SOFT_FILL && isCompactionBoundary(modelHistory))
+			);
+			if (shouldCompact) {
+				const keepTokens = Math.min(24000, Math.floor((fittingBudget - overheadTokens) * COMPACT_KEEP_FRAC));
+				const { prefix, tail } = splitForCompaction(modelHistory, keepTokens);
+				// Anchors may occur in both pieces. Count only what actually leaves the
+				// prompt, and leave enough room for the summary itself to be worthwhile.
+				const gain = stepsTokens(modelHistory) - stepsTokens(tail);
+				if (prefix.length >= 2 && gain >= Math.max(2048, fittingBudget * COMPACT_MIN_GAIN_FRAC)) {
+					lastCompactionStep = step; // Cool down failed summaries too.
+					onHook?.("preCompact", { dropped: String(prefix.length), reason: "auto-summarize" });
+					emit({ type: "compaction", status: "running" });
+					try {
+						const summary = await summarizeSteps(prefix);
+						history.splice(0, history.length, {
+							kind: "user",
+							synthetic: true,
+							text: `Earlier conversation summary (verify details when needed):\n${summary}\n\nFull transcript: ReadContext {"id":"history"}; use pattern or line ranges to recover details.`,
+						}, ...tail);
+						modelHistory = archive.prepareSteps(history);
+						if (opts.contextState) saveContext(persistedHistory, modelHistory, opts.contextState);
+						emit({ type: "compaction", status: "done", summary });
+					} catch {
+						emit({ type: "compaction", status: "failed" });
+					}
+				}
+			}
+			const fitted = limitedContext ? fitStepsToBudget(modelHistory, overheadTokens, fittingBudget) : modelHistory;
+			if (!fitted.some((s) => s.kind === "user" && !s.synthetic)) {
+				throw new Error("The current request cannot fit in the context window. Increase the context window or reduce the attached context.");
+			}
+			if (fitted.length < modelHistory.length) {
+				onHook?.("preCompact", { dropped: String(modelHistory.length - fitted.length) });
+			}
 			const messages = buildMessages(system, fitted, liveCtx);
+			const requestTokenEstimate = stepsTokens(fitted) + overheadTokens;
+
 			let assistantText = "";
 			let thinking = "";
 			let finishReason = "";
@@ -769,7 +792,8 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				model,
 				messages,
 				tools: activeTools,
-				maxTokens: planModeMaxTokens,
+				maxTokens,
+				promptCacheKey: opts.promptCacheKey ?? shellSessionKey,
 				sampling,
 				modelParams,
 				anthropic,
@@ -804,8 +828,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				} else if (ev.type === "tool-call") {
 					calls.push(ev.call);
 				} else if (ev.type === "usage") {
-					lastPrompt = ev.promptTokens ?? lastPrompt;
-					lastCompletion = ev.completionTokens ?? lastCompletion;
+					lastPrompt = ev.promptTokensTotal ?? ev.promptTokens ?? lastPrompt;
+					if (lastPrompt && requestTokenEstimate > 0) {
+						promptTokenRatio = Math.max(1, lastPrompt / requestTokenEstimate);
+					}
+					lastCompletion = ev.completionTokensTotal ?? ev.completionTokens ?? lastCompletion;
 					// Live-update the ring after every step. prompt/completion carry
 					// this step's delta (usage tracking accumulates them); totalTokens
 					// is the current context occupancy.
@@ -854,11 +881,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					continue;
 				}
 				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
-				if (canNudge && isAgentic() && incompleteTodos.length > 0) {
+				if (canNudge && !todoNudged && isAgentic() && incompleteTodos.length > 0) {
+					todoNudged = true;
 					nudgeCount++;
-					const todoList = incompleteTodos.map((t) => `- [${t.status}] ${t.content}`).join("\n");
 					pushSystemNote(
-						`You have ${incompleteTodos.length} incomplete todo(s):\n${todoList}\n\n` +
+						`You have ${incompleteTodos.length} incomplete todo(s). Consult task_state or TodoRead if needed. ` +
 						"Continue any remaining work. If it is complete, update the todo list; if you are blocked, explain what is needed.",
 					);
 					continue;
@@ -953,7 +980,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					if (resolvedName === "TodoWrite" || resolvedName === "TodoRead") {
 						results[i] = {
 							status: "completed",
-							output: resolvedName === "TodoRead" ? "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first to create a structured task list." : "(todos: skipped due to truncated input)",
+							output: resolvedName === "TodoRead" ? "(no todos; input was not valid JSON)" : "(todos: skipped due to truncated input)",
 						};
 						finishUi(i);
 						return;
@@ -1243,52 +1270,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				if (resolvedName === "WritePlan" && r.status === "completed") {
 					planWritten = true;
 				}
-				if (resolvedName === "TodoWrite" && r.status === "completed") {
-					hasCalledTodoWrite = true;
-				}
-				if (resolvedName === "Task") {
-					taskCallCount++;
-				}
 				// Durable ledger backs the flat-cost <task_state> block; history itself
 				// keeps full tool results until auto-summarize / budget trim.
 				ledger.record(resolvedName, parsed[i].input, r.status, r.output);
 				pushHistory({ kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, image: r.image });
-			}
-			// Keep every result adjacent to its assistant tool-call batch. A reminder
-			// inserted between them makes budget fitting discard results as orphans.
-			if (toolCtx.todos.length === 0 && nudgeCount < MAX_NUDGES &&
-				parsed.some((p, i) => p.resolvedName === "TodoRead" && results[i]?.status === "completed")) {
-				nudgeCount++;
-				pushSystemNote(
-					`CRITICAL: You called TodoRead but no todo list exists. ` +
-					`You MUST call TodoWrite NOW to create a structured task list. ` +
-					`List ALL the work that needs to be done, then work through each item systematically. ` +
-					`Do NOT proceed without a todo list.`
-				);
-			}
-			// CRITICAL: After processing tool results, check if model called Task
-			// multiple times without creating a todo list. If so, force it to plan.
-			if (isAgentic() && !hasCalledTodoWrite && taskCallCount >= TASK_WITHOUT_TODO_LIMIT && nudgeCount < MAX_NUDGES) {
-				nudgeCount++;
-				pushSystemNote(
-					`CRITICAL: You have called Task/explore ${taskCallCount} times but have NOT created a todo list. ` +
-					`You MUST stop exploring and create a structured plan using TodoWrite. ` +
-					`List ALL the work that needs to be done, then work through each item systematically. ` +
-					`Do NOT launch more subagents until you have a todo list.`
-				);
-				continue;
-			}
-			// CRITICAL: After processing tool results, check if no todos exist
-			// and model has been running for 2+ turns. Force todo creation.
-			if (isAgentic() && !hasCalledTodoWrite && toolCtx.todos.length === 0 && step >= 2 && nudgeCount < MAX_NUDGES) {
-				nudgeCount++;
-				pushSystemNote(
-					`IMPORTANT: You have not created a todo list yet. ` +
-					`For complex tasks, you MUST first call TodoWrite to create a structured task list, ` +
-					`then work through each item systematically using the available tools. ` +
-					`Do NOT just describe what you will do — create the todo list and start working.`
-				);
-				continue;
 			}
 			// After launching background Task(s), wait for that wave before calling the
 			// model again. Otherwise the next turn (or empty-turn / todo nudge) races
@@ -1345,6 +1330,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		try { emit({ type: "error", message: e instanceof Error ? e.message : String(e) }); } catch { /* ignore */ }
 		emitSettled("error");
 	} finally {
+		if (opts.contextState) opts.contextState.todos = toolCtx.todos.map((todo) => ({ ...todo }));
 		// Force-mark unsettled bg subagents ONLY when the user cancelled (abort).
 		// When run finishes normally, let subagents continue — their results
 		// will be delivered via emit and the model can process them on next run.

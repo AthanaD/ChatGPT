@@ -13,6 +13,7 @@ import type { AskQuestionItem } from "./tools";
 import type { AgentEvent, Attachment, Mode, Step } from "./types";
 import type { SubagentDef } from "../stores/featureStore";
 import type { TeamDef } from "./teams";
+import type { ContextState } from "./contextState";
 
 /** Every input needed to drive a single {@link runAgent} run. */
 export interface RunAgentOptions {
@@ -23,8 +24,12 @@ export interface RunAgentOptions {
 	prompt: string;
 	attachments?: Attachment[];
 	history: Step[];
+	/** Mutable working-memory checkpoint; persist beside the full transcript. */
+	contextState?: ContextState;
+	/** Stable conversation key for transports that support prompt cache routing. */
+	promptCacheKey?: string;
 	maxTokens?: number;
-	/** Max loop steps before pausing (0/undefined = default 50). */
+	/** Max loop steps before pausing (0/undefined = default 200). */
 	maxSteps?: number;
 	/** Keep going past the step limit instead of pausing. */
 	autoContinue?: boolean;

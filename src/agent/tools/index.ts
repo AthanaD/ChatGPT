@@ -16,6 +16,7 @@ import { runTerminalTool, awaitShellTool } from "./shell";
 import { webSearchTool, webFetchTool } from "./web";
 import { todoWriteTool, todoReadTool, askQuestionTool, taskTool, switchModeTool, writePlanTool } from "./agent";
 import { callMcpToolTool, fetchMcpResourceTool, listMcpResourcesTool } from "./mcp";
+import { readContextTool } from "./context";
 
 // Public surface re-exported so the rest of the app keeps importing from "./tools".
 export * from "./types";
@@ -33,6 +34,7 @@ export {
 // All tools. Names/descriptions/schemas come from schemas.ts via defineTool,
 // so this map is purely "tool name -> handler".
 export const TOOLS: Record<string, Tool> = {
+  ReadContext: readContextTool,
   Read: readFileTool,
   ListDir: listDirTool,
   Glob: globTool,

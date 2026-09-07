@@ -70,7 +70,14 @@ export type ProviderEvent =
   // ...and as its JSON arguments arrive in chunks.
   | { type: "tool-call-args-delta"; index: number; delta: string }
   | { type: "tool-call"; call: ToolCall }
-  | { type: "usage"; promptTokens?: number; completionTokens?: number }
+  | {
+    type: "usage";
+    promptTokens?: number;
+    completionTokens?: number;
+    /** Cumulative request totals when streamed usage fields are billing deltas. */
+    promptTokensTotal?: number;
+    completionTokensTotal?: number;
+  }
   | { type: "done"; finishReason: string };
 
 export type AgentEvent =

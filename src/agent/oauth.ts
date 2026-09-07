@@ -12,6 +12,7 @@ import * as crypto from "crypto";
 import * as http from "http";
 import { ProviderEvent, ToolSchema, WireMessage } from "./types";
 import { ChatHTTPError, applyAnthropicReasoning, defaultAnthropicMaxTokens, needsContext1mBeta } from "./provider";
+import { AnthropicUsageTracker } from "./anthropicUsage";
 
 export type {
   OAuthKind,
@@ -808,6 +809,7 @@ export async function* streamOAuthChat(kind: OAuthKind, opts: {
   messages: WireMessage[];
   tools?: ToolSchema[];
   maxTokens?: number;
+  promptCacheKey?: string;
   modelParams?: { thinking?: string; reasoningEffort?: string; maxContext?: string };
   signal: AbortSignal;
 }): AsyncGenerator<ProviderEvent> {
@@ -868,12 +870,24 @@ async function* streamClaudeCode(id: string, opts: {
 }
 
 // Codex talks the Responses API: translate chat messages → input items, stream
+/** Stable UUID v5 for the session header; the cache key itself stays opaque. */
+function codexSessionId(promptCacheKey: string): string {
+  // Standard URL namespace; a namespaced name avoids mixing application keys.
+  const namespace = Buffer.from("6ba7b8119dad11d180b400c04fd430c8", "hex");
+  const bytes = crypto.createHash("sha1").update(namespace).update(`OpenCursor:${promptCacheKey}`).digest().subarray(0, 16);
+  bytes[6] = (bytes[6] & 0x0f) | 0x50;
+  bytes[8] = (bytes[8] & 0x3f) | 0x80;
+  const hex = bytes.toString("hex");
+  return `${hex.slice(0, 8)}-${hex.slice(8, 12)}-${hex.slice(12, 16)}-${hex.slice(16, 20)}-${hex.slice(20)}`;
+}
+
 // Responses SSE → ProviderEvents.
 async function* streamCodex(id: string, opts: {
   model: string;
   messages: WireMessage[];
   tools?: ToolSchema[];
   modelParams?: { reasoningEffort?: string };
+  promptCacheKey?: string;
   signal: AbortSignal;
 }): AsyncGenerator<ProviderEvent> {
   const acc = await validAccount(id);
@@ -890,8 +904,10 @@ async function* streamCodex(id: string, opts: {
     body.tools = opts.tools.map((t) => ({ type: "function", name: t.function.name, description: t.function.description, parameters: t.function.parameters }));
   }
 
-  const sessionId = crypto.randomUUID();
-  body.prompt_cache_key = sessionId;
+  // Cache routing belongs to a conversation, not an individual HTTP request.
+  // Callers without a conversation/run key still get an isolated session.
+  const sessionId = opts.promptCacheKey ? codexSessionId(opts.promptCacheKey) : crypto.randomUUID();
+  body.prompt_cache_key = opts.promptCacheKey || sessionId;
   const r = await fetch(CODEX.responsesUrl, {
     method: "POST",
     headers: {
@@ -960,6 +976,7 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
   const decoder = new TextDecoder();
   let buf = "";
   let finishReason = "stop";
+  const usageTracker = new AnthropicUsageTracker();
   const toolBlocks: Record<number, { id: string; name: string; args: string }> = {};
   while (true) {
     const { done, value } = await reader.read();
@@ -995,9 +1012,11 @@ async function* parseAnthropicStream(reader: ReadableStreamDefaultReader<Uint8Ar
         }
       } else if (chunk.type === "message_delta") {
         if (chunk.delta?.stop_reason) finishReason = chunk.delta.stop_reason;
-        if (chunk.usage) yield { type: "usage", completionTokens: chunk.usage.output_tokens };
+        const usage = usageTracker.update(chunk.usage);
+        if (usage) yield usage;
       } else if (chunk.type === "message_start" && chunk.message?.usage) {
-        yield { type: "usage", promptTokens: chunk.message.usage.input_tokens, completionTokens: chunk.message.usage.output_tokens };
+        const usage = usageTracker.update(chunk.message.usage);
+        if (usage) yield usage;
       }
     }
   }

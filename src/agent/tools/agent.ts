@@ -90,7 +90,7 @@ export const todoReadTool = defineTool("TodoRead", false, async (_input, _abortS
   if (!ctx) return { output: "error: todo context unavailable" };
   if (!ctx.todos.length) {
     return {
-      output: "(no todos) IMPORTANT: No todo list exists yet. You MUST call TodoWrite first to create a structured task list before proceeding. Do NOT just describe what you will do — create the todo list now.",
+      output: "(no todos)",
     };
   }
   return { output: ctx.todos.map((t) => `- [${t.status}] ${t.content}`).join("\n") };

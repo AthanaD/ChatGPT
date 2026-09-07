@@ -46,6 +46,8 @@ export interface StreamChatOpts {
   anthropic?: boolean;
   /** OAuth account provider (Claude Code / Codex) — overrides apiBaseUrl/apiKey. */
   oauthKind?: OAuthKind;
+  /** Stable conversation/run key for provider prompt-cache routing. */
+  promptCacheKey?: string;
   signal: AbortSignal;
   /** Max total attempts per request (default 3). */
   maxRetries?: number;
