@@ -9,32 +9,46 @@
 
 import type { ModelParams } from "./types";
 
-/** Models that take the `effort` param as a stable feature (no beta header). */
-const ANTHROPIC_EFFORT_STABLE = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
-/** Opus 4.5 needs the effort beta header + manual thinking budget. */
-const ANTHROPIC_EFFORT_BETA = /claude-opus-4-5/i;
+/** Supported settings verified against Anthropic's effort/thinking docs. */
+const ANTHROPIC_EFFORT = /claude-(opus-4-[5678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
+const ANTHROPIC_MAX_EFFORT = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
+const ANTHROPIC_XHIGH_EFFORT = /claude-(opus-4-[78]|opus-5|sonnet-5|fable-5|mythos-5)/i;
+const EFFORT_LEVELS = new Set(["low", "medium", "high", "xhigh", "max"]);
 /** Models that support adaptive thinking (no budget_tokens). */
 const ANTHROPIC_ADAPTIVE = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
 /** Models that reject manual `thinking:{type:enabled,budget_tokens}` with a 400.
  * Per docs: Opus 5, Opus 4.8/4.7, Sonnet 5, Fable 5, Mythos 5 → adaptive only. */
-const ANTHROPIC_NO_MANUAL = /claude-(opus-4-[78]|opus-5|sonnet-5|fable-5|mythos)/i;
+const ANTHROPIC_NO_MANUAL = /claude-(opus-4-[78]|opus-5|sonnet-5|fable-5|mythos-5)/i;
 /** Opus 5 rejects `thinking:{type:disabled}` when effort is xhigh/max (400). */
 const ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT = /claude-opus-5/i;
 /** Fable 5 / Mythos 5: thinking is always on — `disabled` returns 400 at any effort. */
 const ANTHROPIC_NO_DISABLE = /claude-(fable-5|mythos)/i;
-/** Models where 1M context is the default (no context-1m beta header needed). */
-const ANTHROPIC_NATIVE_1M = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
+/**
+ * Kept for callers of the existing provider API. The legacy context beta was
+ * retired on April 30, 2026; current 1M models use that window without a beta.
+ * https://platform.claude.com/docs/en/release-notes/overview
+ */
+export function needsContext1mBeta(_model: string): boolean {
+  return false;
+}
 
-/** Whether the retired context-1m beta header is still useful for this model. */
-export function needsContext1mBeta(model: string): boolean {
-  return !ANTHROPIC_NATIVE_1M.test(model);
+function normalizeEffort(model: string, effort: string | undefined): string | undefined {
+  if (!effort || !EFFORT_LEVELS.has(effort) || !ANTHROPIC_EFFORT.test(model)) return undefined;
+  // Saved settings may predate the catalog's per-model restrictions. Avoid
+  // replaying unsupported xhigh/max values, and do not increase token spending.
+  if (effort === "xhigh" && !ANTHROPIC_XHIGH_EFFORT.test(model)) return "high";
+  if (effort === "max" && !ANTHROPIC_MAX_EFFORT.test(model)) return "high";
+  return effort;
 }
 
 /**
- * Apply Anthropic thinking + effort to a request body, returning any beta flags
- * to add to the `anthropic-beta` header. Centralizes the per-model rules:
+ * Apply Anthropic thinking + effort to a request body. The array return value
+ * preserves the provider API, but top-level effort no longer needs a beta.
+ * https://platform.claude.com/docs/en/build-with-claude/effort
+ * https://platform.claude.com/docs/en/build-with-claude/thinking-troubleshooting
+ * Centralizes the per-model rules:
  *  - effort → `output_config.effort` (low/medium/high/xhigh/max)
- *  - 4.6+ → adaptive thinking (no budget); Opus 4.5 → manual budget + beta header
+ *  - 4.6+ → adaptive thinking (no budget); Opus 4.5 → manual budget
  */
 export function applyAnthropicReasoning(
   body: Record<string, unknown>,
@@ -44,7 +58,7 @@ export function applyAnthropicReasoning(
 ): string[] {
   const betas: string[] = [];
   let mode = params?.thinking; // "disabled" | "adaptive" | "enabled" | undefined
-  let effort = params?.reasoningEffort;
+  let effort = normalizeEffort(model, params?.reasoningEffort);
 
   // Fable/Mythos reject thinking:{disabled} entirely — coerce to adaptive.
   if (mode === "disabled" && ANTHROPIC_NO_DISABLE.test(model)) {
@@ -58,13 +72,13 @@ export function applyAnthropicReasoning(
     effort = "high";
   }
 
-  if (effort && (ANTHROPIC_EFFORT_STABLE.test(model) || ANTHROPIC_EFFORT_BETA.test(model))) {
+  if (effort) {
     body.output_config = { effort };
-    if (ANTHROPIC_EFFORT_BETA.test(model)) betas.push("effort-2025-11-24");
   }
 
-  // Thinking is on by default from Opus 5 onward, so opting out has to be explicit.
-  if (mode === "disabled" && ANTHROPIC_DISABLE_NEEDS_LOW_EFFORT.test(model)) {
+  // Both Opus 5 and Sonnet 5 default to thinking. Omitting the field when the
+  // user selects disabled leaves their default thinking behavior enabled.
+  if (mode === "disabled") {
     body.thinking = { type: "disabled" };
   }
 
@@ -75,6 +89,13 @@ export function applyAnthropicReasoning(
     // (or the model can't do adaptive, e.g. Haiku 4.5 / older Claude 4).
     const useManual = canManual && (mode === "enabled" || !canAdaptive);
     if (useManual) {
+      // Keep the user's output cap: a valid manual budget must be >=1024 and
+      // leave room for the answer. Raising max_tokens here would also make the
+      // loop's reserved output budget incorrect.
+      // https://platform.claude.com/docs/en/build-with-claude/extended-thinking
+      if (maxTokens <= 1024) {
+        throw new Error("Extended thinking requires max response tokens above 1024. Increase the response limit or disable thinking.");
+      }
       // `thinking.enabled` requires budget_tokens; scale it by effort.
       const frac = { low: 0.15, medium: 0.3, high: 0.5, xhigh: 0.7, max: 0.85 }[effort ?? "high"] ?? 0.5;
       body.thinking = { type: "enabled", budget_tokens: Math.max(1024, Math.floor(maxTokens * frac)) };
@@ -89,4 +110,3 @@ export function applyAnthropicReasoning(
   }
   return betas;
 }
-

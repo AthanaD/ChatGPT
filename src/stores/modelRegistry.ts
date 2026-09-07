@@ -113,8 +113,11 @@ async function doFetch(): Promise<AllModels> {
 
   for (const batch of providerBatches) {
     for (const { id, p } of batch) {
-      if (seen.has(id)) continue;
-      seen.add(id);
+      // The same upstream model can belong to several independently configured
+      // providers. Only collapse duplicates within one provider's response.
+      const identity = `${p.id}::${id}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
       list.push({
         id,
         name: featureStore.nameFor(id, p.kind),
@@ -131,8 +134,9 @@ async function doFetch(): Promise<AllModels> {
     const label = oauth.OAUTH_LABEL[kind];
     const k = kind === "claude-code" ? "anthropic" : kind === "codex" ? "openai" : "google";
     for (const id of ids) {
-      if (seen.has(id)) continue;
-      seen.add(id);
+      const identity = `oauth:${kind}::${id}`;
+      if (seen.has(identity)) continue;
+      seen.add(identity);
       list.push({
         id,
         name: featureStore.nameFor(id, kind),
@@ -144,7 +148,9 @@ async function doFetch(): Promise<AllModels> {
     }
   }
 
-  cache = { models: list.map((m) => m.id), modelList: list };
+  // Legacy flat consumers need names, while grouped settings use providerId
+  // together with id and must retain every available provider's entry.
+  cache = { models: [...new Set(list.map((m) => m.id))], modelList: list };
   listeners.forEach((fn) => fn(cache!));
   // Re-resolve a remote embedding model now that provider info is loaded.
   const em = features.embedModel;

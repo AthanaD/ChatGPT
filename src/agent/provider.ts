@@ -17,6 +17,9 @@ import { AnthropicUsageTracker } from "./anthropicUsage";
 import { toAnthropic } from "./provider/anthropicMessages";
 import { sseData } from "./provider/sse";
 import { UsageTracker } from "./provider/usage";
+import { applyGoogleOpenAIOptions, googleThoughtSignature, googleToolCall, isGoogleOpenAIEndpoint, prepareGoogleMessages } from "./provider/google";
+import { createOpenAIResponsesRequest, OpenAIResponsesError, parseOpenAIResponses, shouldUseOpenAIResponses } from "./provider/openaiResponses";
+import { applyOpenAIChatOptions } from "./provider/openaiChat";
 import { randomUUID } from "crypto";
 
 export type { ModelInfo, ModelParams, SamplingParams, StreamChatOpts } from "./provider/types";
@@ -42,6 +45,7 @@ export { applyAnthropicReasoning, needsContext1mBeta } from "./provider/anthropi
 
 /** Models that reject temperature / top_p / top_k with a 400. */
 const ANTHROPIC_NO_SAMPLING = /claude-(opus-4-[678]|opus-5|sonnet-4-6|sonnet-5|fable-5|mythos)/i;
+const ANTHROPIC_DEFAULT_THINKING = /claude-(opus-5|sonnet-5|fable-5|mythos)/i;
 
 function applyAnthropicSampling(body: Record<string, unknown>, model: string, s?: SamplingParams) {
   if (!s || ANTHROPIC_NO_SAMPLING.test(model)) return;
@@ -180,14 +184,14 @@ function openAIContent(content: string | WireContentPart[] | null | undefined): 
  * Tool images → tool text + trailing user image message.
  * Returns plain objects (not only WireMessage) so tool-only assistant can omit `content`.
  */
-function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknown>[] {
+function normalizeOpenAIMessages(messages: WireMessage[], googleModel?: string): Record<string, unknown>[] {
   const out: Record<string, unknown>[] = [];
   let toolImages: WireContentPart[] = [];
   const flushImages = () => {
     if (toolImages.length) out.push({ role: "user", content: stripOpenAIParts(toolImages) });
     toolImages = [];
   };
-  for (const m of messages) {
+  for (const m of googleModel ? prepareGoogleMessages(messages, googleModel) : messages) {
     if (m.role !== "tool") flushImages();
     if (m.role === "tool") {
       if (Array.isArray(m.content)) {
@@ -212,7 +216,8 @@ function normalizeOpenAIMessages(messages: WireMessage[]): Record<string, unknow
       // Never send null/empty content — Grok 400 "Empty content block".
       if (text) msg.content = text;
       else if (!m.tool_calls?.length) msg.content = "(empty)";
-      if (m.tool_calls?.length) msg.tool_calls = m.tool_calls.map(({ id, type, function: fn }) => ({ id, type, function: fn }));
+      if (m.tool_calls?.length) msg.tool_calls = googleModel ? m.tool_calls.map(googleToolCall)
+        : m.tool_calls.map(({ id, type, function: fn }) => ({ id, type, function: fn }));
       out.push(msg);
       continue;
     }
@@ -259,14 +264,19 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
   signal.throwIfAborted();
   const sys = "Generate a concise 3-6 word title for a chat that starts with the user's message. The title must summarize the topic, not repeat the message.";
   const prompt = userText.slice(0, 2000);
-  if (oauthKind) {
-    // OAuth providers have no raw HTTP endpoint here; stream a tiny completion.
+  const responses = shouldUseOpenAIResponses({ apiBaseUrl, model, anthropic, oauthKind });
+  const claude = oauthKind === "claude-code" || (!oauthKind && (anthropic ?? isAnthropic(apiBaseUrl)) && ANTHROPIC_DEFAULT_THINKING.test(model));
+  const google = !oauthKind && isGoogleOpenAIEndpoint(apiBaseUrl) && /^gemini-/i.test(model);
+  if (oauthKind || responses || claude || google) {
+    // Use the provider's transport, with room for required reasoning tokens.
+    // Fable's always-on thinking rejects forced tool calls, including set_title.
     let text = "";
     const gen = streamChat({
-      apiBaseUrl, apiKey, oauthKind, maxRetries: 1,
+      apiBaseUrl, apiKey, anthropic, oauthKind, maxRetries: 1,
       model,
       messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
-      maxTokens: 200,
+      maxTokens: responses || claude || google ? 4096 : 200,
+      ...(responses || claude || google ? { modelParams: { reasoningEffort: google ? "none" : "low", ...(claude ? { thinking: "disabled" } : {}) } } : {}),
       signal,
     });
     for await (const ev of gen) {
@@ -297,6 +307,8 @@ export async function generateTitle(apiBaseUrl: string, apiKey: string, model: s
   }
   const msgs = [{ role: "system", content: sys }, { role: "user", content: prompt }];
   const call = async (body: Record<string, unknown>) => {
+    applyOpenAIChatOptions(body, apiBaseUrl, model, { auxiliary: true });
+    if (isGoogleOpenAIEndpoint(apiBaseUrl)) applyGoogleOpenAIOptions(body, model);
     const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/chat/completions`, {
       method: "POST",
       signal,
@@ -379,14 +391,18 @@ export async function pickModel(apiBaseUrl: string, apiKey: string, judge: strin
   const useAnthropic = anthropic ?? isAnthropic(apiBaseUrl);
   const sys = `You route a coding task to the best model. Available models: ${candidates.join(", ")}. Reply with EXACTLY one model id from the list, nothing else.`;
   const prompt = task.slice(0, 2000);
-  if (oauthKind) {
-    // OAuth judges (Claude Code / Codex) have no raw HTTP endpoint; stream a tiny completion.
+  const responses = shouldUseOpenAIResponses({ apiBaseUrl, model: judge, anthropic, oauthKind });
+  const claude = oauthKind === "claude-code" || (!oauthKind && useAnthropic && ANTHROPIC_DEFAULT_THINKING.test(judge));
+  const google = !oauthKind && isGoogleOpenAIEndpoint(apiBaseUrl) && /^gemini-/i.test(judge);
+  if (oauthKind || responses || claude || google) {
+    // Use the provider's transport, with room for required reasoning tokens.
     let text = "";
     const gen = streamChat({
-      apiBaseUrl, apiKey, oauthKind, maxRetries: 1,
+      apiBaseUrl, apiKey, anthropic, oauthKind, maxRetries: 1,
       model: judge,
       messages: [{ role: "system", content: sys }, { role: "user", content: prompt }],
-      maxTokens: 64,
+      maxTokens: responses || claude || google ? 4096 : 64,
+      ...(responses || claude || google ? { modelParams: { reasoningEffort: google ? "none" : "low", ...(claude ? { thinking: "disabled" } : {}) } } : {}),
       signal,
     });
     for await (const ev of gen) {
@@ -405,13 +421,16 @@ export async function pickModel(apiBaseUrl: string, apiKey: string, judge: strin
       body: JSON.stringify({ model: judge, system: sys, messages: [{ role: "user", content: prompt }], max_tokens: 24 }),
     });
     const d = await auxiliaryResponse(r, judge, true, "judge", options);
-    return String(d?.content?.[0]?.text ?? "").trim();
+    return (d?.content ?? []).filter((block: any) => block?.type === "text").map((block: any) => block.text ?? "").join("").trim();
   }
+  const body: Record<string, unknown> = { model: judge, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }], max_tokens: 24, temperature: 0 };
+  applyOpenAIChatOptions(body, apiBaseUrl, judge, { auxiliary: true });
+  if (isGoogleOpenAIEndpoint(apiBaseUrl)) applyGoogleOpenAIOptions(body, judge);
   const r = await fetch(`${normalizeBaseUrl(apiBaseUrl)}/chat/completions`, {
     method: "POST",
     signal,
     headers: { ...(apiKey ? { authorization: `Bearer ${apiKey}` } : {}), "content-type": "application/json" },
-    body: JSON.stringify({ model: judge, messages: [{ role: "system", content: sys }, { role: "user", content: prompt }], max_tokens: 24, temperature: 0 }),
+    body: JSON.stringify(body),
   });
   const d = await auxiliaryResponse(r, judge, false, "judge", options);
   return String(d?.choices?.[0]?.message?.content ?? "").trim();
@@ -437,17 +456,33 @@ export function streamChat(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> 
   if (useAnthropic && !opts.apiKey) {
     throw new Error("API Key not set");
   }
-  const make = () => (useAnthropic ? streamAnthropic(opts) : streamOpenAI(opts));
+  const make = () => (useAnthropic ? streamAnthropic(opts) : shouldUseOpenAIResponses(opts) ? streamResponses(opts) : streamOpenAI(opts));
   return streamWithRetry(make, opts.signal, opts.onRetry, opts.maxRetries ?? 10, opts.model);
+}
+
+async function* streamResponses(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
+  try {
+    const { url, init } = createOpenAIResponsesRequest(opts);
+    const response = await fetch(url, init);
+    if (!response.ok) {
+      const detail = await response.text().catch(() => "");
+      throw new ChatHTTPError(response.status, `OpenAI Responses ${response.status}: ${detail.slice(0, 500)}`);
+    }
+    yield* parseOpenAIResponses(response, opts.signal, opts.model);
+  } catch (error) {
+    if (error instanceof OpenAIResponsesError) throw new ChatHTTPError(error.status, error.message);
+    throw error;
+  }
 }
 
 const withoutStreamUsage = new Set<string>();
 
 async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent> {
   const baseUrl = normalizeBaseUrl(opts.apiBaseUrl);
+  const google = isGoogleOpenAIEndpoint(baseUrl);
   const body: Record<string, unknown> = {
     model: opts.model,
-    messages: normalizeOpenAIMessages(opts.messages),
+    messages: normalizeOpenAIMessages(opts.messages, google ? opts.model : undefined),
     stream: true,
     ...(!withoutStreamUsage.has(baseUrl) ? { stream_options: { include_usage: true } } : {}),
   };
@@ -462,6 +497,8 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
     body.reasoning_effort = opts.modelParams.reasoningEffort;
   }
   applyOpenAISampling(body, opts.sampling);
+  applyOpenAIChatOptions(body, opts.apiBaseUrl, opts.model);
+  if (google) applyGoogleOpenAIOptions(body, opts.model, opts.modelParams);
   if (opts.tools?.length) {
     body.tools = opts.tools;
     body.tool_choice = "auto";
@@ -498,7 +535,7 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
     throw new ChatHTTPError(r.status, `chat ${r.status}${hint}: ${clean.slice(0, 500)}`);
   }
 
-  const toolAcc: Record<number, { id: string; name: string; args: string }> = {};
+  const toolAcc: Record<number, { id: string; name: string; args: string; thoughtSignature?: string }> = {};
   let finishReason = "stop";
   let finished = false;
   const usage = new UsageTracker();
@@ -532,6 +569,8 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
         for (const tc of delta.tool_calls) {
           const idx = tc.index ?? 0;
           const acc = (toolAcc[idx] ??= { id: "", name: "", args: "" });
+          const signature = google ? googleThoughtSignature(tc) : undefined;
+          if (signature) acc.thoughtSignature = signature;
           if (tc.id) acc.id = tc.id;
           const hadName = !!acc.name;
           if (tc.function?.name) acc.name = tc.function.name;
@@ -557,7 +596,8 @@ async function* streamOpenAI(opts: StreamChatOpts): AsyncGenerator<ProviderEvent
     if (!a.name) continue;
     // Some providers prefix tool names (e.g. "default_api:read_file" or "functions.read_file"); normalize.
     const normalizedName = a.name.split(/[:.]/).pop() || a.name;
-    const call: ToolCall = { id: a.id || `call_${idx}`, name: normalizedName, arguments: a.args || "{}" };
+    const call: ToolCall = { id: a.id || `call_${idx}`, name: normalizedName, arguments: a.args || "{}",
+      ...(a.thoughtSignature ? { thoughtSignature: a.thoughtSignature } : {}) };
     yield { type: "tool-call", call };
   }
   yield { type: "done", finishReason };
@@ -602,8 +642,7 @@ async function* streamAnthropic(opts: {
     }));
   }
 
-  // 1M context is native on Opus 5 / Fable 5 / Sonnet 5 / 4.6+; beta is only
-  // needed for older models that still gate long context behind it.
+  // Current 1M models use that window natively; the legacy beta is retired.
   const betas: string[] = [...reasoningBetas];
   if (opts.modelParams?.maxContext === "1m" && needsContext1mBeta(opts.model)) {
     betas.push("context-1m-2025-08-07");

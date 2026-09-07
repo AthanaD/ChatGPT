@@ -1062,8 +1062,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
   private _buildModelList(fetched: { providerId: string; ids: string[] }[]): ModelDef[] {
     const features = this.featureStore.get();
     const enabled = this._enabledProviders();
-    // enabledModels is the authoritative allow-list. Catalog models are enabled by
-    // default; any other provider model stays disabled until the user enables it.
+    // Saved choices include explicitly enabled models. Newly shipped catalog
+    // defaults also appear; any explicit disabledModels entry takes precedence.
     // Empty set = legacy/fresh config → fall back to "all catalog enabled".
     const enabledSet = new Set(features.enabledModels.length ? features.enabledModels : this.featureStore.allModels().filter((m) => m.enabled !== false).map((m) => m.id));
     // Only catalog models enabled by default count as auto-on for fetched/OAuth ids.
@@ -1079,7 +1079,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     // Catalog/default models served by an enabled provider of matching kind.
     for (const m of this.featureStore.allModels()) {
       // Catalog models default-on; only filter when explicitly disabled.
-      if (disabledSet.has(m.id) || !enabledSet.has(m.id)) continue;
+      if (disabledSet.has(m.id) || (!enabledSet.has(m.id) && !catalogIds.has(m.id))) continue;
       // Custom models tagged to a specific provider route there; else by kind.
       // Catalog models only match popular (built-in) providers — a custom
       // "OpenAI-compatible" endpoint serves its own fetched models, not the catalog.

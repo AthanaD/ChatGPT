@@ -52,6 +52,12 @@ it("does not send Google replay signatures to an OpenAI-compatible endpoint", as
 });
 
 describe("complete provider request contracts", () => {
+  it.each([undefined, "claude-code"] as const)("honors Sonnet 5 disabled thinking through %s", async (oauthKind) => {
+    await collect({ anthropic: true, oauthKind, model: "claude-sonnet-5", modelParams: { thinking: "disabled", reasoningEffort: "max" } });
+    expect(requests[0].body.thinking).toEqual({ type: "disabled" });
+    expect(requests[0].body.output_config).toEqual({ effort: "max" });
+  });
+
   it.each([undefined, "claude-code"] as const)("limits Anthropic cache breakpoints for %s without modifying history", async (oauthKind) => {
     const messages = buildMessages("System", [{ kind: "user", text: "Previous request" }, { kind: "assistant", text: "Previous answer", calls: [] }, { kind: "user", text: "Follow-up" }], { userInfo: "Workspace", openFiles: "src/example.ts", timestamp: "fixture" });
     const original = JSON.stringify(messages);

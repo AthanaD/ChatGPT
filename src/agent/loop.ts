@@ -31,7 +31,7 @@ import { DeferredToolSchemas } from "./deferredTools";
 import { restoreContext, saveContext } from "./contextState";
 import { buildUserInfoBlock, buildOpenFilesBlock } from "../context/cursorContext";
 import { mcpManager } from "../integrations/mcpClient";
-import type { AgentEvent, Attachment, Mode, Step, ToolCall, ToolSchema } from "./types";
+import type { AgentEvent, Attachment, Mode, ResponsesReasoning, Step, ToolCall, ToolSchema } from "./types";
 import type { SubagentDef } from "../stores/featureStore";
 import type { RunAgentOptions } from "./loopTypes";
 import { buildTeamsBlock, findSubagentByName, resolveTeamSubagents } from "./teams";
@@ -791,6 +791,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			let assistantText = "";
 			let thinking = "";
+			let responsesReasoning: ResponsesReasoning | undefined;
 			let finishReason = "";
 			const calls: ToolCall[] = [];
 			// Map provider stream index → call id, so streamed args route to the
@@ -822,6 +823,10 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				} else if (ev.type === "thinking-delta") {
 					thinking += ev.text;
 					emit({ type: "thinking-delta", text: ev.text });
+				} else if (ev.type === "responses-reasoning") {
+					// The provider emits complete opaque state after validating the
+					// terminal response. Keep it for tool continuations, outside the UI.
+					responsesReasoning = ev.reasoning;
 				} else if (ev.type === "tool-call-start") {
 					// Surface the tool card the moment the model commits to a call.
 					// No startedAt yet — countdown begins when execute actually starts.
@@ -860,11 +865,11 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			// One assistant message per model turn (text + its tool calls together):
 			// splitting it doubled the message count and deviated from the shape
 			// providers expect for thinking followed by tool use.
-			if (assistantText || thinking || !calls.length) {
-				pushHistory({ kind: "assistant", text: assistantText, thinking: thinking || undefined, calls });
-			} else if (calls.length) {
-				pushHistory({ kind: "assistant", text: "", calls });
-			}
+			pushHistory({
+				kind: "assistant", text: assistantText, calls,
+				...(thinking ? { thinking } : {}),
+				...(responsesReasoning ? { responsesReasoning } : {}),
+			});
 
 			if (!calls.length) {
 				consecutiveTextTurns++;

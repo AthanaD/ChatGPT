@@ -817,7 +817,7 @@ async function* streamCodex(id: string, opts: Parameters<typeof createCodexReque
   if (!response.ok || !response.body) {
     throw new ChatHTTPError(response.ok ? 502 : response.status, `codex ${response.status}: ${(await response.text().catch(() => "")).slice(0, 500)}`);
   }
-  try { yield* parseCodexStream(response.body.getReader(), opts.signal); }
+  try { yield* parseCodexStream(response.body.getReader(), opts.signal, { provider: "codex", model: opts.model }); }
   catch (error) {
     if (error instanceof CodexProtocolError) throw new ChatHTTPError(error.status, error.message);
     throw error;

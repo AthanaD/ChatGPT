@@ -10,7 +10,7 @@
 import { beforeEach, describe, expect, it, vi } from "vitest";
 import type { StreamChatOpts } from "./provider";
 import type { RunAgentOptions } from "./loopTypes";
-import type { AgentEvent, ProviderEvent, Step, ToolCall, WireMessage } from "./types";
+import type { AgentEvent, ProviderEvent, ResponsesReasoning, Step, ToolCall, WireMessage } from "./types";
 import type { Tool } from "./tools/types";
 import type { ToolSpec } from "./tools/schemas";
 
@@ -177,6 +177,52 @@ beforeEach(() => {
 	vi.spyOn(writePlanTool, "execute").mockImplementation(async (input) => {
 		fixture.executions.push({ name: "WritePlan", input });
 		return { output: "Plan saved to .plans/test.md" };
+	});
+});
+
+describe("Responses reasoning continuations", () => {
+	const reasoning: ResponsesReasoning = {
+		model: "gpt-5.4", provider: "openai",
+		items: [
+			{ type: "reasoning", id: "rs_first", summary: [], encrypted_content: "opaque-first-response" },
+			{ type: "reasoning", id: "rs_second", summary: [{ type: "summary_text", text: "Inspecting files" }], encrypted_content: "opaque-second-item" },
+		],
+	};
+
+	it.each([false, true])("replays complete state through tool results with display thinking=%s", async (displayThinking) => {
+		const firstTurn: ProviderEvent[] = [
+			...(displayThinking ? [{ type: "thinking-delta" as const, text: "Visible reasoning summary" }] : []),
+			{ type: "responses-reasoning", reasoning },
+			...toolTurn(call("Read", { path: "first.ts" }, "first"), call("Read", { path: "second.ts" }, "second")),
+		];
+		const { history, events } = await run([
+			firstTurn,
+			toolTurn(call("Read", { path: "third.ts" }, "third")),
+			answer("All three files inspected."),
+		], { model: reasoning.model });
+		const assistants = history.filter((step) => step.kind === "assistant");
+		expect(assistants[0].responsesReasoning).toEqual(reasoning);
+		expect(assistants[1].responsesReasoning).toBeUndefined();
+		expect(assistants[2].responsesReasoning).toBeUndefined();
+		const replay = fixture.requests[1].messages.find((message) => message.role === "assistant");
+		expect(replay).toMatchObject({ role: "assistant", content: null, responsesReasoning: reasoning });
+		expect(replay).not.toHaveProperty("thinking");
+		for (const request of fixture.requests) expectCompleteToolGroups(request.messages);
+		expect(JSON.stringify(events)).not.toContain("opaque-first-response");
+		expect(JSON.stringify(events)).not.toContain("responses-reasoning");
+		expectFinished(events, "All three files inspected.", 3);
+	});
+
+	it("restores a completed response's reasoning from serialized history on the next user run", async () => {
+		const first = await run([
+			[{ type: "responses-reasoning", reasoning }, ...answer("The initial answer.")],
+		], { model: reasoning.model });
+		const savedHistory: Step[] = JSON.parse(JSON.stringify(first.history));
+		await run([answer("The follow-up answer.")], { model: reasoning.model, history: savedHistory, prompt: "Explain the answer" });
+		expect(fixture.requests[1].messages).toContainEqual(expect.objectContaining({
+			role: "assistant", content: "The initial answer.", responsesReasoning: reasoning,
+		}));
+		expect(savedHistory.filter((step) => step.kind === "assistant").at(-1)?.responsesReasoning).toBeUndefined();
 	});
 });
 

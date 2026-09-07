@@ -8,7 +8,7 @@
  */
 
 import { createHash, randomUUID } from "crypto";
-import type { ProviderEvent, ToolSchema, WireMessage } from "../types";
+import type { ProviderEvent, ResponsesReasoning, ToolSchema, WireMessage } from "../types";
 import { sseData } from "../provider/sse";
 import { UsageTracker } from "../provider/usage";
 
@@ -58,11 +58,15 @@ function codexSessionId(promptCacheKey: string): string {
 type ImagePart = { type: "input_image"; image_url: string };
 type TextPart = { type: "input_text" | "output_text"; text: string };
 type InputItem =
-  | { role: "user" | "assistant"; content: (ImagePart | TextPart)[] }
+  | { role: "user"; content: (ImagePart | TextPart)[] }
+  | { role: "assistant"; content: TextPart[]; phase?: ResponsesReasoning["phase"] }
   | { type: "function_call"; call_id: string; name: string; arguments: string }
-  | { type: "function_call_output"; call_id: string; output: string };
+  | { type: "function_call_output"; call_id: string; output: string }
+  | ResponsesReasoning["items"][number];
 
-function toResponsesInput(messages: WireMessage[]): { instructions: string; input: InputItem[] } {
+type ResponsesIdentity = Pick<ResponsesReasoning, "model" | "provider">;
+
+export function toResponsesInput(messages: WireMessage[], identity?: ResponsesIdentity): { instructions: string; input: InputItem[] } {
   const instructions: string[] = [];
   const input: InputItem[] = [];
   let toolImages: ImagePart[] = [];
@@ -80,7 +84,27 @@ function toResponsesInput(messages: WireMessage[]): { instructions: string; inpu
         : message.content.map((part) => part.type === "text" ? { type: "input_text", text: part.text } : { type: "input_image", image_url: part.image_url.url });
       input.push({ role: "user", content });
     } else if (message.role === "assistant") {
-      if (message.content) input.push({ role: "assistant", content: [{ type: "output_text", text: message.content }] });
+      const candidate = message.responsesReasoning;
+      const reasoning = identity && candidate?.provider === identity.provider && candidate.model === identity.model ? candidate : undefined;
+      // Encrypted reasoning is bound to its transport and model. Other models
+      // receive only the portable text, calls, and results from this history.
+      if (reasoning) {
+        for (const item of reasoning.items) if (item.type === "reasoning" && item.id && item.encrypted_content) {
+          input.push({ type: "reasoning", id: item.id, summary: item.summary, encrypted_content: item.encrypted_content });
+        }
+      }
+      if (message.content) {
+        // GPT-5.3 Codex requires each assistant item's original phase. Keep
+        // boundaries when history text is intact; edited mixed-phase text is
+        // replayed without assigning it a misleading phase.
+        // https://developers.openai.com/api/docs/guides/latest-model?model=gpt-5.3-codex
+        const segments = reasoning?.messages;
+        if (segments?.length && segments.map((segment) => segment.text).join("") === message.content) {
+          for (const segment of segments) if (segment.text) input.push({ role: "assistant", content: [{ type: "output_text", text: segment.text }], ...(segment.phase !== undefined ? { phase: segment.phase } : {}) });
+        } else {
+          input.push({ role: "assistant", content: [{ type: "output_text", text: message.content }], ...(reasoning?.phase !== undefined ? { phase: reasoning.phase } : {}) });
+        }
+      }
       for (const call of message.tool_calls ?? []) {
         // call_id joins tool results to calls. Never replay transient server item IDs.
         input.push({ type: "function_call", call_id: call.id, name: call.function.name, arguments: call.function.arguments || "{}" });
@@ -118,7 +142,7 @@ function reasoningEffort(model: string, requested = "low"): string {
 
 export function createCodexRequest(opts: CodexRequestOptions, account: CodexCredentials): { url: string; init: RequestInit } {
   opts.signal?.throwIfAborted();
-  const { instructions, input } = toResponsesInput(opts.messages);
+  const { instructions, input } = toResponsesInput(opts.messages, { provider: "codex", model: opts.model });
   const sessionId = opts.promptCacheKey ? codexSessionId(opts.promptCacheKey) : randomUUID();
   const effort = reasoningEffort(opts.model, opts.modelParams?.reasoningEffort);
   // Build the accepted Responses shape directly. Codex rejects max_output_tokens,
@@ -156,6 +180,8 @@ interface StreamItem {
   arguments?: string;
   content?: { type?: string; text?: string; refusal?: string }[];
   summary?: { type?: string; text?: string }[];
+  encrypted_content?: string;
+  phase?: ResponsesReasoning["phase"];
 }
 
 interface ItemState {
@@ -165,8 +191,10 @@ interface ItemState {
 }
 
 /** Read Responses deltas, but release executable calls only after successful completion. */
-export async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint8Array>, signal?: AbortSignal): AsyncGenerator<ProviderEvent> {
+export async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint8Array>, signal?: AbortSignal, identity?: ResponsesIdentity): AsyncGenerator<ProviderEvent> {
   const usage = new UsageTracker();
+  const reasoning = new Map<string, ResponsesReasoning["items"][number]>();
+  const phaseMessages = new Map<ItemState, { state: ItemState; index?: number; phase?: ResponsesReasoning["phase"] }>();
   const byId = new Map<string, ItemState>();
   const byIndex = new Map<number, ItemState>();
   const tools: NonNullable<ItemState["tool"]>[] = [];
@@ -202,6 +230,15 @@ export async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint
   }
   function* finalizeItem(item: StreamItem, index?: number): Generator<ProviderEvent> {
     const state = stateFor(item.id, index);
+    if (identity && item.type === "message") {
+      const record = phaseMessages.get(state) ?? { state, index };
+      if (index !== undefined) record.index = index;
+      if (item.phase === null || item.phase === "commentary" || item.phase === "final_answer") record.phase = item.phase;
+      phaseMessages.set(state, record);
+    }
+    if (identity && item.type === "reasoning" && typeof item.id === "string" && item.id && typeof item.encrypted_content === "string" && item.encrypted_content) {
+      reasoning.set(item.id, { type: "reasoning", id: item.id, summary: Array.isArray(item.summary) ? item.summary : [], encrypted_content: item.encrypted_content });
+    }
     if (item.type === "function_call") yield* updateTool(state, item);
     if (Array.isArray(item.content)) for (const [partIndex, part] of item.content.entries()) {
       if (part.type === "output_text") yield* finalText(state, partIndex, part.text);
@@ -232,6 +269,7 @@ export async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint
           observed.input_tokens ?? observed.prompt_tokens,
           observed.output_tokens ?? observed.completion_tokens,
           observed.input_tokens_details?.cached_tokens ?? observed.cache_read_input_tokens,
+          observed.input_tokens_details?.cache_write_tokens,
         );
         if (delta) yield delta;
       }
@@ -295,6 +333,11 @@ export async function* parseCodexStream(reader: ReadableStreamDefaultReader<Uint
     signal?.throwIfAborted();
     if (!finished) throw new CodexProtocolError(502, "codex stream ended before completion");
     if (tools.some((tool) => !tool.name)) throw new CodexProtocolError(502, "codex completed a function call without a tool name");
+    const messages = [...phaseMessages.values()].sort((a, b) => (a.index ?? Infinity) - (b.index ?? Infinity))
+      .map(({ state, phase }) => ({ text: [...state.text.entries()].sort(([a], [b]) => a - b).map(([, text]) => text).join(""), ...(phase !== undefined ? { phase } : {}) }));
+    const hasPhase = messages.some((message) => message.phase !== undefined);
+    const phase = messages.length && messages.every((message) => message.phase === messages[0].phase) ? messages[0].phase : undefined;
+    if (identity && (reasoning.size || hasPhase)) yield { type: "responses-reasoning", reasoning: { ...identity, items: [...reasoning.values()], ...(hasPhase ? { messages } : {}), ...(phase !== undefined ? { phase } : {}) } };
     for (const tool of tools) {
       signal?.throwIfAborted();
       yield { type: "tool-call", call: { id: tool.id, name: tool.name, arguments: tool.args || "{}" } };

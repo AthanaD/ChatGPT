@@ -31,12 +31,28 @@ export interface ToolImage {
   base64: string;
 }
 
+/** Opaque Responses state, replayed only to the model and provider that issued it. */
+export interface ResponsesReasoning {
+  model: string;
+  provider: "openai" | "codex";
+  /** Phase is safe as a fallback only when all original assistant items agree. */
+  phase?: "commentary" | "final_answer" | null;
+  /** Preserve item boundaries when a response contains different output phases. */
+  messages?: Array<{ text: string; phase?: "commentary" | "final_answer" | null }>;
+  items: Array<{
+    type: "reasoning";
+    id: string;
+    summary: unknown[];
+    encrypted_content: string;
+  }>;
+}
+
 export type Step =
   /** `synthetic` marks loop-injected system messages (nudges, subagent reports,
    *  compaction summaries) — they are not the user's request and must never be
    *  treated as one when placing context blocks or bounding the live turn. */
   | { kind: "user"; text: string; attachments?: Attachment[]; synthetic?: boolean }
-  | { kind: "assistant"; text: string; thinking?: string; calls: ToolCall[] }
+  | { kind: "assistant"; text: string; thinking?: string; calls: ToolCall[]; responsesReasoning?: ResponsesReasoning }
   | { kind: "tool-result"; callId: string; name: string; output: string; status: "completed" | "error"; image?: ToolImage };
 
 export interface ToolSchema {
@@ -55,20 +71,22 @@ export type WireContentPart =
 export type WireMessage =
   | { role: "system"; content: string | WireContentPart[] }
   | { role: "user"; content: string | WireContentPart[] }
-  | { role: "assistant"; content: string | null; tool_calls?: WireToolCall[] }
+  | { role: "assistant"; content: string | null; tool_calls?: WireToolCall[]; responsesReasoning?: ResponsesReasoning }
   | { role: "tool"; tool_call_id: string; content: string | WireContentPart[] };
 
 export interface WireToolCall {
   id: string;
   type: "function";
   function: { name: string; arguments: string };
-  /** Internal replay metadata, serialized only by the Google OAuth client. */
+  /** Internal replay metadata, serialized only by the Google clients. */
   thoughtSignature?: string;
 }
 
 export type ProviderEvent =
   | { type: "text-delta"; text: string }
   | { type: "thinking-delta"; text: string }
+  /** Complete, validated reasoning state for one response; never a UI event. */
+  | { type: "responses-reasoning"; reasoning: ResponsesReasoning }
   // Streaming tool-call progress: fires when a call first appears (name known)
   | { type: "tool-call-start"; index: number; id: string; name: string }
   // ...and as its JSON arguments arrive in chunks.

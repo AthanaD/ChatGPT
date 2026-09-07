@@ -133,7 +133,7 @@ describe("Claude OAuth request protocol", () => {
     expect(body.output_config).toBeUndefined();
   });
 
-  it("preserves modern adaptive reasoning and legacy effort/context beta selection", () => {
+  it("preserves modern and manual reasoning without obsolete effort/context betas", () => {
     const modern = makeRequest({ model: "claude-opus-5", modelParams: { thinking: "enabled", reasoningEffort: "high", maxContext: "1m" } });
     const modernBody = JSON.parse(String(modern.init.body));
     expect(modernBody.thinking).toEqual({ type: "adaptive", display: "summarized" });
@@ -143,8 +143,8 @@ describe("Claude OAuth request protocol", () => {
 
     const legacy = makeRequest({ model: "claude-opus-4-5", maxTokens: 8192, modelParams: { thinking: "enabled", reasoningEffort: "high", maxContext: "1m" } });
     expect(JSON.parse(String(legacy.init.body)).thinking).toEqual({ type: "enabled", budget_tokens: 4096 });
-    expect(new Headers(legacy.init.headers).get("anthropic-beta")).toContain("effort-2025-11-24");
-    expect(new Headers(legacy.init.headers).get("anthropic-beta")).toContain("context-1m-2025-08-07");
+    expect(new Headers(legacy.init.headers).get("anthropic-beta")).not.toContain("effort-2025-11-24");
+    expect(new Headers(legacy.init.headers).get("anthropic-beta")).not.toContain("context-1m-2025-08-07");
   });
 
   it("preserves explicit output limits and shared model defaults", () => {

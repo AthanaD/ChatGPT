@@ -14,6 +14,7 @@ import { runAgent } from "../agent/loop";
 import { generateTitle } from "../agent/provider";
 import { recordUsage } from "../stores/usageStore";
 import { DEFAULT_APPROVAL } from "../agent/approvalPolicy";
+import { MODEL_CATALOG, type ModelDef } from "../stores/featureStore";
 
 vi.mock("vscode", () => ({ window: { showWarningMessage: vi.fn(), showErrorMessage: vi.fn(), state: { focused: true } } }));
 vi.mock("../agent/loop", () => ({ runAgent: vi.fn() }));
@@ -56,7 +57,10 @@ function session() {
   return { abort: new AbortController(), pendingApprovals: new Map(), pendingQuestions: new Map(), subagentAborts: new Map(), turns: [], done, resolveDone };
 }
 
-beforeEach(() => vi.clearAllMocks());
+beforeEach(() => {
+  vi.clearAllMocks();
+  MODEL_CATALOG.length = 0;
+});
 
 describe("production sidebar session lifecycle", () => {
   it("Stop resolves pending approval and remains idempotent", async () => {
@@ -162,5 +166,38 @@ describe("production scoped provider routing", () => {
     const { host, features } = await fixture();
     features.providers[0].enabled = false;
     await expect(host._resolveProviderForModel("api::claude")).rejects.toThrow("unavailable or disabled");
+  });
+});
+
+describe("production catalog update visibility", () => {
+  async function modelsFixture(disabledModels: string[] = []) {
+    const { host, features } = await fixture();
+    const catalog: ModelDef[] = [
+      { id: "old-model", name: "Old model", kind: "anthropic" },
+      { id: "new-model", name: "New model", kind: "anthropic" },
+      { id: "optional-model", name: "Optional model", kind: "anthropic", enabled: false },
+    ];
+    MODEL_CATALOG.push(...catalog);
+    Object.assign(features, {
+      providers: [{ id: "popular:anthropic", name: "Anthropic", kind: "anthropic", enabled: true, baseUrl: "https://api.example.test" }],
+      enabledModels: ["old-model"], disabledModels, disabledLocalModels: [],
+    });
+    host.featureStore.allModels = () => catalog;
+    host.featureStore.nameFor = (id: string) => id;
+    return host;
+  }
+
+  it("shows newly shipped catalog defaults with an old saved allowlist before provider discovery", async () => {
+    const host = await modelsFixture();
+    expect(host._buildModelList([]).map((model: ModelDef) => model.id)).toEqual([
+      "popular:anthropic::old-model", "popular:anthropic::new-model",
+    ]);
+  });
+
+  it("preserves explicit user opt-outs even when the model is a new default or fetched", async () => {
+    const host = await modelsFixture(["new-model"]);
+    expect(host._buildModelList([{ providerId: "popular:anthropic", ids: ["old-model", "new-model", "uncurated-model"] }]).map((model: ModelDef) => model.id)).toEqual([
+      "popular:anthropic::old-model",
+    ]);
   });
 });
