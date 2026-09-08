@@ -29,6 +29,7 @@ import { createHash } from "node:crypto";
 import { BackgroundTasks } from "./backgroundTasks";
 import type { ToolOutcome } from "./toolOutcome";
 import { ActivityLedger } from "./taskState";
+import { RetrievalProgress } from "./retrievalProgress";
 import { ContextArchive } from "./contextArchive";
 import { DeferredToolSchemas } from "./deferredTools";
 import { restoreContext, saveContext } from "./contextState";
@@ -235,6 +236,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 	// replaces entries via spread (never mutates originals), and new steps are
 	// pushed as fresh objects.
 	const history: Step[] = restoreContext(persistedHistory, opts.contextState);
+	const runStart = persistedHistory.length;
 	const archive = new ContextArchive();
 	archive.prepareSteps(persistedHistory);
 	let deferredTools: DeferredToolSchemas | undefined;
@@ -645,12 +647,14 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		let nudgeCount = 0;
 		const MAX_NUDGES = 3;
 		let todoNudged = false;
+		const retrievalProgress = new RetrievalProgress();
 
 		// Feed already-finished (but unreported) background subagent results into the
 		// conversation, so the model always knows what has completed. Returns count.
 		const flushSettledBg = (): number => {
 			const done = background.drain();
 			if (done.length) {
+				retrievalProgress.reset();
 				pushSystemNote(
 					`Background subagent${done.length > 1 ? "s" : ""} finished — results below.\n\n${done.map((v) => `### ${v.title} (task ${v.id})\n${v.text}`).join("\n\n")}`,
 				);
@@ -778,10 +782,15 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				throw new Error("The context window is too small for the instructions, tools, and response limit. Increase the context window or reduce the response limit or workspace instructions.");
 			}
 
-			// The UI retains original outputs and edit arguments. The model sees stable
-			// excerpts with references it can read or search only when detail is needed.
+			// Keep completed tool exchanges verbatim while the prompt fits. Rewriting
+			// old results on every turn loses findings and invalidates cached prefixes.
 			economizeHistory(history);
-			let modelHistory = archive.prepareSteps(history);
+			let modelHistory = history;
+			let contextReduced = false;
+			if (limitedContext && stepsTokens(modelHistory) + overheadTokens > fittingBudget) {
+				modelHistory = archive.prepareSteps(history);
+				contextReduced = true;
+			}
 			const usedEst = stepsTokens(modelHistory) + overheadTokens;
 			const cooledDown = step - lastCompactionStep >= COMPACT_COOLDOWN_STEPS;
 			const shouldCompact = limitedContext && cooledDown && (
@@ -808,20 +817,31 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 							kind: "user", synthetic: true,
 							text: `Current context restored after compaction (supersedes older environment snapshots):\n${cursorCtx.userInfo}\n${cursorCtx.openFiles}\n\n${ledger.render({ request: currentRequestText(history), todos: toolCtx.todos })}`,
 						});
-						modelHistory = archive.prepareSteps(history);
-						if (opts.contextState) saveContext(persistedHistory, modelHistory, opts.contextState);
+						modelHistory = history;
+						contextReduced = true;
 						emit({ type: "compaction", status: "done", summary });
 					} catch {
 						emit({ type: "compaction", status: "failed" });
 					}
 				}
 			}
-			const fitted = limitedContext ? fitStepsToBudget(modelHistory, overheadTokens, fittingBudget) : modelHistory;
+			// Group call/results even without a configured limit: tool execution can
+			// append mode or background notes before all siblings have settled.
+			const fitted = limitedContext
+				? fitStepsToBudget(modelHistory, overheadTokens, fittingBudget)
+				: fitStepsToBudget(modelHistory, 0, Number.MAX_SAFE_INTEGER);
 			if (!fitted.some((s) => s.kind === "user" && !s.synthetic)) {
 				throw new Error("The current request cannot fit in the context window. Increase the context window or reduce the attached context.");
 			}
 			if (fitted.length < modelHistory.length) {
 				onHook?.("preCompact", { dropped: String(modelHistory.length - fitted.length) });
+			}
+			if (contextReduced || fitted.length !== history.length || fitted.some((entry, index) => entry !== history[index])) {
+				// Freeze the exact working prefix sent below, including emergency budget
+				// fitting. Later turns and restored chats append to it instead of bringing
+				// back full originals that would immediately need rewriting again.
+				history.splice(0, history.length, ...fitted);
+				if (opts.contextState) saveContext(persistedHistory, history, opts.contextState);
 			}
 			const messages = buildMessages(system, fitted);
 			const requestTokenEstimate = stepsTokens(fitted) + overheadTokens;
@@ -838,75 +858,81 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			const activeTools = schemasFor(mode);
 
-			// Stream response from LLM
-			for await (const ev of streamChat({
-				apiBaseUrl,
-				apiKey,
-				model,
-				messages,
-				tools: activeTools,
-				maxTokens,
-				promptCacheKey: opts.promptCacheKey ?? shellSessionKey,
-				sampling,
-				modelParams,
-				anthropic,
-				oauthKind,
-				signal,
-				onRetry: (attempt, max, delayMs, error) => emit({ type: "retry", attempt, max, delayMs, error }),
-			})) {
-				if (ev.type === "text-delta") {
-					assistantText += ev.text;
-					emit({ type: "text-delta", text: ev.text });
-				} else if (ev.type === "thinking-delta") {
-					thinking += ev.text;
-					emit({ type: "thinking-delta", text: ev.text });
-				} else if (ev.type === "responses-reasoning") {
-					// The provider emits complete opaque state after validating the
-					// terminal response. Keep it for tool continuations, outside the UI.
-					responsesReasoning = ev.reasoning;
-				} else if (ev.type === "tool-call-start") {
-					// Surface the tool card the moment the model commits to a call.
-					// No startedAt yet — countdown begins when execute actually starts.
-					callIdByIndex.set(ev.index, ev.id);
-					argsByIndex.set(ev.index, "");
-					const tMs = toolTimeoutMs(ev.name);
-					emit({
-						type: "tool-call-started",
-						callId: ev.id,
-						name: ev.name,
-						input: {},
-						timeoutMs: tMs > 0 ? tMs : undefined,
-					});
-				} else if (ev.type === "tool-call-args-delta") {
-					const id = callIdByIndex.get(ev.index);
-					const acc = (argsByIndex.get(ev.index) ?? "") + ev.delta;
-					argsByIndex.set(ev.index, acc);
-					if (id) emit({ type: "tool-call-args", callId: id, argsText: acc });
-				} else if (ev.type === "tool-call") {
-					calls.push(ev.call);
-				} else if (ev.type === "usage") {
-					lastPrompt = ev.promptTokensTotal ?? ev.promptTokens ?? lastPrompt;
-					if (lastPrompt && requestTokenEstimate > 0) {
-						promptTokenRatio = Math.max(1, lastPrompt / requestTokenEstimate);
+			// Persist received content even when the stream throws on Stop or disconnect.
+			let streamCompleted = false;
+			try {
+				for await (const ev of streamChat({
+					apiBaseUrl,
+					apiKey,
+					model,
+					messages,
+					tools: activeTools,
+					maxTokens,
+					promptCacheKey: opts.promptCacheKey ?? shellSessionKey,
+					sampling,
+					modelParams,
+					anthropic,
+					oauthKind,
+					signal,
+					onRetry: (attempt, max, delayMs, error) => emit({ type: "retry", attempt, max, delayMs, error }),
+				})) {
+					if (ev.type === "text-delta") {
+						assistantText += ev.text;
+						emit({ type: "text-delta", text: ev.text });
+					} else if (ev.type === "thinking-delta") {
+						thinking += ev.text;
+						emit({ type: "thinking-delta", text: ev.text });
+					} else if (ev.type === "responses-reasoning") {
+						// The provider emits complete opaque state after validating the
+						// terminal response. Keep it for tool continuations, outside the UI.
+						responsesReasoning = ev.reasoning;
+					} else if (ev.type === "tool-call-start") {
+						// Surface the tool card the moment the model commits to a call.
+						// No startedAt yet — countdown begins when execute actually starts.
+						callIdByIndex.set(ev.index, ev.id);
+						argsByIndex.set(ev.index, "");
+						const tMs = toolTimeoutMs(ev.name);
+						emit({
+							type: "tool-call-started",
+							callId: ev.id,
+							name: ev.name,
+							input: {},
+							timeoutMs: tMs > 0 ? tMs : undefined,
+						});
+					} else if (ev.type === "tool-call-args-delta") {
+						const id = callIdByIndex.get(ev.index);
+						const acc = (argsByIndex.get(ev.index) ?? "") + ev.delta;
+						argsByIndex.set(ev.index, acc);
+						if (id) emit({ type: "tool-call-args", callId: id, argsText: acc });
+					} else if (ev.type === "tool-call") {
+						calls.push(ev.call);
+					} else if (ev.type === "usage") {
+						lastPrompt = ev.promptTokensTotal ?? ev.promptTokens ?? lastPrompt;
+						if (lastPrompt && requestTokenEstimate > 0) {
+							promptTokenRatio = Math.max(1, lastPrompt / requestTokenEstimate);
+						}
+						lastCompletion = ev.completionTokensTotal ?? ev.completionTokens ?? lastCompletion;
+						// Live-update the ring after every step. prompt/completion carry
+						// this step's delta (usage tracking accumulates them); totalTokens
+						// is the current context occupancy.
+						emit({ ...ev, type: "usage", model: ev.model ?? model, source: "parent", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
+					} else if (ev.type === "done") {
+						finishReason = ev.finishReason || "";
 					}
-					lastCompletion = ev.completionTokensTotal ?? ev.completionTokens ?? lastCompletion;
-					// Live-update the ring after every step. prompt/completion carry
-					// this step's delta (usage tracking accumulates them); totalTokens
-					// is the current context occupancy.
-					emit({ ...ev, type: "usage", model: ev.model ?? model, source: "parent", promptTokens: ev.promptTokens ?? 0, completionTokens: ev.completionTokens ?? 0, totalTokens: lastPrompt + lastCompletion });
-				} else if (ev.type === "done") {
-					finishReason = ev.finishReason || "";
+				}
+
+				streamCompleted = true;
+			} finally {
+				// Partial argument deltas are UI previews, never executable tool calls.
+				// Complete calls receive a cancellation result in cleanup if unexecuted.
+				if (streamCompleted || assistantText || thinking || calls.length) {
+					pushHistory({
+						kind: "assistant", text: assistantText, calls,
+						...(thinking ? { thinking } : {}),
+						...(responsesReasoning ? { responsesReasoning } : {}),
+					});
 				}
 			}
-
-			// One assistant message per model turn (text + its tool calls together):
-			// splitting it doubled the message count and deviated from the shape
-			// providers expect for thinking followed by tool use.
-			pushHistory({
-				kind: "assistant", text: assistantText, calls,
-				...(thinking ? { thinking } : {}),
-				...(responsesReasoning ? { responsesReasoning } : {}),
-			});
 
 			if (!calls.length) {
 				consecutiveTextTurns++;
@@ -938,7 +964,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					continue;
 				}
 				const incompleteTodos = toolCtx.todos.filter((t) => t.status === "pending" || t.status === "in_progress");
-				if (canNudge && !todoNudged && isAgentic() && incompleteTodos.length > 0) {
+				if (canNudge && !todoNudged && !retrievalProgress.wrapUpRequested && isAgentic() && incompleteTodos.length > 0) {
 					todoNudged = true;
 					nudgeCount++;
 					pushSystemNote(
@@ -967,8 +993,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				break;
 			} else {
 				consecutiveTextTurns = 0;
-				// Re-reading files, polling, and rerunning tests are legitimate repeats.
-				// The step limit and hard cap bound the run without guessing from arguments.
 			}
 
 			const parsed = calls.map((call) => {
@@ -1009,11 +1033,24 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 
 			const results = new Array<{ status: "completed" | "error"; output: string; diff?: string; startLine?: number; endLine?: number; outcome?: ToolOutcome; image?: { mime: string; base64: string } }>(parsed.length);
 			const completedUi = new Set<number>();
+			const recordedResults = new Map<number, Step>();
 			const finishUi = (i: number) => {
 				if (completedUi.has(i) || !results[i]) return;
 				completedUi.add(i);
-				const { call } = parsed[i];
+				const { call, resolvedName } = parsed[i];
 				const r = results[i];
+				// Persist each observation before announcing it. A stopped sibling or
+				// extension reload must not leave visible results out of model history.
+				const resultStep: Step = { kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, outcome: r.outcome, image: r.image };
+				recordedResults.set(i, resultStep);
+				// Siblings may settle out of order. Order this unsent batch by call
+				// index while leaving the entire previously requested prefix intact.
+				const nextIndex = [...recordedResults.keys()].filter(index => index > i).sort((a, b) => a - b)[0];
+				const nextResult = recordedResults.get(nextIndex);
+				if (nextResult) {
+					history.splice(history.indexOf(nextResult), 0, resultStep);
+					persistedHistory.splice(persistedHistory.indexOf(nextResult), 0, resultStep);
+				} else pushHistory(resultStep);
 				// Surface completion as soon as the tool settles — don't wait for
 				// siblings. Prevents one slow tool from freezing the whole card strip.
 				emit({
@@ -1366,7 +1403,6 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 			}
 
 			for (let i = 0; i < parsed.length; i++) {
-				const { call } = parsed[i];
 				const resolvedName = parsed[i].resolvedName;
 				const r = results[i] ?? { status: "error" as const, output: "error: tool produced no result" };
 				if (resolvedName === "WritePlan" && r.status === "completed") {
@@ -1375,7 +1411,28 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 				// Keep a bounded recovery ledger for compaction; ordinary requests
 				// retain their original tool results without a changing state suffix.
 				ledger.record(resolvedName, parsed[i].input, r.status, r.output, r.outcome);
-				pushHistory({ kind: "tool-result", callId: call.id, name: resolvedName, output: r.output, status: r.status, outcome: r.outcome, image: r.image });
+				finishUi(i);
+			}
+			const retrievalState = retrievalProgress.observe(parsed.map((item, i) => ({
+				name: item.resolvedName, input: item.input, ...results[i],
+			})));
+			if (retrievalState === "recover") {
+				pushSystemNote("Repeated searches and reads are returning the same results without new evidence. Use the findings already in this conversation to take the next concrete step. Make the authorized change or answer the request; if a specific fact is still missing, inspect only that fact with a different targeted probe. Do not repeat unchanged searches or reads.");
+			} else if (retrievalState === "wrap-up") {
+				pushSystemNote("The investigation is still repeating unchanged results after a recovery reminder. Stop repeating those probes. Use the established evidence to finish the authorized work, or give a concise account of the findings and the exact blocker. An open todo is not a reason to continue the same searches.");
+			} else if (retrievalState === "pause") {
+				// Active children can still supply useful evidence; wait for their next
+				// report instead of ending their work because the parent kept searching.
+				if (bgPending()) {
+					await awaitPendingBg();
+					retrievalProgress.reset();
+					continue;
+				}
+				pushSystemNote("The run was paused after repeated unchanged retrieval results. The task remains incomplete; retain these findings and change approach when resuming.");
+				finalText = "I paused because repeated searches and reads returned no new information. The task is still incomplete; the existing findings and tool results are retained for the next message.";
+				pushHistory({ kind: "assistant", text: finalText, calls: [] });
+				emit({ type: "text-delta", text: finalText });
+				break;
 			}
 
 		}
@@ -1416,6 +1473,17 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		try { emit({ type: "error", message: e instanceof Error ? e.message : String(e) }); } catch { /* ignore */ }
 		emitSettled("error");
 	} finally {
+		// Append missing outcomes without rewriting any already-sent history.
+		// This also preserves a complete call emitted just before a stream abort.
+		const unanswered = new Map<string, ToolCall>();
+		for (const step of persistedHistory.slice(runStart)) {
+			if (step.kind === "assistant") for (const call of step.calls) unanswered.set(call.id, call);
+			else if (step.kind === "tool-result") unanswered.delete(step.callId);
+		}
+		for (const call of unanswered.values()) {
+			pushHistory({ kind: "tool-result", callId: call.id, name: call.name, status: "error", output: "error: run interrupted before a result was recorded; completion is unconfirmed. Verify the current state before retrying any action." });
+		}
+		if (signal.aborted) pushSystemNote("The user stopped the previous run. Earlier tool calls and results retain the observations and outcomes already recorded; the last assistant response may be incomplete. Continue from that evidence when requested, checking only unfinished or potentially changed work.");
 		if (opts.contextState) opts.contextState.todos = toolCtx.todos.map((todo) => ({ ...todo }));
 		// The run owns its children, including error exits.
 		background.cancelAll();

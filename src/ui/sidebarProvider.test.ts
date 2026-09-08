@@ -34,7 +34,13 @@ vi.mock("../logging", () => ({ getLog: () => ({ appendLine: vi.fn() }), logError
 
 function memento() {
   const values = new Map<string, any>();
-  return { get: (key: string, fallback?: any) => values.get(key) ?? fallback, update: async (key: string, value: any) => { values.set(key, value); } };
+  return {
+    get: (key: string, fallback?: any) => values.has(key) ? structuredClone(values.get(key)) : fallback,
+    update: async (key: string, value: any) => {
+      if (value === undefined) values.delete(key);
+      else values.set(key, structuredClone(value));
+    },
+  };
 }
 async function fixture() {
   const context = { globalState: memento(), workspaceState: memento() };
@@ -54,7 +60,7 @@ async function fixture() {
 function session() {
   let resolveDone!: () => void;
   const done = new Promise<void>((resolve) => { resolveDone = resolve; });
-  return { abort: new AbortController(), pendingApprovals: new Map(), pendingQuestions: new Map(), subagentAborts: new Map(), turns: [], done, resolveDone };
+  return { abort: new AbortController(), pendingApprovals: new Map(), pendingQuestions: new Map(), subagentAborts: new Map(), turns: [], history: [], contextState: {}, done, resolveDone };
 }
 
 beforeEach(() => {
@@ -63,6 +69,43 @@ beforeEach(() => {
 });
 
 describe("production sidebar session lifecycle", () => {
+  it("saves live tool history and waits for Stop cleanup before sending a follow-up", async () => {
+    const { host, a, store } = await fixture();
+    let entered!: () => void;
+    const started = new Promise<void>((resolve) => { entered = resolve; });
+    let release!: () => void;
+    const cleanup = new Promise<void>((resolve) => { release = resolve; });
+    vi.mocked(runAgent).mockImplementationOnce(async (opts) => {
+      opts.history.push(
+        { kind: "user", text: opts.prompt },
+        { kind: "assistant", text: "Found the failing branch", calls: [{ id: "read", name: "Read", arguments: '{"path":"src/issue.ts"}' }] },
+        { kind: "tool-result", callId: "read", name: "Read", status: "completed", output: "The exact source already inspected" },
+      );
+      opts.contextState!.todos = [{ id: "fix", content: "Fix the failing branch", status: "in_progress" }];
+      opts.emit({ type: "tool-call-completed", callId: "read", name: "Read", status: "completed", result: "The exact source already inspected" });
+      host._persistTurnsNow(a.id, host._sessions.get(a.id));
+      entered();
+      await new Promise<void>((resolve) => opts.signal.addEventListener("abort", () => resolve(), { once: true }));
+      await cleanup;
+      opts.history.push({ kind: "assistant", text: "Interrupted while preparing the fix", calls: [] });
+    });
+    const running = host._handleMessage("Fix this issue", undefined, { convId: a.id });
+    await started;
+    // A persisted snapshot must contain model history before runAgent returns.
+    expect(store.get(a.id)?.steps.at(-1)).toMatchObject({ kind: "tool-result", output: "The exact source already inspected" });
+    expect(store.get(a.id)?.contextState?.todos?.[0].id).toBe("fix");
+    host._cancelSession(a.id);
+    const followup = host._handleMessage("Continue", undefined, { convId: a.id });
+    expect(vi.mocked(runAgent)).toHaveBeenCalledTimes(1);
+    release();
+    await Promise.all([running, followup]);
+    const resumed = vi.mocked(runAgent).mock.calls[1][0];
+    expect(resumed.history).toEqual(store.get(a.id)?.steps);
+    expect(resumed.history).toContainEqual(expect.objectContaining({ kind: "tool-result", output: "The exact source already inspected" }));
+    expect(resumed.history.at(-1)).toMatchObject({ text: "Interrupted while preparing the fix" });
+    expect(resumed.contextState?.todos?.[0].id).toBe("fix");
+  });
+
   it("Stop resolves pending approval and remains idempotent", async () => {
     const { host, a } = await fixture();
     const s = session();

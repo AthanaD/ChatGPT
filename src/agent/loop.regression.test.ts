@@ -373,6 +373,49 @@ describe("runAgent PR 170 regressions", () => {
 		expectFinished(events, "The implementation plan is saved.", 3);
 	});
 
+	it("recovers repeated retrieval with append-only notes and an unchanged tool schema", async () => {
+		const { history, events } = await run([
+			...Array.from({ length: 4 }, (_, i) => toolTurn(call("Read", { path: "a.ts" }, `read-${i}`))),
+			toolTurn(call("Write", { path: "a.ts", contents: "fixed" }, "write")),
+			toolTurn(call("Read", { path: "a.ts" }, "verify")),
+			answer("Fixed and verified using the existing findings."),
+		]);
+		expect(history).toContainEqual(expect.objectContaining({ kind: "user", synthetic: true, text: expect.stringContaining("without new evidence") }));
+		for (let i = 1; i < fixture.requests.length; i++) {
+			const previous = fixture.requests[i - 1];
+			expect(fixture.requests[i].messages.slice(0, previous.messages.length)).toEqual(previous.messages);
+			expect(fixture.requests[i].tools).toEqual(previous.tools);
+			expectCompleteToolGroups(fixture.requests[i].messages);
+		}
+		expectFinished(events, "Fixed and verified using the existing findings.", 7);
+	});
+
+	it("bounds an unchanged search/read cycle even when auto-continue is enabled", async () => {
+		const { history, events } = await run(
+			Array.from({ length: 20 }, (_, i) => toolTurn(i % 2
+				? call("Read", { path: "a.ts" }, `read-${i}`)
+				: call("Grep", { pattern: "bug" }, `grep-${i}`))),
+			{ autoContinue: true, maxSteps: 200 },
+		);
+		expect(fixture.executions).toHaveLength(10);
+		expect(fixture.requests).toHaveLength(10);
+		expect(history).toContainEqual(expect.objectContaining({ kind: "user", synthetic: true, text: expect.stringContaining("task remains incomplete") }));
+		expect(history.at(-1)).toMatchObject({ kind: "assistant", text: expect.stringContaining("I paused") });
+		expect(events).toContainEqual(expect.objectContaining({ type: "run-result", text: expect.stringContaining("still incomplete") }));
+		expect(events.filter(event => event.type === "error" || event.type === "max-steps")).toEqual([]);
+		for (const request of fixture.requests) expectCompleteToolGroups(request.messages);
+	});
+
+	it("accepts a concrete blocker after the retrieval wrap-up instead of nudging open todos again", async () => {
+		const { events } = await run([
+			toolTurn(call("TodoWrite", { todos: [{ id: "fix", content: "Fix the issue", status: "pending" }] }, "todo")),
+			...Array.from({ length: 7 }, (_, i) => toolTurn(call("Read", { path: "a.ts" }, `read-${i}`))),
+			answer("The reproduction input is missing; I need it to identify the failing case."),
+		]);
+		expect(JSON.stringify(fixture.requests.at(-1)?.messages)).toContain("exact blocker");
+		expectFinished(events, "The reproduction input is missing; I need it to identify the failing case.", 9);
+	});
+
 	it("still pauses a repeated tool loop at the configured step limit", async () => {
 		const { history, events } = await run(
 			Array.from({ length: 4 }, (_, i) => toolTurn(call("Read", { path: "a.ts" }, `read-${i}`))),
@@ -448,7 +491,111 @@ describe("runAgent context consumption", () => {
 		expect(events).toContainEqual({ type: "error", message: expect.stringContaining("context window is too small") });
 	});
 
-	it("executes large edits verbatim and sends retrievable abbreviated arguments on later turns", async () => {
+	it.each([false, true])("preserves full large tool exchanges and cached prefixes across saved followups (stopped=%s)", async (stopped) => {
+		const marker = "FINDING_IN_THE_MIDDLE_OF_THE_PRIOR_TOOL_EXCHANGE";
+		const output = `${"Earlier source lines\n".repeat(1000)}${marker}\n${"Later source lines\n".repeat(1000)}`;
+		const input = { path: "generated.ts", contents: `${"export const example = 1;\n".repeat(1000)}${marker}\n${"// generated content\n".repeat(1000)}` };
+		const writeCall = call("Write", input, "full-write");
+		vi.spyOn(TOOLS.Read, "execute").mockResolvedValueOnce({ output });
+		const contextState: NonNullable<RunAgentOptions["contextState"]> = {};
+		const abort = new AbortController();
+		const first = await run([
+			toolTurn(call("Read", { path: "source.ts" }, "full-read")),
+			toolTurn(writeCall),
+			(request) => {
+				const result = request.messages.find((message) => message.role === "tool" && message.tool_call_id === "full-read");
+				expect(result?.role === "tool" ? result.content : "").toBe(output);
+				const sentCall = request.messages.flatMap((message) => message.role === "assistant" ? message.tool_calls ?? [] : [])
+					.find((toolCall) => toolCall.id === writeCall.id);
+				expect(sentCall?.function.arguments).toBe(writeCall.arguments);
+				if (stopped) abort.abort();
+				return answer("The source has been inspected and updated.");
+			},
+		], { contextTokens: 1_000_000, contextState, signal: abort.signal, promptCacheKey: "full-history" });
+		if (stopped) expect(first.events).toContainEqual({ type: "run-status", status: "cancelled" });
+		else expectFinished(first.events, "The source has been inspected and updated.", 3);
+		expect(fixture.executions).toContainEqual({ name: "Write", input });
+		expect(contextState.checkpoint).toBeUndefined();
+		for (let i = 1; i < fixture.requests.length; i++) {
+			const previous = fixture.requests[i - 1].messages;
+			expect(fixture.requests[i].messages.slice(0, previous.length)).toEqual(previous);
+		}
+
+		let previous = JSON.parse(JSON.stringify(fixture.requests[2].messages)) as WireMessage[];
+		let restored = JSON.parse(JSON.stringify({ history: first.history, contextState })) as { history: Step[]; contextState: NonNullable<RunAgentOptions["contextState"]> };
+		for (const prompt of ["Continue the interrupted work.", "Explain the change using the earlier findings."]) {
+			fixture.requests.length = 0;
+			fixture.turns.length = 0;
+			const next = await run([
+				(request) => {
+					expect(request.messages.slice(0, previous.length)).toEqual(previous);
+					const result = request.messages.find((message) => message.role === "tool" && message.tool_call_id === "full-read");
+					expect(result?.role === "tool" ? result.content : "").toBe(output);
+					expect(request.promptCacheKey).toBe("full-history");
+					return answer("The previous finding is available without reading the file again.");
+				},
+			], { prompt, ...restored, contextTokens: 1_000_000, promptCacheKey: "full-history" });
+			expectFinished(next.events, "The previous finding is available without reading the file again.", 1);
+			expectCompleteToolGroups(fixture.requests[0].messages);
+			previous = JSON.parse(JSON.stringify(fixture.requests[0].messages)) as WireMessage[];
+			restored = JSON.parse(JSON.stringify({ history: next.history, contextState: restored.contextState }));
+		}
+	});
+
+	it("groups unlimited-context mode-switch batches without changing saved originals or prior message prefixes", async () => {
+		const output = `${"Full source detail\n".repeat(1000)}UNABBREVIATED_MIDDLE_FINDING\n${"More source detail\n".repeat(1000)}`;
+		vi.spyOn(TOOLS.Read, "execute").mockResolvedValue({ output });
+		vi.spyOn(writePlanTool, "execute").mockResolvedValue({ output: "wrote plan" });
+		const contextState: NonNullable<RunAgentOptions["contextState"]> = {};
+		const first = await run([
+			toolTurn(call("Read", { path: "before.ts" }, "before-switch")),
+			toolTurn(call("SwitchMode", { target_mode_id: "plan" }, "grouped-switch"), call("Read", { path: "after.ts" }, "after-switch")),
+			(request) => {
+				expectCompleteToolGroups(request.messages);
+				// Switching modes changes the system instructions; earlier conversation
+				// messages must still retain their exact serialized cache prefix.
+				const previous = fixture.requests[1].messages;
+				expect(request.messages.slice(1, previous.length)).toEqual(previous.slice(1));
+				const result = request.messages.find((message) => message.role === "tool" && message.tool_call_id === "after-switch");
+				expect(result?.role === "tool" ? result.content : "").toBe(output);
+				return toolTurn(call("WritePlan", { title: "Plan", content: "Apply the observed finding." }, "grouped-plan"));
+			},
+			(request) => {
+				expectCompleteToolGroups(request.messages);
+				const previous = fixture.requests[2].messages;
+				expect(request.messages.slice(0, previous.length)).toEqual(previous);
+				return answer("The plan is ready.");
+			},
+		], { contextState });
+		expectFinished(first.events, "The plan is ready.", 4);
+		expect(contextState.checkpoint).toBeDefined();
+		const noteIndex = first.history.findIndex((step) => step.kind === "user" && step.synthetic && step.text.startsWith("Mode changed from agent to plan."));
+		const resultIndex = first.history.findIndex((step) => step.kind === "tool-result" && step.callId === "grouped-switch");
+		expect(noteIndex).toBeGreaterThan(-1);
+		expect(noteIndex).toBeLessThan(resultIndex);
+		expect(first.history).toContainEqual(expect.objectContaining({ kind: "tool-result", callId: "after-switch", output }));
+		const previous = JSON.parse(JSON.stringify(fixture.requests[3].messages)) as WireMessage[];
+		const originalHistory = JSON.parse(JSON.stringify(first.history)) as Step[];
+		const restored = JSON.parse(JSON.stringify({ history: first.history, contextState })) as { history: Step[]; contextState: NonNullable<RunAgentOptions["contextState"]> };
+		fixture.requests.length = 0;
+		fixture.turns.length = 0;
+		const second = await run([
+			(request) => {
+				expectCompleteToolGroups(request.messages);
+				expect(request.messages.slice(0, previous.length)).toEqual(previous);
+				return toolTurn(call("WritePlan", { title: "Plan", content: "Explain the observed finding." }, "restored-grouped-plan"));
+			},
+			(request) => {
+				expectCompleteToolGroups(request.messages);
+				expect(request.messages.slice(0, previous.length)).toEqual(previous);
+				return answer("The saved plan and findings are available.");
+			},
+		], { mode: "plan", prompt: "Explain the saved plan.", ...restored });
+		expectFinished(second.events, "The saved plan and findings are available.", 2);
+		expect(restored.history.slice(0, originalHistory.length)).toEqual(originalHistory);
+	});
+
+	it("executes large edits verbatim and archives their arguments only under context pressure", async () => {
 		const marker = "ORIGINAL_MIDDLE_OF_WRITTEN_FILE";
 		const input = { path: "generated.ts", contents: `${"export const example = 1;\n".repeat(1000)}${marker}\n${"// generated content\n".repeat(1000)}` };
 		const writeCall = call("Write", input, "large-write");
@@ -469,14 +616,14 @@ describe("runAgent context consumption", () => {
 				expect(result?.role === "tool" ? result.content : "").toContain(marker);
 				return answer("The generated file is written.");
 			},
-		]);
+		], { contextTokens: 12_000, maxTokens: 1024 });
 		expect(fixture.executions).toContainEqual({ name: "Write", input });
 		expect(history).toContainEqual(expect.objectContaining({ kind: "assistant", calls: [writeCall] }));
 		for (const request of fixture.requests) expectCompleteToolGroups(request.messages);
 		expectFinished(events, "The generated file is written.", 3);
 	});
 
-	it("reduces repeated large-output payloads while keeping full results and retrieving omitted details", async () => {
+	it("archives large outputs under context pressure while retaining recoverable full results", async () => {
 		const marker = "ARCHIVE_ONLY_DEPENDENCY_MISMATCH_42";
 		const outputs = ["alpha", "beta", "gamma"].map((name) => Array.from({ length: 3000 }, (_, i) =>
 			i === 1500 ? `${name}: ${marker}` : `${name}:${i + 1} export const setting_${i} = \"a realistic source value with implementation details\";`,
@@ -500,7 +647,7 @@ describe("runAgent context consumption", () => {
 				expect(result?.role === "tool" ? result.content : "").toContain(`alpha: ${marker}`);
 				return answer("The archived source identifies the dependency mismatch.");
 			},
-		], { contextTokens: 1_000_000 });
+		], { contextTokens: 40_000, maxTokens: 1024 });
 
 		const measuredRequests = fixture.requests.slice(0, 4);
 		const sentCharacters = measuredRequests.reduce((sum, request) => sum + JSON.stringify({ messages: request.messages, tools: request.tools }).length, 0);
@@ -519,6 +666,41 @@ describe("runAgent context consumption", () => {
 		expectFinished(events, "The archived source identifies the dependency mismatch.", 5);
 	});
 
+	it("keeps a checkpointed archive prefix stable after saving and increasing the context window", async () => {
+		const marker = "ARCHIVED_FINDING_AVAILABLE_AFTER_RELOAD";
+		const output = `${"Earlier source lines\n".repeat(1000)}${marker}\n${"Later source lines\n".repeat(1000)}`;
+		const contextState: NonNullable<RunAgentOptions["contextState"]> = {};
+		vi.spyOn(TOOLS.Read, "execute").mockResolvedValueOnce({ output });
+		const first = await run([
+			toolTurn(call("Read", { path: "source.ts" }, "checkpoint-read")),
+			answer("I have inspected the source."),
+		], { contextTokens: 12_000, maxTokens: 1024, contextState });
+		expectFinished(first.events, "I have inspected the source.", 2);
+		expect(contextState.checkpoint).toBeDefined();
+		const previous = JSON.parse(JSON.stringify(fixture.requests[1].messages)) as WireMessage[];
+		const preview = previous.find((message) => message.role === "tool" && message.tool_call_id === "checkpoint-read");
+		const reference = (preview?.role === "tool" && typeof preview.content === "string" ? preview.content : "").match(/ReadContext \{"id":"([^"]+)"\}/);
+		expect(reference).not.toBeNull();
+		const restored = JSON.parse(JSON.stringify({ history: first.history, contextState })) as { history: Step[]; contextState: NonNullable<RunAgentOptions["contextState"]> };
+		fixture.requests.length = 0;
+		fixture.turns.length = 0;
+		const second = await run([
+			(request) => {
+				expect(request.messages.slice(0, previous.length)).toEqual(previous);
+				return toolTurn(call("ReadContext", { id: reference![1], pattern: marker }, "checkpoint-detail"));
+			},
+			(request) => {
+				expect(request.messages.slice(0, previous.length)).toEqual(previous);
+				const result = request.messages.find((message) => message.role === "tool" && message.tool_call_id === "checkpoint-detail");
+				expect(result?.role === "tool" ? result.content : "").toContain(marker);
+				return answer("The earlier finding is recovered.");
+			},
+		], { prompt: "Recover the earlier finding.", ...restored, contextTokens: 1_000_000 });
+		expectFinished(second.events, "The earlier finding is recovered.", 2);
+		expect(second.history).toContainEqual(expect.objectContaining({ kind: "tool-result", callId: "checkpoint-read", output }));
+		for (const request of fixture.requests) expectCompleteToolGroups(request.messages);
+	});
+
 	it("restores archived output references from saved chat history in a subsequent Ask run", async () => {
 		const marker = "DETAIL_NEEDED_ON_FOLLOWUP";
 		const output = `${"Earlier source lines\n".repeat(1000)}${marker}\n${"Later source lines\n".repeat(1000)}`;
@@ -526,7 +708,7 @@ describe("runAgent context consumption", () => {
 		const first = await run([
 			toolTurn(call("Read", { path: "source.ts" }, "saved-read")),
 			answer("I have inspected the source."),
-		]);
+		], { contextTokens: 12_000, maxTokens: 1024 });
 		const preview = fixture.requests[1].messages.find((message) => message.role === "tool" && message.tool_call_id === "saved-read");
 		const reference = (preview?.role === "tool" && typeof preview.content === "string" ? preview.content : "").match(/ReadContext \{"id":"([^"]+)"\}/);
 		expect(reference).not.toBeNull();
@@ -552,6 +734,7 @@ describe("runAgent context consumption", () => {
 		const originalRequest = "Inspect the dependency initialization.";
 		const followup = "Recover the earlier finding and explain it.";
 		const history = olderReadHistory(originalRequest, marker);
+		const contextState: NonNullable<RunAgentOptions["contextState"]> = {};
 		const originalHistory = [...history];
 		const summary = "Earlier files were inspected. The user now needs an earlier finding explained.";
 		const { events } = await run([
@@ -577,7 +760,7 @@ describe("runAgent context consumption", () => {
 			},
 			toolTurn(call("Read", { path: "verify-other.ts" }, "verify-other")),
 			answer("The earlier finding has been recovered and explained."),
-		], { prompt: followup, history, contextTokens: 16_000, maxTokens: 1024 });
+		], { prompt: followup, history, contextState, contextTokens: 16_000, maxTokens: 1024 });
 		expect(history.slice(0, originalHistory.length)).toEqual(originalHistory);
 		expect(events.filter((event) => event.type === "compaction")).toEqual([
 			{ type: "compaction", status: "running" },
@@ -587,6 +770,19 @@ describe("runAgent context consumption", () => {
 		expect(fixture.requests.filter((request) => request.tools === undefined)).toHaveLength(1);
 		for (const request of fixture.requests.slice(1)) expectCompleteToolGroups(request.messages);
 		expectFinished(events, "The earlier finding has been recovered and explained.", 5);
+		expect(contextState.checkpoint).toBeDefined();
+		const previous = JSON.parse(JSON.stringify(fixture.requests[4].messages)) as WireMessage[];
+		const restored = JSON.parse(JSON.stringify({ history, contextState })) as { history: Step[]; contextState: NonNullable<RunAgentOptions["contextState"]> };
+		fixture.requests.length = 0;
+		fixture.turns.length = 0;
+		const next = await run([
+			(request) => {
+				expect(request.messages.slice(0, previous.length)).toEqual(previous);
+				return answer("The context is still available.");
+			},
+		], { prompt: "Continue with the recovered finding.", ...restored, contextTokens: 1_000_000 });
+		expectFinished(next.events, "The context is still available.", 1);
+		expect(next.events.filter((event) => event.type === "compaction")).toEqual([]);
 	});
 
 	it("reuses a serialized summary and todo state on the next run without another paid summary", async () => {
@@ -751,6 +947,31 @@ describe("cache-safe loop and background scheduling", () => {
     expect(history).toContainEqual(expect.objectContaining({ kind: "tool-result", callId: "parent-read" }));
     expect(fixture.requests.filter(r => r.promptCacheKey?.includes("/task/"))).toHaveLength(1);
     expectFinished(events, "Review integrated", 6);
+  });
+
+  it("waits for new child evidence when the parent repeats retrieval and then resets the guard", async () => {
+    let release!: () => void;
+    const gate = new Promise<void>(resolve => { release = resolve; });
+    let childDone = false;
+    const { history, events } = await run([
+      toolTurn(call("Task", { prompt: "Investigate worker.ts", run_in_background: true }, "worker")),
+      async () => { await gate; childDone = true; return answer("The child found the missing case."); },
+      ...Array.from({ length: 9 }, (_, i) => () => {
+        expect(childDone).toBe(false);
+        if (i === 8) setTimeout(release, 0);
+        return toolTurn(call("Read", { path: "parent.ts" }, `read-${i}`));
+      }),
+      request => {
+        expect(childDone).toBe(true);
+        expect(JSON.stringify(request.messages)).toContain("The child found the missing case.");
+        return toolTurn(call("Read", { path: "parent.ts" }, "read-after-child"));
+      },
+      toolTurn(call("Read", { path: "parent.ts" }, "read-after-child-2")),
+      answer("The missing case is now explained."),
+    ], { maxSteps: 20 });
+    expect(events).toContainEqual(expect.objectContaining({ type: "shell-notify", message: expect.stringContaining("Waiting for a result") }));
+    expect(history.some(step => step.kind === "assistant" && step.text.startsWith("I paused"))).toBe(false);
+    expectFinished(events, "The missing case is now explained.", 14);
   });
 
   it("resolves child model options and preserves parent restrictions in delegation", async () => {

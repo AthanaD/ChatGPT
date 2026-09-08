@@ -641,10 +641,10 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     await this._handleFetchModels();
   }
 
-  /** Persist a running session's authoritative turns immediately. */
+  /** Save both representations together so a reload can resume the visible work. */
   private _persistTurnsNow(convId: string, session: RunSession) {
     if (session.persistTimer) { clearTimeout(session.persistTimer); session.persistTimer = undefined; }
-    void this._store.update(convId, { turns: session.turns });
+    void this._store.update(convId, { turns: session.turns, steps: session.history, contextState: session.contextState });
   }
 
   /** Throttle persistence of live turns (~1/sec) during a run. */
@@ -652,7 +652,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     if (session.persistTimer) return;
     session.persistTimer = setTimeout(() => {
       session.persistTimer = undefined;
-      void this._store.update(convId, { turns: session.turns });
+      this._persistTurnsNow(convId, session);
     }, 800);
   }
 
@@ -1424,6 +1424,8 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       pendingQuestions: new Map(),
       pendingApprovals: new Map(),
       turns: seededTurns,
+      history,
+      contextState,
     };
     this._sessions.set(convId, session);
 

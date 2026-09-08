@@ -398,6 +398,10 @@ export function buildMessages(system: string, steps: Step[], ctx?: CursorContext
         out.push({ role: "user", content: [{ type: "text", text: textContent, cache_control: EPHEMERAL }] });
       }
     } else if (s.kind === "assistant") {
+      // A stopped thinking stream has display state but no message to replay.
+      // Sending an empty assistant before the next user turn is invalid for
+      // Anthropic. Keep opaque Responses state even without visible content.
+      if (!s.text && !s.calls?.length && !s.responsesReasoning) continue;
       const msg: WireMessage = { role: "assistant", content: s.text || null };
       // Opaque Responses state survives UI-thinking removal and context fitting.
       // Each provider serializer decides whether the originating identity matches.
