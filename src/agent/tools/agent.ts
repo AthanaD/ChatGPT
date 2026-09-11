@@ -87,6 +87,23 @@ export const taskTool = defineTool("Task", false, async (input, abortSignal, cal
   return { output: result };
 });
 
+// ---- Wait (plain sleep) ----
+const MAX_WAIT_MS = 120_000;
+export const waitTool = defineTool("Wait", false, async (input, abortSignal) => {
+  const requested = Number(input?.ms);
+  if (!Number.isFinite(requested) || requested < 0) return { output: "error: ms must be a non-negative number" };
+  const ms = Math.min(MAX_WAIT_MS, Math.round(requested));
+  const startedAt = Date.now();
+  await new Promise<void>((resolve) => {
+    const finish = () => { clearTimeout(timer); abortSignal?.removeEventListener("abort", finish); resolve(); };
+    const timer = setTimeout(finish, ms);
+    if (abortSignal?.aborted) finish();
+    else abortSignal?.addEventListener("abort", finish, { once: true });
+  });
+  if (abortSignal?.aborted) return { output: `Wait aborted after ${Date.now() - startedAt}ms.`, outcome: { status: "aborted" } };
+  return { output: `Waited ${ms}ms${ms < requested ? ` (capped from ${Math.round(requested)})` : ""}.`, outcome: { status: "completed" } };
+});
+
 // ---- SwitchMode ----
 export const switchModeTool = defineTool("SwitchMode", false, async (input, _signal, _callId, ctx) => {
   const target = String(input?.target_mode_id ?? "").trim().toLowerCase();

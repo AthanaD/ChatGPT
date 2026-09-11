@@ -107,6 +107,10 @@ function toolMeta(name: string, i: any): { icon: IconName; label: string; badge:
     case "grep":
     case "Grep":
       return { icon: "search", label: 'Grep "' + (i.pattern || "") + '"', badge: "Read", cls: "badge-read" };
+    case "Rg":
+      return { icon: "search", label: "rg " + (Array.isArray(i.args) ? i.args.join(" ") : ""), badge: "Read", cls: "badge-read" };
+    case "Wait":
+      return { icon: "task", label: "Wait " + (Number(i.ms) || 0) + "ms" + (i.reason ? " — " + i.reason : ""), badge: "Wait", cls: "badge-read" };
     case "SemanticSearch":
       return { icon: "search", label: "Search " + (i.query || ""), badge: "Read", cls: "badge-read" };
     case "SearchDocs":

@@ -48,6 +48,8 @@ export const TOOL_TIMEOUT_MS: Record<string, number> = {
   Shell: 120_000,
   AwaitShell: 300_000,
   Grep: 120_000,
+  Rg: 120_000,
+  Wait: 130_000,
   Glob: 120_000,
   FileSearch: 120_000,
   SemanticSearch: 300_000,

@@ -89,6 +89,7 @@ function archivedTranscript(steps: Step[]): string {
  */
 const VERBOSE_TOOL_DESCRIPTIONS = new Set([
 	"Task",
+	"Rg",
 	"Shell",
 	"AwaitShell",
 	"TodoWrite",
@@ -450,7 +451,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 					onHook?.("subagentStop", { subagent: title });
 				});
 				background.add(childId, taskKey, title, tracked, () => childAC.abort());
-				return `Launched ${title} in the background (task ${childId}). Continue independent work. Its result will be delivered automatically when ready. Do not relaunch this task or poll it with AwaitShell.`;
+				return `Launched ${title} in the background (task ${childId}). Continue independent work; its result will be delivered automatically when ready. If your next step depends on it, end your turn without tool calls and the system will wait for it. Do not relaunch this task or poll it with AwaitShell.`;
 			}
 			try {
 				await runP;
@@ -515,6 +516,7 @@ export async function runAgent(opts: RunAgentOptions): Promise<void> {
 		disabledToolNames.add("Read");
 		disabledToolNames.add("Glob");
 		disabledToolNames.add("Grep");
+		disabledToolNames.add("Rg");
 		disabledToolNames.add("SemanticSearch");
 		disabledToolNames.add("FileSearch");
 	}

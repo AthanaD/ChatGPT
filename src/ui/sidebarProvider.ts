@@ -144,6 +144,7 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
     const cfgSub = this.featureStore.onDidChange(() => {
       this._sendConfigState();
       void this._handleFetchModels();
+      this._reevaluatePendingApprovals();
     });
     // Refresh the picker when OAuth accounts connect/disconnect.
     const oauthSub = oauth.onOAuthStatus(() => {
@@ -899,6 +900,19 @@ export class SidebarProvider implements vscode.WebviewViewProvider {
       if (session.abort.signal.aborted) settle(false);
       else session.abort.signal.addEventListener("abort", onAbort, { once: true });
     });
+  }
+
+  /**
+   * A policy change from the Settings panel (e.g. switching to "Allow") must
+   * settle prompts that were already raised, not just future ones.
+   */
+  private _reevaluatePendingApprovals() {
+    for (const session of this._sessions.values()) {
+      for (const p of [...session.pendingApprovals.values()]) {
+        const decision = this._evaluatePolicy(p.info.toolName, p.info.input);
+        if (decision !== "ask") p.resolve(decision === "allow");
+      }
+    }
   }
 
   /** The effective approval policy (user settings over safe defaults). */

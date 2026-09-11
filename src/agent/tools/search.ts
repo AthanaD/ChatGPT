@@ -235,6 +235,71 @@ export const grepTool = defineTool("Grep", false, async (input, abortSignal) => 
   }
 });
 
+// ---- Rg (raw ripgrep, no shell) ----
+const RG_OUTPUT_CAP = 60_000;
+const RG_TIMEOUT_MS = 60_000;
+// Flags that would make ripgrep touch things outside the read-only contract.
+const RG_BLOCKED_FLAGS = new Set(["--pre", "--pre-glob", "-r", "--replace", "--passthru", "--files-from"]);
+
+export const rgTool = defineTool("Rg", false, async (input, abortSignal) => {
+  if (abortSignal?.aborted) return { output: "(rg aborted)", outcome: { status: "aborted" } };
+  const raw = Array.isArray(input?.args) ? input.args : [];
+  const args = raw.map((a: unknown) => String(a));
+  if (!args.length) return { output: "error: args is required (argv after 'rg')" };
+  if (args[0] === "rg" || /(^|[\\/])rg(\.exe)?$/i.test(args[0])) args.shift();
+  for (const a of args) {
+    const flag = a.includes("=") ? a.slice(0, a.indexOf("=")) : a;
+    if (RG_BLOCKED_FLAGS.has(flag)) return { output: `error: ${flag} is not permitted; Rg is read-only. Use Shell for anything that executes programs or rewrites output.` };
+  }
+  const rgBin = await rgCommand();
+  if (!rgBin) return { output: "error: ripgrep is not available on this machine (not bundled with this VS Code build and not on PATH). Use Grep instead." };
+  let cwd: string;
+  try { cwd = input?.working_directory ? safePath(String(input.working_directory)) : getWorkspaceRoot(); }
+  catch (e) { return { output: `error: ${e instanceof Error ? e.message : String(e)}` }; }
+
+  const finalArgs = ["--color=never", "--no-messages", "--path-separator", "/", ...args];
+  return new Promise((resolve) => {
+    let settled = false;
+    let out = "";
+    let err = "";
+    let truncated = false;
+    let child: ReturnType<typeof spawn> | undefined;
+    const done = (status: ToolOutcome["status"], exitCode?: number, note?: string) => {
+      if (settled) return;
+      settled = true;
+      clearTimeout(timer);
+      abortSignal?.removeEventListener("abort", onAbort);
+      const head = `[rg ${status}${exitCode != null ? ` exit_code=${exitCode}` : ""}${truncated ? " output=truncated" : ""}]`;
+      const body = out.trim() || (exitCode === 1 && status === "completed" ? "(no matches)" : "");
+      const trailer = [err.trim() && `stderr:\n${err.trim()}`, note].filter(Boolean).join("\n");
+      resolve({ output: [head, body, trailer].filter(Boolean).join("\n"), outcome: { status, exitCode } });
+    };
+    const kill = () => { try { child?.kill("SIGKILL"); } catch { /* exited */ } };
+    const onAbort = () => { kill(); done("aborted"); };
+    const timer = setTimeout(() => { kill(); done("timed_out", undefined, `rg exceeded ${RG_TIMEOUT_MS / 1000}s; narrow the search.`); }, RG_TIMEOUT_MS);
+    try { child = spawn(rgBin, finalArgs, { cwd, windowsHide: true, stdio: ["ignore", "pipe", "pipe"] }); }
+    catch (e) { done("failed", undefined, `spawn failed: ${e instanceof Error ? e.message : String(e)}`); return; }
+    if (abortSignal?.aborted) { onAbort(); return; }
+    abortSignal?.addEventListener("abort", onAbort, { once: true });
+    const collect = (sink: "out" | "err") => (chunk: Buffer) => {
+      if (settled) return;
+      const text = chunk.toString("utf8");
+      if (sink === "err") { if (err.length < 8_000) err += text; return; }
+      if (out.length >= RG_OUTPUT_CAP) { if (!truncated) { truncated = true; kill(); } return; }
+      out += text;
+      if (out.length > RG_OUTPUT_CAP) { out = out.slice(0, RG_OUTPUT_CAP); truncated = true; kill(); }
+    };
+    child.stdout?.on("data", collect("out"));
+    child.stderr?.on("data", collect("err"));
+    child.on("error", (e) => done("failed", undefined, `ripgrep failed: ${e.message}`));
+    child.on("close", (code) => {
+      // ripgrep: 0 matches, 1 no matches, 2 error. A kill from truncation still counts as completed.
+      if (truncated) done("completed", code ?? 0, `output capped at ${RG_OUTPUT_CAP} chars; narrow the query (e.g. add a path, -l, or --max-count).`);
+      else done(code === 2 ? "failed" : "completed", code ?? undefined);
+    });
+  });
+});
+
 // ---- SemanticSearch ----
 // Real local semantic search: embed the query and cosine-rank against the
 // on-disk embedding index (see semanticIndex.ts). Falls back to keyword

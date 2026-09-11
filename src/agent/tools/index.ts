@@ -11,10 +11,10 @@ import type { Mode } from "../types";
 import type { Tool } from "./types";
 
 import { readFileTool, listDirTool, globTool, fileSearchTool, readLintsTool, strReplaceTool, writeTool, deleteFileTool, editNotebookTool } from "./files";
-import { grepTool, semanticSearchTool, searchDocsTool } from "./search";
+import { grepTool, rgTool, semanticSearchTool, searchDocsTool } from "./search";
 import { runTerminalTool, awaitShellTool } from "./shell";
 import { webSearchTool, webFetchTool } from "./web";
-import { todoWriteTool, todoReadTool, askQuestionTool, taskTool, switchModeTool, writePlanTool } from "./agent";
+import { todoWriteTool, todoReadTool, askQuestionTool, taskTool, waitTool, switchModeTool, writePlanTool } from "./agent";
 import { callMcpToolTool, fetchMcpResourceTool, listMcpResourcesTool } from "./mcp";
 import { readContextTool } from "./context";
 
@@ -39,6 +39,7 @@ export const TOOLS: Record<string, Tool> = {
   ListDir: listDirTool,
   Glob: globTool,
   Grep: grepTool,
+  Rg: rgTool,
   SemanticSearch: semanticSearchTool,
   SearchDocs: searchDocsTool,
   FileSearch: fileSearchTool,
@@ -48,6 +49,7 @@ export const TOOLS: Record<string, Tool> = {
   WebSearch: webSearchTool,
   WebFetch: webFetchTool,
   Task: taskTool,
+  Wait: waitTool,
   AskQuestion: askQuestionTool,
   WritePlan: writePlanTool,
   StrReplace: strReplaceTool,

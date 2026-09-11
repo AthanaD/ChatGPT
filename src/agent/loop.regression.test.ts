@@ -58,7 +58,7 @@ vi.mock("./tools/files", async () => {
 });
 vi.mock("./tools/search", async () => {
 	const { TOOL_SPECS: s } = await vi.importActual<typeof import("./tools/schemas")>("./tools/schemas");
-	return { grepTool: fixture.tool(s.Grep), semanticSearchTool: fixture.tool(s.SemanticSearch), searchDocsTool: fixture.tool(s.SearchDocs) };
+	return { grepTool: fixture.tool(s.Grep), rgTool: fixture.tool(s.Rg), semanticSearchTool: fixture.tool(s.SemanticSearch), searchDocsTool: fixture.tool(s.SearchDocs) };
 });
 vi.mock("./tools/shell", async () => {
 	const { TOOL_SPECS: s } = await vi.importActual<typeof import("./tools/schemas")>("./tools/schemas");

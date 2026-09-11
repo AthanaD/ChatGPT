@@ -103,6 +103,32 @@ def({
 });
 
 def({
+  name: "Rg",
+  description: "Run ripgrep directly with raw arguments, cross-platform, without going through a shell. Use this instead of Shell when Grep's structured options are not enough (e.g. -l, -c, -o, --files, -w, -F, -t/-T, --iglob, -z, --stats, -e with several patterns). Do not pass a command name or shell syntax: args is the argv list after 'rg' and no globbing or quoting is applied. The workspace root is the default search location. Output is capped; narrow the query or paginate with ReadContext when truncated. Exit code 1 means no matches, 2 means an argument or IO error.",
+  parameters: {
+    type: "object",
+    properties: {
+      args: { type: "array", items: { type: "string" }, description: "Arguments passed verbatim to ripgrep, one per element, e.g. [\"-n\", \"-w\", \"TODO\", \"src\"]. Flags and paths are separate elements." },
+      working_directory: { type: "string", description: "Directory to run in; relative paths in args resolve from here. Defaults to the workspace root." },
+    },
+    required: ["args"],
+  },
+});
+
+def({
+  name: "Wait",
+  description: "Sleep for a fixed number of milliseconds and return. Use when a short delay is genuinely needed (e.g. letting a server start, debouncing a watcher) before the next action. Not for waiting on terminal jobs (use AwaitShell) or subagents (end your turn and the system waits for them). Cancelled immediately when the run is stopped.",
+  parameters: {
+    type: "object",
+    properties: {
+      ms: { type: "number", minimum: 0, description: "Milliseconds to wait. Capped at 120000." },
+      reason: { type: "string", description: "Short note about why waiting is needed (shown in the UI)." },
+    },
+    required: ["ms"],
+  },
+});
+
+def({
   name: "AwaitShell",
   description: "Observe or wait for a terminal job owned by this conversation, using the shell_id returned by Shell. Finished job metadata remains readable in later turns until its retention expires or the extension restarts. Omit shell_id to sleep for block_until_ms without a command. The default is 30000ms, the maximum is 120000ms, and 65000ms waits are supported. Set 0 with a shell_id for an immediate status check. Waits are cancellable; the outer configured tool timeout may end a wait earlier. A wait ending while the process remains active returns status running, not success. Work on independent tasks instead of repeatedly polling. Await when the next step needs this result. Output cards contain a bounded head/tail preview and an opaque ReadContext reference for exact retained transcript pages. Regex waits check the retained in-memory preview and subsequent output, not transcript headers or footers; use ReadContext with a literal pattern to search older output omitted from the preview. Active jobs end with the run; retained transcripts do not keep their processes alive.",
   parameters: {
@@ -339,7 +365,7 @@ def({
         description: "Subagent type to use for this task. Either one of the built-in types (generalPurpose, explore, shell, cursor-guide, ci-investigator, bugbot, security-review, best-of-n-runner, docs-researcher, code-reviewer) or the name of a configured subagent — including a member of an assigned team listed in <assigned_teams> or <subagents>.",
       },
       file_attachments: { type: "array", items: { type: "string" }, description: "File paths to include in the child prompt. The child must read them with its permitted tools; file bytes are not attached automatically." },
-      run_in_background: { type: "boolean", description: "Return immediately while the child works. Its report is delivered to the parent before the run finishes. Use true for independent coordinator subtasks." },
+      run_in_background: { type: "boolean", description: "false (default): block until the child finishes and return its report inline — use when the next step depends on the result. true: return immediately while the child works; its report is delivered automatically, and ending your turn waits for it. Use true for independent subtasks that can run alongside your own work." },
     },
     required: ["description", "prompt"],
   },

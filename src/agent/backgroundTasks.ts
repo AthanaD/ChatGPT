@@ -44,6 +44,7 @@ export class BackgroundTasks {
     const active = [...this.jobs.values()].filter(job => !job.result);
     return active.length ? Promise.race(active.map(job => job.promise)) : Promise.resolve();
   }
+
   cancelAll(): void {
     for (const [id, job] of this.jobs) {
       if (job.result) continue;
