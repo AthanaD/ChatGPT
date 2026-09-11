@@ -4,6 +4,31 @@ All notable changes to the "ocursor" extension will be documented in this file.
 
 Check [Keep a Changelog](http://keepachangelog.com/) for recommendations on how to structure this file.
 
+## [0.1.4] - 2026-09-11
+
+### Added
+
+- `Rg` tool runs ripgrep directly with raw arguments on every platform, using the binary bundled with VS Code, so agents no longer shell out to `rg`/`grep`/`findstr`; read-only flags only, capped output, and clear no-match/error exit reporting
+- `Wait` tool sleeps for a fixed number of milliseconds (up to two minutes) when a short delay is genuinely needed, and cancels immediately on Stop
+- Introduced retrieval evidence tracking to detect repetitive search/read cycles and guide recovery behavior during investigations
+- Added session resume continuity for live model history and context state, including persisted todos, so interrupted runs can continue cleanly
+- Added integration coverage for interrupted/continued runs, retrieval progress behavior, and the new `Rg`/`Wait` tools
+
+### Changed
+
+- Clarified Task guidance: `run_in_background=false` blocks for a dependent result, `run_in_background=true` runs alongside the parent and the built-in wait delivers results when the turn ends; launch receipts and mode prompts no longer point agents at `AwaitShell` for subagents
+- Improved message construction to avoid emitting empty assistant turns in Anthropic flows when only display-only thinking was present
+- Updated prompt guidance to emphasize reading file content before editing changes
+- Refined run-loop control so repeated unchanged retrieval signals trigger recovery, wrap-up, and pause transitions before continuing
+- Persisted live turns, step history, and context state together for reload-safe conversation resumption
+
+### Fixed
+
+- Approval prompts already showing in the chat now resolve immediately when the Behavior policy is changed to Allow or Deny in Settings, instead of waiting for a click on the card
+- Prevented premature or repeated investigation loops by detecting unchanged retrieval evidence and nudging the agent toward concrete next action
+- Ensured unfinished tool calls are marked and surfaced when runs are interrupted, preserving known results while warning about unconfirmed completions
+- Improved session cancellation/cleanup behavior so follow-up messages wait for stop cleanup before resuming
+
 ## [0.1.3] - 2026-09-07
 
 ### Added
